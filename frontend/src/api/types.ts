@@ -39,6 +39,7 @@ export interface GenerateRequest {
   building: BuildingParams;
   mission: MissionParams;
   min_facade_area?: number;
+  extraction_method?: string;
 }
 
 export interface UploadedBuilding {

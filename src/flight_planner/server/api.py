@@ -79,6 +79,7 @@ class GenerateRequest(BaseModel):
     building: BuildingParams = BuildingParams()
     mission: MissionParams = MissionParams()
     min_facade_area: float = Field(1.0, ge=0.1, le=50.0)
+    extraction_method: str = "region_growing"
 
 
 class BuildingUploadRequest(BaseModel):
@@ -349,7 +350,7 @@ def generate(request: GenerateRequest):
             if raw_mesh:
                 # Reconstruct mesh from stored vertices/indices and re-run
                 # facet detection with the requested min_facade_area threshold.
-                from ..building_import import _extract_facades_from_mesh, _convex_hull_2d
+                from ..building_import import extract_facades
                 import trimesh
                 import numpy as np
 
@@ -357,7 +358,7 @@ def generate(request: GenerateRequest):
                 indices = np.array(raw_mesh["indices"], dtype=np.int64).reshape(-1, 3)
                 mesh_obj = trimesh.Trimesh(vertices=positions, faces=indices)
 
-                facades = _extract_facades_from_mesh(mesh_obj, min_area_m2=request.min_facade_area)
+                facades = extract_facades(mesh_obj, method=request.extraction_method, min_area_m2=request.min_facade_area)
                 if facades:
                     xs = [float(v[0]) for f in facades for v in f.vertices]
                     ys = [float(v[1]) for f in facades for v in f.vertices]

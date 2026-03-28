@@ -50,6 +50,7 @@ interface AppState {
 
   // Mesh settings
   minFacadeArea: number;
+  extractionMethod: string;
 
   // Result
   result: GenerateResponse | null;
@@ -82,6 +83,7 @@ export const useStore = create<AppState>((set, get) => ({
   selectedBuildingId: null,
   buildings: [],
   minFacadeArea: 1.0,
+  extractionMethod: 'region_growing',
 
   preset: 'simple_box',
   building: { ...DEFAULT_BUILDING },
@@ -93,6 +95,7 @@ export const useStore = create<AppState>((set, get) => ({
   activeTab: '3d',
 
   setMinFacadeArea: (v) => set({ minFacadeArea: v }),
+  setExtractionMethod: (v: string) => set({ extractionMethod: v }),
 
   setBuildingSource: (source) => {
     set({ buildingSource: source });
@@ -125,7 +128,7 @@ export const useStore = create<AppState>((set, get) => ({
   setActiveTab: (tab) => set({ activeTab: tab }),
 
   generate: async () => {
-    const { preset, selectedBuildingId, buildingSource, building, mission, minFacadeArea } = get();
+    const { preset, selectedBuildingId, buildingSource, building, mission, minFacadeArea, extractionMethod } = get();
     set({ loading: true });
     try {
       const result = await api.generate({
@@ -134,6 +137,7 @@ export const useStore = create<AppState>((set, get) => ({
         building,
         mission,
         min_facade_area: buildingSource === 'upload' ? minFacadeArea : undefined,
+        extraction_method: buildingSource === 'upload' ? extractionMethod : undefined,
       });
       set({ result, loading: false });
       get().refreshVersions();

@@ -19,9 +19,9 @@ const CAMERA_LABELS: Record<string, string> = {
 
 export function Sidebar() {
   const {
-    buildingSource, selectedBuildingId, buildings, uploading, minFacadeArea,
+    buildingSource, selectedBuildingId, buildings, uploading, minFacadeArea, extractionMethod,
     preset, building, mission, result, loading,
-    setBuildingSource, setPreset, setBuilding, setMission, setMinFacadeArea,
+    setBuildingSource, setPreset, setBuilding, setMission, setMinFacadeArea, setExtractionMethod,
     uploadBuilding, selectBuilding, deleteBuilding,
   } = useStore();
 
@@ -212,12 +212,19 @@ export function Sidebar() {
       {/* ---- Mesh detail (upload mode only) ---- */}
       {isUploadMode && (
         <div className="section">
-          <h3>Mesh Detail</h3>
+          <h3>Facade Detection</h3>
+          <div className="field">
+            <label>Method</label>
+            <select value={extractionMethod}
+              onChange={(e) => { setExtractionMethod(e.target.value); autoGen(); }}>
+              <option value="region_growing">Region Growing</option>
+              <option value="convex_hull">Convex Hull</option>
+            </select>
+          </div>
           <SliderField label="Min surface" value={minFacadeArea}
             min={0.5} max={10} step={0.5}
             format={(v) => `${v} m\u00B2`}
             onChange={(v) => setMinFacadeArea(v)} onCommit={autoGen} />
-          <div className="field-hint">Smaller = more facades detected from mesh</div>
         </div>
       )}
 

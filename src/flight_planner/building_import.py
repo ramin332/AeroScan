@@ -217,7 +217,7 @@ def build_building_from_geojson(
     )
 
 
-def _extract_facades_from_mesh(
+def _extract_region_growing(
     mesh: "trimesh.Trimesh",
     min_area_m2: float = 1.0,
     angle_threshold_deg: float = 15.0,
@@ -364,6 +364,67 @@ def _extract_facades_from_mesh(
     return facades if facades else None
 
 
+def _extract_convex_hull(
+    mesh: "trimesh.Trimesh",
+    min_area_m2: float = 1.0,
+    **_kwargs: object,
+) -> Optional[list[Facade]]:
+    """Extract facades from the mesh's convex hull footprint.
+
+    Simplest method: projects mesh to 2D, computes convex hull, extrudes
+    walls from ground to mesh height, adds flat roof. Always produces a
+    clean result regardless of mesh complexity.
+    """
+    height = float(mesh.vertices[:, 2].max())
+    if height < 0.1:
+        return None
+
+    points_2d = [(float(v[0]), float(v[1])) for v in mesh.vertices]
+    hull = _convex_hull_2d(points_2d)
+    if len(hull) < 3:
+        return None
+
+    # Reuse the footprint-to-building logic (walls from edges + flat roof)
+    building = _footprint_to_building(
+        enu_coords=hull,
+        center_lat=0, center_lon=0,  # placeholder, overwritten by caller
+        height=height,
+        num_stories=1,
+        roof_type_str="flat",
+        roof_pitch_deg=0,
+        name="",
+    )
+    return building.facades if building.facades else None
+
+
+# --- Modular extraction dispatcher ---
+
+EXTRACTION_METHODS: dict[str, callable] = {
+    "region_growing": _extract_region_growing,
+    "convex_hull": _extract_convex_hull,
+}
+
+
+def extract_facades(
+    mesh: "trimesh.Trimesh",
+    method: str = "region_growing",
+    min_area_m2: float = 1.0,
+    **kwargs: object,
+) -> list[Facade]:
+    """Extract facades from a mesh using the specified method.
+
+    Available methods: region_growing (default), convex_hull.
+    Falls back to convex_hull if the chosen method returns no results.
+    """
+    fn = EXTRACTION_METHODS.get(method, _extract_region_growing)
+    result = fn(mesh, min_area_m2=min_area_m2, **kwargs)
+    if result:
+        return result
+    # Fallback to convex hull
+    if method != "convex_hull":
+        result = _extract_convex_hull(mesh, min_area_m2=min_area_m2)
+    return result or []
+
 
 def build_building_from_mesh(
     mesh_data: bytes,
@@ -376,6 +437,7 @@ def build_building_from_mesh(
     roof_pitch_deg: float = 0.0,
     name: str = "",
     min_facade_area: float = 1.0,
+    method: str = "region_growing",
 ) -> Building:
     """Create a Building from an OBJ/PLY/STL mesh file.
 
@@ -450,7 +512,7 @@ def build_building_from_mesh(
 
     # Try facet-based extraction first (gives real wall/roof planes from mesh).
     # Fall back to convex hull if facets aren't available.
-    facades = _extract_facades_from_mesh(mesh, min_area_m2=min_facade_area)
+    facades = extract_facades(mesh, method=method, min_area_m2=min_facade_area)
 
     if facades:
         xs = [float(v[0]) for f in facades for v in f.vertices]
