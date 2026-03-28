@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import json
+import math
 from typing import Literal, Optional
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Form, HTTPException, UploadFile
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
 
+from ..building_import import build_building_from_geojson, build_building_from_mesh
 from ..building_presets import (
     l_shaped_block,
     large_apartment_block,
@@ -17,8 +20,23 @@ from ..building_presets import (
 from ..camera import compute_distance_for_gsd, compute_footprint, get_camera
 from ..geometry import build_rectangular_building, generate_mission_waypoints
 from ..kmz_builder import build_kmz_bytes
-from ..models import CameraName, MissionConfig, RoofType
+from ..models import (
+    CAMERAS,
+    CameraName,
+    GIMBAL_PAN_MAX_DEG,
+    GIMBAL_PAN_MIN_DEG,
+    GIMBAL_TILT_MAX_DEG,
+    GIMBAL_TILT_MIN_DEG,
+    INSPECTION_SPEED_MS,
+    MAX_FLIGHT_TIME_WITH_MANIFOLD_MIN,
+    MAX_SPEED_MS,
+    MAX_WAYPOINTS_PER_MISSION,
+    MIN_ALTITUDE_M,
+    MissionConfig,
+    RoofType,
+)
 from ..visualize import prepare_leaflet_data, prepare_threejs_data
+from .database import BuildingRecord, get_db
 from .state import session
 
 router = APIRouter()
@@ -52,8 +70,18 @@ class GenerateRequest(BaseModel):
     preset: Optional[Literal[
         "simple_box", "pitched_roof_house", "l_shaped_block", "large_apartment_block"
     ]] = None
+    building_id: Optional[str] = None
     building: BuildingParams = BuildingParams()
     mission: MissionParams = MissionParams()
+
+
+class BuildingUploadRequest(BaseModel):
+    name: str = "Uploaded building"
+    geojson: dict
+    height: float = Field(8.0, ge=1.0, le=100.0)
+    num_stories: int = Field(1, ge=1, le=20)
+    roof_type: Literal["flat", "pitched"] = "flat"
+    roof_pitch_deg: float = Field(0.0, ge=0.0, le=60.0)
 
 
 # --- Preset map ---
@@ -73,7 +101,155 @@ PRESET_DEFAULTS = {
 }
 
 
-# --- Endpoints ---
+# --- Building CRUD endpoints ---
+
+
+@router.post("/buildings")
+def create_building(req: BuildingUploadRequest):
+    """Upload a GeoJSON building footprint and store it."""
+    # Validate by parsing the GeoJSON into a Building
+    try:
+        building = build_building_from_geojson(
+            req.geojson,
+            height=req.height,
+            num_stories=req.num_stories,
+            roof_type=req.roof_type,
+            roof_pitch_deg=req.roof_pitch_deg,
+            name=req.name,
+        )
+    except (ValueError, KeyError, IndexError) as e:
+        raise HTTPException(status_code=400, detail=f"Invalid GeoJSON: {e}")
+
+    record = BuildingRecord(
+        name=req.name,
+        source_type="geojson",
+        geometry_data=json.dumps(req.geojson),
+        lat=building.lat,
+        lon=building.lon,
+        height=req.height,
+        num_stories=req.num_stories,
+        roof_type=req.roof_type,
+        roof_pitch_deg=req.roof_pitch_deg,
+        heading_deg=0.0,
+        properties_json=json.dumps({}),
+    )
+
+    db = get_db()
+    try:
+        db.add(record)
+        db.commit()
+        db.refresh(record)
+        return record.to_dict()
+    finally:
+        db.close()
+
+
+@router.post("/buildings/upload-file")
+async def upload_building_file(
+    file: UploadFile,
+    name: str = Form(""),
+    lat: float = Form(53.2012),
+    lon: float = Form(5.7999),
+    height: float = Form(0),
+    num_stories: int = Form(1),
+    roof_type: str = Form("flat"),
+    roof_pitch_deg: float = Form(0.0),
+):
+    """Upload an OBJ/PLY/STL mesh file and create a building from it."""
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="No file provided")
+
+    ext = file.filename.rsplit(".", 1)[-1].lower()
+    supported = {"obj": "obj", "ply": "ply", "stl": "stl", "glb": "glb", "gltf": "gltf"}
+    if ext not in supported:
+        raise HTTPException(status_code=400, detail=f"Unsupported format: .{ext}. Use .obj, .ply, or .stl")
+
+    file_data = await file.read()
+    build_name = name or file.filename.rsplit(".", 1)[0] or "Mesh building"
+
+    try:
+        building = build_building_from_mesh(
+            mesh_data=file_data,
+            file_type=supported[ext],
+            lat=lat,
+            lon=lon,
+            height=height if height > 0 else None,
+            num_stories=num_stories,
+            roof_type=roof_type,
+            roof_pitch_deg=roof_pitch_deg,
+            name=build_name,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to parse mesh: {e}")
+
+    record = BuildingRecord(
+        name=build_name,
+        source_type=f"mesh_{ext}",
+        geometry_data=None,  # mesh files are not stored as JSON
+        lat=building.lat,
+        lon=building.lon,
+        height=building.height,
+        num_stories=num_stories,
+        roof_type=roof_type,
+        roof_pitch_deg=roof_pitch_deg,
+        heading_deg=0.0,
+        properties_json=json.dumps({
+            "mesh_format": ext,
+            "mesh_vertices": len(building.facades),
+            "auto_height": building.height,
+        }),
+    )
+
+    db = get_db()
+    try:
+        db.add(record)
+        db.commit()
+        db.refresh(record)
+        return record.to_dict()
+    finally:
+        db.close()
+
+
+@router.get("/buildings")
+def list_buildings():
+    """List all uploaded buildings."""
+    db = get_db()
+    try:
+        records = db.query(BuildingRecord).order_by(BuildingRecord.created_at.desc()).all()
+        return {"buildings": [r.to_dict() for r in records]}
+    finally:
+        db.close()
+
+
+@router.get("/buildings/{building_id}")
+def get_building(building_id: str):
+    """Get a specific uploaded building."""
+    db = get_db()
+    try:
+        record = db.query(BuildingRecord).filter_by(id=building_id).first()
+        if not record:
+            raise HTTPException(status_code=404, detail="Building not found")
+        return record.to_dict()
+    finally:
+        db.close()
+
+
+@router.delete("/buildings/{building_id}")
+def delete_building(building_id: str):
+    """Delete an uploaded building."""
+    db = get_db()
+    try:
+        record = db.query(BuildingRecord).filter_by(id=building_id).first()
+        if not record:
+            raise HTTPException(status_code=404, detail="Building not found")
+        db.delete(record)
+        db.commit()
+        return {"deleted": building_id}
+    finally:
+        db.close()
+
+
+# --- Existing endpoints ---
 
 
 @router.get("/presets")
@@ -81,10 +257,60 @@ def get_presets():
     return {"presets": PRESET_DEFAULTS}
 
 
+@router.get("/drone")
+def get_drone():
+    """Return DJI Matrice 4E hardware specifications."""
+    cameras = {}
+    for name, spec in CAMERAS.items():
+        cameras[name.value] = {
+            "focal_length_mm": spec.focal_length_mm,
+            "sensor_width_mm": spec.sensor_width_mm,
+            "sensor_height_mm": spec.sensor_height_mm,
+            "image_width_px": spec.image_width_px,
+            "image_height_px": spec.image_height_px,
+            "fov_deg": spec.fov_deg,
+            "min_interval_s": spec.min_interval_s,
+        }
+    return {
+        "name": "DJI Matrice 4E",
+        "cameras": cameras,
+        "gimbal": {
+            "tilt_min_deg": GIMBAL_TILT_MIN_DEG,
+            "tilt_max_deg": GIMBAL_TILT_MAX_DEG,
+            "pan_min_deg": GIMBAL_PAN_MIN_DEG,
+            "pan_max_deg": GIMBAL_PAN_MAX_DEG,
+        },
+        "flight": {
+            "max_speed_ms": MAX_SPEED_MS,
+            "inspection_speed_ms": INSPECTION_SPEED_MS,
+            "min_altitude_m": MIN_ALTITUDE_M,
+            "max_waypoints": MAX_WAYPOINTS_PER_MISSION,
+            "max_flight_time_manifold_min": MAX_FLIGHT_TIME_WITH_MANIFOLD_MIN,
+        },
+    }
+
+
 @router.post("/generate")
 def generate(request: GenerateRequest):
-    # Build the building
-    if request.preset and request.preset in PRESET_MAP:
+    # Build the building from one of three sources: uploaded, preset, or custom box
+    if request.building_id:
+        db = get_db()
+        try:
+            record = db.query(BuildingRecord).filter_by(id=request.building_id).first()
+            if not record:
+                raise HTTPException(status_code=404, detail="Building not found")
+            geojson = json.loads(record.geometry_data)
+            building = build_building_from_geojson(
+                geojson,
+                height=request.building.height,
+                num_stories=request.building.num_stories,
+                roof_type=request.building.roof_type,
+                roof_pitch_deg=request.building.roof_pitch_deg,
+                name=record.name,
+            )
+        finally:
+            db.close()
+    elif request.preset and request.preset in PRESET_MAP:
         building = PRESET_MAP[request.preset](
             lat=request.building.lat,
             lon=request.building.lon,
@@ -117,18 +343,72 @@ def generate(request: GenerateRequest):
     # Generate waypoints
     waypoints = generate_mission_waypoints(building, config)
 
-    # Compute summary
+    # Compute summary with path metrics
     camera_spec = get_camera(camera_name)
     distance = compute_distance_for_gsd(camera_spec, config.target_gsd_mm_per_px)
     footprint = compute_footprint(camera_spec, distance)
-    estimated_flight_time_s = len(waypoints) * 2  # rough: ~2s per waypoint (hover + move)
+
+    n_inspection = sum(1 for wp in waypoints if not wp.is_transition)
+    n_transition = sum(1 for wp in waypoints if wp.is_transition)
+    n_photos = sum(
+        sum(1 for a in wp.actions if a.action_type.value == "takePhoto")
+        for wp in waypoints
+    )
+
+    # Compute total path length and per-segment distances
+    total_path_m = 0.0
+    transitions = []
+    prev_facade_idx = -1
+    for i in range(1, len(waypoints)):
+        dx = waypoints[i].x - waypoints[i - 1].x
+        dy = waypoints[i].y - waypoints[i - 1].y
+        dz = waypoints[i].z - waypoints[i - 1].z
+        seg_dist = math.sqrt(dx * dx + dy * dy + dz * dz)
+        total_path_m += seg_dist
+
+        # Track facade transitions
+        if waypoints[i].facade_index != prev_facade_idx and not waypoints[i].is_transition:
+            if prev_facade_idx >= 0:
+                heading_change = abs(waypoints[i].heading_deg - waypoints[i - 1].heading_deg)
+                if heading_change > 180:
+                    heading_change = 360 - heading_change
+                transitions.append({
+                    "from_facade": prev_facade_idx,
+                    "to_facade": waypoints[i].facade_index,
+                    "heading_change_deg": round(heading_change),
+                })
+            prev_facade_idx = waypoints[i].facade_index
+
+    # Estimate flight time (inspection WPs at inspection speed, transit at transit speed)
+    est_time_s = 0.0
+    for i in range(1, len(waypoints)):
+        dx = waypoints[i].x - waypoints[i - 1].x
+        dy = waypoints[i].y - waypoints[i - 1].y
+        dz = waypoints[i].z - waypoints[i - 1].z
+        seg_dist = math.sqrt(dx * dx + dy * dy + dz * dz)
+        speed = waypoints[i].speed_ms or config.flight_speed_ms
+        est_time_s += seg_dist / speed
+        if not waypoints[i].is_transition:
+            est_time_s += 1.0  # hover time for photo
+
+    # Per-facade waypoint counts
+    facade_wp_counts = {}
+    for wp in waypoints:
+        if not wp.is_transition:
+            facade_wp_counts[wp.facade_index] = facade_wp_counts.get(wp.facade_index, 0) + 1
 
     summary = {
         "waypoint_count": len(waypoints),
+        "inspection_waypoints": n_inspection,
+        "transition_waypoints": n_transition,
+        "photo_count": n_photos,
         "facade_count": len(building.facades),
         "camera_distance_m": round(distance, 1),
         "photo_footprint_m": [round(footprint.width_m, 1), round(footprint.height_m, 1)],
-        "estimated_flight_time_s": estimated_flight_time_s,
+        "total_path_m": round(total_path_m, 1),
+        "estimated_flight_time_s": round(est_time_s),
+        "transitions": transitions,
+        "facade_waypoint_counts": facade_wp_counts,
     }
 
     # Prepare viewer data

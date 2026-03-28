@@ -138,6 +138,7 @@ class Waypoint:
     facade_index: int = -1
     component_tag: str = ""  # NL-SfB code, e.g. "21.1"
     is_detail_point: bool = False
+    is_transition: bool = False  # transit waypoint (no photo, higher speed)
     index: int = 0  # global waypoint index, set during mission assembly
 
 

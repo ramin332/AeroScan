@@ -126,6 +126,23 @@ class TestVersions:
             assert "wpmz/template.kml" in zf.namelist()
 
 
+class TestDrone:
+    def test_get_drone(self):
+        r = client.get("/api/drone")
+        assert r.status_code == 200
+        data = r.json()
+        assert data["name"] == "DJI Matrice 4E"
+        assert "wide" in data["cameras"]
+        assert data["gimbal"]["tilt_min_deg"] == -90
+        assert data["flight"]["max_waypoints"] == 65535
+
+    def test_drone_cameras_have_specs(self):
+        r = client.get("/api/drone")
+        cam = r.json()["cameras"]["wide"]
+        assert cam["focal_length_mm"] == 24
+        assert cam["image_width_px"] == 5280
+
+
 class TestFrontend:
     def test_index_returns_html(self):
         r = client.get("/")

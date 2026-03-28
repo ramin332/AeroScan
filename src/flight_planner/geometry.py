@@ -20,6 +20,8 @@ from .models import (
     CameraAction,
     CameraName,
     Facade,
+    MAX_SPEED_MS,
+    MIN_ALTITUDE_M,
     MissionConfig,
     RoofType,
     Waypoint,
@@ -336,20 +338,122 @@ def generate_waypoints_for_facade(
     return waypoints
 
 
+def _make_transition_waypoint(
+    x: float, y: float, z: float,
+    heading_deg: float,
+    speed_ms: float,
+) -> Waypoint:
+    """Create a transit waypoint (no photo, higher speed)."""
+    return Waypoint(
+        x=x, y=y, z=max(z, MIN_ALTITUDE_M),
+        heading_deg=heading_deg,
+        gimbal_pitch_deg=0.0,
+        speed_ms=speed_ms,
+        actions=[],
+        is_transition=True,
+    )
+
+
+def _generate_transition_waypoints(
+    prev_wp: Waypoint,
+    next_wp: Waypoint,
+    prev_facade: Facade,
+    next_facade: Facade,
+    clearance: float,
+    speed: float,
+) -> list[Waypoint]:
+    """Generate clearance waypoints for transitioning between facades.
+
+    Flies out from the last waypoint along the facade normal,
+    then approaches the next facade from outside. This prevents
+    the drone from flying through the building at corners.
+    """
+    import numpy as np
+
+    # For transitions to/from roof, just go straight (already above building)
+    if abs(prev_facade.normal[2]) > 0.5 or abs(next_facade.normal[2]) > 0.5:
+        return []
+
+    # Exit point: fly further out along prev facade normal
+    exit_pos = np.array([prev_wp.x, prev_wp.y, prev_wp.z])
+    exit_pos[:2] += prev_facade.normal[:2] * clearance
+
+    # Entry point: approach next facade from outside
+    entry_pos = np.array([next_wp.x, next_wp.y, next_wp.z])
+    entry_pos[:2] += next_facade.normal[:2] * clearance
+
+    # Use a safe altitude for transition (highest of exit/entry + margin)
+    transit_z = max(exit_pos[2], entry_pos[2], prev_wp.z, next_wp.z) + 2.0
+
+    transition_wps = []
+
+    # Exit waypoint: pull out from facade
+    transition_wps.append(_make_transition_waypoint(
+        float(exit_pos[0]), float(exit_pos[1]), transit_z,
+        prev_wp.heading_deg, speed,
+    ))
+
+    # Corner waypoint (if exit and entry are far apart)
+    dist = np.linalg.norm(exit_pos[:2] - entry_pos[:2])
+    if dist > clearance:
+        # Add a midpoint at the corner to avoid clipping
+        mid = (exit_pos + entry_pos) / 2
+        # Push the midpoint outward from building center
+        mid_dir = mid[:2].copy()
+        mid_norm = np.linalg.norm(mid_dir)
+        if mid_norm > 0.1:
+            mid_dir /= mid_norm
+            mid[:2] += mid_dir * clearance * 0.5
+        transition_wps.append(_make_transition_waypoint(
+            float(mid[0]), float(mid[1]), transit_z,
+            next_wp.heading_deg, speed,
+        ))
+
+    # Entry waypoint: approach next facade
+    transition_wps.append(_make_transition_waypoint(
+        float(entry_pos[0]), float(entry_pos[1]), transit_z,
+        next_wp.heading_deg, speed,
+    ))
+
+    return transition_wps
+
+
 def generate_mission_waypoints(
     building: Building,
     config: MissionConfig,
 ) -> list[Waypoint]:
     """Generate all waypoints for a building inspection mission.
 
-    Iterates over all facades and generates waypoint grids, then assigns
-    global indices and converts to WGS84 coordinates.
+    Iterates over all facades, generates waypoint grids, and inserts
+    transition waypoints between facades to avoid flying through the building.
     """
-    all_waypoints: list[Waypoint] = []
-
+    # Generate inspection waypoints per facade
+    facade_groups: list[list[Waypoint]] = []
     for facade in building.facades:
         facade_wps = generate_waypoints_for_facade(facade, config)
-        all_waypoints.extend(facade_wps)
+        if facade_wps:
+            facade_groups.append(facade_wps)
+
+    # Assemble with transition waypoints between facades
+    all_waypoints: list[Waypoint] = []
+    transit_speed = min(config.flight_speed_ms * 3, MAX_SPEED_MS)
+
+    for i, group in enumerate(facade_groups):
+        if i > 0 and all_waypoints:
+            # Insert transition waypoints between facades
+            prev_wp = all_waypoints[-1]
+            next_wp = group[0]
+            prev_facade = building.facades[prev_wp.facade_index]
+            next_facade = building.facades[next_wp.facade_index]
+
+            transitions = _generate_transition_waypoints(
+                prev_wp, next_wp, prev_facade, next_facade,
+                clearance=config.obstacle_clearance_m,
+                speed=transit_speed,
+            )
+            all_waypoints.extend(transitions)
+
+        all_waypoints.extend(group)
 
     # Assign global indices
     for i, wp in enumerate(all_waypoints):
