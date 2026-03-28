@@ -220,6 +220,7 @@ def build_building_from_geojson(
 def _extract_facades_from_mesh(
     mesh: "trimesh.Trimesh",
     min_area_m2: float = 1.0,
+    cluster_facades: bool = False,
 ) -> Optional[list[Facade]]:
     """Extract real planar surfaces from a mesh using trimesh facet detection.
 
@@ -238,8 +239,13 @@ def _extract_facades_from_mesh(
     if len(facets) == 0:
         return None
 
-    # Compute area per facet
+    # Compute area per facet and building bounding box for occlusion check
     areas = np.array([float(mesh.area_faces[f].sum()) for f in facets])
+    bbox = mesh.bounding_box.extents
+    max_extent = float(max(bbox))
+
+    # Building center for normal orientation check
+    building_center = mesh.centroid.copy()
 
     facades: list[Facade] = []
     idx = 0
@@ -249,19 +255,42 @@ def _extract_facades_from_mesh(
             continue
 
         normal = normal / np.linalg.norm(normal)
+
+        # Get unique vertices for this facet
+        vert_indices = np.unique(mesh.faces[face_indices].flatten())
+        verts_3d = mesh.vertices[vert_indices]
+        facet_center = verts_3d.mean(axis=0)
+
+        # Fix flipped normals: ensure normal points AWAY from building center.
+        # Without this, facets with inconsistent winding generate waypoints
+        # on the wrong side of the building.
+        to_facet = facet_center - building_center
+        if np.dot(normal, to_facet) < 0:
+            normal = -normal
+
         nz = abs(normal[2])
 
         # Skip downward-facing surfaces (floors, ceilings) and ground plane
         if normal[2] < -0.5:
             continue
 
-        # Get unique vertices for this facet
-        vert_indices = np.unique(mesh.faces[face_indices].flatten())
-        verts_3d = mesh.vertices[vert_indices]
-
         # Skip surfaces at ground level
         if np.mean(verts_3d[:, 2]) < 0.3:
             continue
+
+        # Occlusion check: cast a ray from the facet center along its outward
+        # normal. If the ray hits another part of the mesh, this surface is
+        # blocked (e.g., window reveals, door jambs, recessed features) and
+        # a drone cannot photograph it from that direction.
+        ray_origin = facet_center + normal * 0.05  # slight offset to avoid self-hit
+        hits = mesh.ray.intersects_location(
+            ray_origins=[ray_origin],
+            ray_directions=[normal],
+        )
+        if len(hits[0]) > 0:
+            hit_dist = float(np.linalg.norm(hits[0][0] - ray_origin))
+            if hit_dist < max_extent * 0.5:
+                continue  # surface is occluded — skip
 
         # Classify surface type
         if nz < 0.1:
@@ -332,6 +361,140 @@ def _extract_facades_from_mesh(
         idx += 1
 
     return facades if facades else None
+
+
+def _cluster_facades(
+    facades: list[Facade],
+    angle_threshold_deg: float = 20.0,
+) -> list[Facade]:
+    """Merge facades with similar normals that are spatially close.
+
+    Uses agglomerative clustering: iteratively merge the closest pair of
+    facades (by normal angle) whose bounding volumes overlap, until no
+    more merges are possible. This eliminates redundant waypoint grids
+    from adjacent mesh facets on the same wall/roof plane.
+    """
+    # Build union-find structure
+    parent = list(range(len(facades)))
+
+    def find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    def union(i: int, j: int) -> None:
+        parent[find(i)] = find(j)
+
+    cos_threshold = math.cos(math.radians(angle_threshold_deg))
+
+    # Check all pairs — merge if normals are similar AND spatially close
+    for i in range(len(facades)):
+        for j in range(i + 1, len(facades)):
+            ni = facades[i].normal
+            nj = facades[j].normal
+
+            # Normal similarity: dot product > cos(threshold)
+            dot = float(np.dot(ni, nj))
+            if dot < cos_threshold:
+                continue
+
+            # Spatial proximity: check if closest vertices are within
+            # half the facade width (nearby on the same surface)
+            min_dist = float("inf")
+            for vi in facades[i].vertices:
+                for vj in facades[j].vertices:
+                    d = float(np.linalg.norm(vi - vj))
+                    if d < min_dist:
+                        min_dist = d
+            max_extent = max(facades[i].width, facades[j].width, 2.0)
+            if min_dist < max_extent:
+                union(i, j)
+
+    # Group facades by cluster
+    clusters: dict[int, list[int]] = {}
+    for i in range(len(facades)):
+        root = find(i)
+        clusters.setdefault(root, []).append(i)
+
+    # Merge each cluster into a single facade
+    merged: list[Facade] = []
+    idx = 0
+    for members in clusters.values():
+        if len(members) == 1:
+            f = facades[members[0]]
+            merged.append(Facade(
+                vertices=f.vertices,
+                normal=f.normal,
+                component_tag=f.component_tag,
+                label=f.label,
+                index=idx,
+            ))
+        else:
+            # Area-weighted average normal
+            total_area = 0.0
+            avg_normal = np.zeros(3)
+            all_verts = []
+            component = facades[members[0]].component_tag
+            for m in members:
+                f = facades[m]
+                area = f.width * f.height
+                avg_normal += f.normal * area
+                total_area += area
+                all_verts.append(f.vertices)
+                if f.component_tag != "47.1":
+                    component = f.component_tag
+
+            avg_normal /= np.linalg.norm(avg_normal)
+            combined_verts = np.vstack(all_verts)
+
+            # Recompute convex hull in the plane of the merged facade
+            nz = abs(avg_normal[2])
+            if nz < 0.9:
+                ref = np.array([0.0, 0.0, 1.0])
+            else:
+                ref = np.array([1.0, 0.0, 0.0])
+            u_axis = np.cross(avg_normal, ref)
+            u_axis /= np.linalg.norm(u_axis)
+            v_axis = np.cross(avg_normal, u_axis)
+            v_axis /= np.linalg.norm(v_axis)
+
+            center = combined_verts.mean(axis=0)
+            relative = combined_verts - center
+            u_coords = relative @ u_axis
+            v_coords = relative @ v_axis
+
+            pts_2d = list(zip(u_coords.tolist(), v_coords.tolist()))
+            hull_2d = _convex_hull_2d(pts_2d)
+            if len(hull_2d) < 3:
+                # Can't form hull, keep first facade
+                f = facades[members[0]]
+                merged.append(Facade(vertices=f.vertices, normal=f.normal,
+                                     component_tag=f.component_tag, label=f.label, index=idx))
+            else:
+                hull_3d = np.array([center + u * u_axis + v * v_axis for u, v in hull_2d])
+
+                # Label from dominant direction
+                azimuth = math.degrees(math.atan2(avg_normal[0], avg_normal[1])) % 360
+                if nz > 0.3:
+                    tilt = round(math.degrees(math.acos(min(nz, 1.0))))
+                    compass = "N" if azimuth < 45 or azimuth >= 315 else "E" if azimuth < 135 else "S" if azimuth < 225 else "W"
+                    label = f"roof_{compass}_{tilt}deg" if nz < 0.95 else "roof_flat"
+                else:
+                    label = ("north" if azimuth < 45 or azimuth >= 315 else
+                             "east" if azimuth < 135 else
+                             "south" if azimuth < 225 else "west") + "_wall"
+
+                merged.append(Facade(
+                    vertices=hull_3d,
+                    normal=avg_normal,
+                    component_tag=component,
+                    label=f"{label}_{idx}",
+                    index=idx,
+                ))
+        idx += 1
+
+    return merged
 
 
 def build_building_from_mesh(

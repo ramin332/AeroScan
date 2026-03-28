@@ -30,6 +30,20 @@ from .models import (
 )
 
 
+def _rotation_matrix_z(angle_rad: float) -> np.ndarray:
+    """3x3 rotation matrix around the Z (up) axis.
+
+    Positive angle = counterclockwise when viewed from above.
+    Used for building heading rotation in ENU coordinates.
+    """
+    c, s = np.cos(angle_rad), np.sin(angle_rad)
+    return np.array([
+        [c, -s, 0],
+        [s, c, 0],
+        [0, 0, 1],
+    ])
+
+
 def build_rectangular_building(
     lat: float,
     lon: float,
@@ -75,36 +89,25 @@ def build_rectangular_building(
         label=label,
     )
 
-    # Rotation matrix for heading (clockwise from north = counterclockwise in ENU)
-    theta = math.radians(heading_deg)
-    cos_t, sin_t = math.cos(theta), math.sin(theta)
-    # Heading from north (Y axis), clockwise: rotate ENU coordinates
-    # A heading of 0° means width along North, depth along East
-    # heading rotates: local_x -> sin(h)*E + cos(h)*N, local_y -> cos(h)*E - sin(h)*N
-
-    def rotate(local_x: float, local_y: float) -> tuple[float, float]:
-        """Rotate local building coords to ENU."""
-        e = local_x * cos_t + local_y * sin_t
-        n = -local_x * sin_t + local_y * cos_t
-        return e, n
+    # Rotation matrix for heading around Z (up) axis.
+    # Heading is CW from north in ENU: local Y (forward) maps to north at heading=0.
+    # R_z(theta) rotates local coords to ENU.
+    R = _rotation_matrix_z(math.radians(heading_deg))
 
     hw, hd = width / 2, depth / 2
 
     # Footprint corners in local building coords (x=along width, y=along depth)
-    # Order: SW, SE, NE, NW (looking down, with local Y pointing "forward")
-    local_corners = [
-        (-hw, -hd),  # 0: left-back
-        (hw, -hd),   # 1: right-back
-        (hw, hd),    # 2: right-front
-        (-hw, hd),   # 3: left-front
-    ]
+    local_corners_3d = np.array([
+        [-hw, -hd, 0.0],  # 0: left-back
+        [hw, -hd, 0.0],   # 1: right-back
+        [hw, hd, 0.0],    # 2: right-front
+        [-hw, hd, 0.0],   # 3: left-front
+    ])
 
-    # Convert to ENU
-    corners_2d = [rotate(lx, ly) for lx, ly in local_corners]
-
-    # 3D corners at ground and eave level
-    ground = np.array([[e, n, 0.0] for e, n in corners_2d])
-    eave = np.array([[e, n, height] for e, n in corners_2d])
+    # Rotate to ENU and set heights
+    ground = (R @ local_corners_3d.T).T
+    eave = ground.copy()
+    eave[:, 2] = height
 
     facades = []
 
@@ -158,13 +161,16 @@ def build_rectangular_building(
         ridge_rise = (depth / 2) * math.tan(pitch_rad)
         ridge_height = height + ridge_rise
 
-        # Ridge line endpoints (midpoints of front and back edges, at ridge height)
-        ridge_mid_back_local = (0.0, -hd + hd)  # actually mid of back edge...
-        # Ridge runs along local X at local Y=0
-        ridge_left = rotate(-hw, 0.0)
-        ridge_right = rotate(hw, 0.0)
-        ridge_left_3d = np.array([ridge_left[0], ridge_left[1], ridge_height])
-        ridge_right_3d = np.array([ridge_right[0], ridge_right[1], ridge_height])
+        # Ridge runs along local X at local Y=0, rotated to ENU
+        ridge_local = np.array([
+            [-hw, 0.0, ridge_height],
+            [hw, 0.0, ridge_height],
+        ])
+        ridge_enu = (R @ ridge_local.T).T
+        # Restore Z since R only rotates in XY
+        ridge_enu[:, 2] = ridge_height
+        ridge_left_3d = ridge_enu[0]
+        ridge_right_3d = ridge_enu[1]
 
         # South slope: eave[0]-eave[1] to ridge
         south_verts = np.array([eave[0], eave[1], ridge_right_3d, ridge_left_3d])
@@ -281,19 +287,9 @@ def generate_waypoints_for_facade(
     # We want to face the facade, so heading is opposite to normal
     heading_deg = (heading_deg + 180) % 360
 
-    # Gimbal pitch: compute from the look-at direction (-normal)
-    # The camera looks opposite to the outward normal (toward the surface).
-    # Pitch = atan2(vertical_component, horizontal_magnitude) of the look direction.
-    look_dir = -normal  # look toward the surface
-    horiz_mag = math.sqrt(look_dir[0] ** 2 + look_dir[1] ** 2)
-    gimbal_pitch = math.degrees(math.atan2(look_dir[2], horiz_mag))
-    # Vertical wall: pitch=0 (horizontal), flat roof: pitch=-90 (nadir),
-    # 30° pitched roof: pitch=-60° (tilted well down)
-
-    # Clamp gimbal pitch to hardware limits with configurable safety margin
+    # Gimbal pitch limits with configurable safety margin
     pitch_min = GIMBAL_TILT_MIN_DEG + config.gimbal_pitch_margin_deg
     pitch_max = GIMBAL_TILT_MAX_DEG - config.gimbal_pitch_margin_deg
-    gimbal_pitch = max(pitch_min, min(pitch_max, gimbal_pitch))
 
     # Offset vector from facade surface to camera position
     offset = normal * distance
@@ -308,16 +304,26 @@ def generate_waypoints_for_facade(
         for col in col_range:
             u_pos = u_start + col * h_step
 
-            # Position on the facade surface
-            surface_pos = center + u_pos * u_axis + v_pos * v_axis
-            # Camera position (offset from surface)
-            cam_pos = surface_pos + offset
+            # Target point on the facade surface
+            target_pos = center + u_pos * u_axis + v_pos * v_axis
+            # Camera position (offset from surface along normal)
+            cam_pos = target_pos + offset
 
             # Ensure minimum altitude
-            if cam_pos[2] < 2.0:
-                cam_pos[2] = 2.0
+            if cam_pos[2] < MIN_ALTITUDE_M:
+                cam_pos[2] = float(MIN_ALTITUDE_M)
 
-            # Create photo action
+            # Per-waypoint look-at vector: from camera to target surface point
+            look = target_pos - cam_pos
+            horiz_mag = math.sqrt(look[0] ** 2 + look[1] ** 2)
+
+            # Heading: face toward the target point
+            wp_heading = float(math.degrees(math.atan2(look[0], look[1])) % 360)
+
+            # Gimbal pitch: angle from horizontal to look direction
+            wp_pitch = math.degrees(math.atan2(look[2], horiz_mag)) if horiz_mag > 1e-6 else -90.0
+            wp_pitch = max(pitch_min, min(pitch_max, wp_pitch))
+
             actions = [
                 CameraAction(
                     action_type=ActionType.TAKE_PHOTO,
@@ -329,8 +335,8 @@ def generate_waypoints_for_facade(
                 x=float(cam_pos[0]),
                 y=float(cam_pos[1]),
                 z=float(cam_pos[2]),
-                heading_deg=heading_deg,
-                gimbal_pitch_deg=gimbal_pitch,
+                heading_deg=wp_heading,
+                gimbal_pitch_deg=wp_pitch,
                 speed_ms=config.flight_speed_ms,
                 actions=actions,
                 facade_index=facade.index,
@@ -573,26 +579,23 @@ def build_l_shaped_building(
         heading_deg=heading_deg,
         label=f"{label}_wing1" if label else "wing1",
     )
-    # Compute offset for wing 2 center
-    theta = math.radians(heading_deg)
-    cos_t, sin_t = math.cos(theta), math.sin(theta)
+    # Compute offset for wing 2 center using rotation matrix
+    R = _rotation_matrix_z(math.radians(heading_deg))
 
-    # Wing 2 center offset in local building coords
-    # Place wing 2 at the end of wing 1, extending perpendicular
-    local_x = wing1_width / 2 + wing2_depth / 2  # shift along width of wing1
-    local_y = wing1_depth / 2 - wing2_width / 2  # align with front edge of wing1
-
-    # Rotate to ENU
-    offset_e = local_x * cos_t + local_y * sin_t
-    offset_n = -local_x * sin_t + local_y * cos_t
+    local_offset = np.array([
+        wing1_width / 2 + wing2_depth / 2,   # shift along width of wing1
+        wing1_depth / 2 - wing2_width / 2,    # align with front edge of wing1
+        0.0,
+    ])
+    enu_offset = R @ local_offset
 
     # Approximate GPS offset
     lat_rad = math.radians(lat)
-    meters_per_deg_lat = 111132.92 - 559.82 * math.cos(2 * lat_rad)
-    meters_per_deg_lon = 111412.84 * math.cos(lat_rad)
+    meters_per_deg_lat = 111132.92 - 559.82 * math.cos(2 * lat_rad) + 1.175 * math.cos(4 * lat_rad)
+    meters_per_deg_lon = 111412.84 * math.cos(lat_rad) - 93.5 * math.cos(3 * lat_rad)
 
-    lat2 = lat + offset_n / meters_per_deg_lat
-    lon2 = lon + offset_e / meters_per_deg_lon
+    lat2 = lat + enu_offset[1] / meters_per_deg_lat
+    lon2 = lon + enu_offset[0] / meters_per_deg_lon
 
     b2 = build_rectangular_building(
         lat=lat2, lon=lon2,
@@ -601,7 +604,56 @@ def build_l_shaped_building(
         label=f"{label}_wing2" if label else "wing2",
     )
 
-    # Combine facades, re-index
+    # Remove interior facades: walls whose center is inside the other wing.
+    # Use a simple 2D point-in-footprint check (ground vertices of each wing).
+    def _footprint_2d(building: Building) -> np.ndarray:
+        """Get ground-level XY coords of wall vertices as a polygon."""
+        pts = []
+        for f in building.facades:
+            if abs(f.normal[2]) < 0.01:  # walls only
+                for v in f.vertices:
+                    if abs(v[2]) < 0.1:
+                        pts.append(v[:2])
+        if not pts:
+            return np.array([])
+        pts = np.array(pts)
+        # Sort by angle around centroid for convex polygon
+        cx, cy = pts.mean(axis=0)
+        angles = np.arctan2(pts[:, 1] - cy, pts[:, 0] - cx)
+        return pts[np.argsort(angles)]
+
+    def _point_in_polygon_2d(point: np.ndarray, polygon: np.ndarray) -> bool:
+        """Ray casting point-in-polygon test (2D)."""
+        x, y = point[0], point[1]
+        n = len(polygon)
+        inside = False
+        j = n - 1
+        for i in range(n):
+            xi, yi = polygon[i]
+            xj, yj = polygon[j]
+            if ((yi > y) != (yj > y)) and (x < (xj - xi) * (y - yi) / (yj - yi) + xi):
+                inside = not inside
+            j = i
+        return inside
+
+    fp1 = _footprint_2d(b1)
+    fp2 = _footprint_2d(b2)
+
+    exterior_facades = []
+    for f in b1.facades + b2.facades:
+        if abs(f.normal[2]) > 0.5:
+            # Roof — always keep
+            exterior_facades.append(f)
+            continue
+        # Check if wall center is inside the other wing
+        center_2d = f.center[:2]
+        is_b1_facade = any(np.array_equal(f.vertices, bf.vertices) for bf in b1.facades)
+        other_fp = fp2 if is_b1_facade else fp1
+        if len(other_fp) >= 3 and _point_in_polygon_2d(center_2d, other_fp):
+            continue  # interior wall — skip
+        exterior_facades.append(f)
+
+    # Re-index
     combined = Building(
         lat=lat, lon=lon,
         ground_altitude=ground_altitude,
@@ -611,10 +663,8 @@ def build_l_shaped_building(
         label=label or "l_shaped",
     )
 
-    all_facades = []
-    for i, f in enumerate(b1.facades + b2.facades):
+    for i, f in enumerate(exterior_facades):
         f.index = i
-        all_facades.append(f)
-    combined.facades = all_facades
+    combined.facades = exterior_facades
 
     return combined

@@ -88,7 +88,7 @@ class TestLShapedEndToEnd:
 
         assert len(waypoints) > 0
         facade_indices = set(wp.facade_index for wp in waypoints)
-        assert len(facade_indices) >= 8
+        assert len(facade_indices) >= 4  # at least some walls + roofs (interior walls removed)
 
         kmz_bytes = build_kmz_bytes(waypoints, config)
         assert len(kmz_bytes) > 0

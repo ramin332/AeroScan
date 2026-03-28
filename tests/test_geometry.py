@@ -120,8 +120,8 @@ class TestWaypointGeneration:
             dot = np.dot(to_wp[:2], wall.normal[:2])
             assert dot > 0, "Waypoint is on wrong side of facade"
 
-    def test_gimbal_horizontal_for_walls(self):
-        """Gimbal pitch should be 0° for vertical walls."""
+    def test_gimbal_near_horizontal_for_walls(self):
+        """Gimbal pitch should be near 0° for vertical walls (varies per waypoint)."""
         b = build_rectangular_building(
             lat=53.2, lon=5.8, width=20, depth=10, height=8,
         )
@@ -129,7 +129,11 @@ class TestWaypointGeneration:
         for wall in b.facades[:4]:
             wps = generate_waypoints_for_facade(wall, config)
             for wp in wps:
-                assert wp.gimbal_pitch_deg == 0.0
+                # Per-waypoint targeting: pitch varies slightly from 0°
+                # for off-center waypoints (looking up or down to target)
+                assert -30 < wp.gimbal_pitch_deg < 30, (
+                    f"Wall gimbal {wp.gimbal_pitch_deg}° should be near horizontal"
+                )
 
     def test_gimbal_down_for_flat_roof(self):
         """Gimbal pitch should be near -90° for flat roof (clamped with safety margin)."""

@@ -219,8 +219,8 @@ body {
   display: flex; align-items: center; justify-content: center;
 }
 .play-btn:hover { background: var(--accent2); }
-.progress-slider { width: 200px; accent-color: var(--accent); }
-.playback-wp { font-size: 11px; color: var(--fg2); min-width: 90px; }
+.progress-slider { width: 200px; flex-shrink: 0; accent-color: var(--accent); }
+.playback-wp { font-size: 11px; color: var(--fg2); width: 110px; flex-shrink: 0; text-align: left; }
 .speed-select {
   background: var(--bg3); border: 1px solid var(--border); border-radius: 4px;
   color: var(--fg2); padding: 2px 4px; font-size: 11px;
