@@ -1,4 +1,4 @@
-import { useRef, useMemo } from 'react';
+import { useRef, useMemo, useEffect } from 'react';
 import { useFrame } from '@react-three/fiber';
 import * as THREE from 'three';
 import type { WaypointData } from '../api/types';
@@ -42,10 +42,21 @@ interface Props {
   timeline?: Timeline;
 }
 
+/** Layer 1 is used to hide the drone marker from the PIP camera preview. */
+export const DRONE_LAYER = 1;
+
 export function DroneMarker({ waypoints, progress, cameraFov, timeline }: Props) {
   const groupRef = useRef<THREE.Group>(null);
   const gimbalRef = useRef<THREE.Group>(null);
   const footprintRef = useRef<THREE.Mesh>(null);
+
+  // Put all drone visuals on layer 1 so the PIP camera (layer 0 only) doesn't see them
+  useEffect(() => {
+    if (!groupRef.current) return;
+    groupRef.current.traverse((obj) => {
+      obj.layers.set(DRONE_LAYER);
+    });
+  });
 
   const positions = useMemo(
     () => waypoints.map((wp) => toScene(wp.x, wp.y, wp.z)),

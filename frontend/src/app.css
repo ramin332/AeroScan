@@ -226,5 +226,42 @@ body {
   color: var(--fg2); padding: 2px 4px; font-size: 11px;
 }
 
+/* Camera PIP overlay */
+.camera-pip-frame {
+  position: absolute;
+  top: 12px;
+  left: 12px;
+  width: 280px;
+  height: 210px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  z-index: 10;
+  pointer-events: none;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  padding: 6px 10px;
+  background: transparent;
+  box-shadow: 0 2px 12px rgba(0,0,0,0.4);
+}
+.camera-pip-label {
+  font-size: 10px;
+  color: var(--fg3);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  background: rgba(15,17,23,0.75);
+  padding: 2px 6px;
+  border-radius: 3px;
+  align-self: flex-start;
+}
+.camera-pip-wp {
+  font-size: 10px;
+  color: var(--fg2);
+  background: rgba(15,17,23,0.75);
+  padding: 2px 6px;
+  border-radius: 3px;
+  align-self: flex-end;
+}
+
 /* Leaflet overrides */
 .leaflet-container { background: var(--bg) !important; }

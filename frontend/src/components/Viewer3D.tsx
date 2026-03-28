@@ -1,9 +1,9 @@
 import { useRef, useMemo, useState, useCallback, useEffect } from 'react';
-import { Canvas, useThree, type ThreeEvent } from '@react-three/fiber';
+import { Canvas, useThree, useFrame, type ThreeEvent } from '@react-three/fiber';
 import { OrbitControls, Line } from '@react-three/drei';
 import * as THREE from 'three';
 import type { RawMeshData, ThreeJSData, WaypointData } from '../api/types';
-import { DroneMarker, getVisitedIndex } from './DroneAnimation';
+import { DroneMarker, getVisitedIndex, DRONE_LAYER } from './DroneAnimation';
 
 // Convert ENU (x=East, y=North, z=Up) to Three.js (x=right, y=up, z=toward camera)
 function enu(x: number, y: number, z: number): [number, number, number] {
@@ -270,6 +270,100 @@ interface CameraFOV {
   distance_m: number;
 }
 
+interface Timeline {
+  totalTime: number;
+  cumTimes: number[];
+}
+
+const PIP_W = 280;
+const PIP_H = 210;
+const PIP_X = 12;
+const PIP_TOP = 12; // CSS px from top of canvas
+
+function CameraPreview({ waypoints, progress, cameraFov, timeline }: {
+  waypoints: WaypointData[];
+  progress: number;
+  cameraFov?: CameraFOV;
+  timeline?: Timeline;
+}) {
+  const pipCameraRef = useRef<THREE.PerspectiveCamera>(null);
+  const { gl, scene, camera, size } = useThree();
+
+  const positions = useMemo(
+    () => waypoints.map((wp) => new THREE.Vector3(wp.x, wp.z, -wp.y)),
+    [waypoints],
+  );
+
+  const vFov = cameraFov?.fov_v_deg || 50;
+
+  useFrame(() => {
+    if (!pipCameraRef.current || positions.length < 2) return;
+
+    // Interpolate drone position (same logic as DroneMarker)
+    let idx: number, t: number;
+    if (timeline && timeline.cumTimes.length === positions.length) {
+      const currentTime = progress * timeline.totalTime;
+      idx = 0;
+      for (let i = 1; i < timeline.cumTimes.length; i++) {
+        if (timeline.cumTimes[i] >= currentTime) break;
+        idx = i;
+      }
+      idx = Math.min(idx, positions.length - 2);
+      const segStart = timeline.cumTimes[idx];
+      const segEnd = timeline.cumTimes[idx + 1];
+      const segDur = segEnd - segStart;
+      t = segDur > 0 ? Math.min((currentTime - segStart) / segDur, 1) : 0;
+    } else {
+      const n = positions.length - 1;
+      const rawIdx = progress * n;
+      idx = Math.min(Math.floor(rawIdx), n - 1);
+      t = rawIdx - idx;
+    }
+
+    const wp = waypoints[Math.min(idx + 1, waypoints.length - 1)];
+    const eased = wp.is_transition ? t * t * (3 - 2 * t) : t;
+    const pos = new THREE.Vector3().lerpVectors(positions[idx], positions[idx + 1], eased);
+
+    // Position + orient PIP camera to match drone heading + gimbal
+    pipCameraRef.current.position.copy(pos);
+    const headingRad = -(wp.heading * Math.PI) / 180;
+    const pitchRad = (wp.gimbal_pitch * Math.PI) / 180;
+    pipCameraRef.current.rotation.set(pitchRad, headingRad, 0, 'YXZ');
+    pipCameraRef.current.aspect = PIP_W / PIP_H;
+    pipCameraRef.current.updateProjectionMatrix();
+    pipCameraRef.current.updateMatrixWorld();
+
+    // Main camera sees drone layer too; PIP camera only sees layer 0
+    camera.layers.enable(DRONE_LAYER);
+
+    // 1. Render main scene (full viewport, auto-clear)
+    gl.setViewport(0, 0, size.width, size.height);
+    gl.render(scene, camera);
+
+    // 2. Render PIP (drone camera view)
+    const pipY = size.height - PIP_TOP - PIP_H; // WebGL y is bottom-up
+    gl.autoClear = false;
+    gl.setScissorTest(true);
+    gl.setScissor(PIP_X, pipY, PIP_W, PIP_H);
+    gl.setViewport(PIP_X, pipY, PIP_W, PIP_H);
+    gl.clear(true, true, false);
+    gl.render(scene, pipCameraRef.current);
+    gl.setScissorTest(false);
+    gl.setViewport(0, 0, size.width, size.height);
+    gl.autoClear = true;
+  }, 1); // priority 1: take over rendering for dual viewport
+
+  return (
+    <perspectiveCamera
+      ref={pipCameraRef}
+      fov={vFov}
+      aspect={PIP_W / PIP_H}
+      near={0.1}
+      far={200}
+    />
+  );
+}
+
 export function Viewer3D({ data, cameraFov }: { data: ThreeJSData | null; cameraFov?: CameraFOV }) {
   const [selectedWp, setSelectedWp] = useState<WaypointData | null>(null);
   const [playing, setPlaying] = useState(false);
@@ -277,6 +371,7 @@ export function Viewer3D({ data, cameraFov }: { data: ThreeJSData | null; camera
   const [speed, setSpeed] = useState(1);
   const [usePhysics, setUsePhysics] = useState(true);
   const [showRawMesh, setShowRawMesh] = useState(true);
+  const showPip = playing || progress > 0;
   const animRef = useRef<number | null>(null);
   const lastTimeRef = useRef(0);
 
@@ -392,7 +487,18 @@ export function Viewer3D({ data, cameraFov }: { data: ThreeJSData | null; camera
         {(playing || progress > 0) && (
           <DroneMarker waypoints={data.waypoints} progress={progress} cameraFov={cameraFov} timeline={usePhysics ? timeline : undefined} />
         )}
+        {showPip && (
+          <CameraPreview waypoints={data.waypoints} progress={progress} cameraFov={cameraFov} timeline={usePhysics ? timeline : undefined} />
+        )}
       </Canvas>
+
+      {/* Camera preview frame */}
+      {showPip && (
+        <div className="camera-pip-frame">
+          <span className="camera-pip-label">Camera Preview</span>
+          <span className="camera-pip-wp">WP {currentWpIdx} · {currentWp?.heading}° · {currentWp?.gimbal_pitch}°</span>
+        </div>
+      )}
 
       {/* Legend */}
       <div className="legend-3d">
