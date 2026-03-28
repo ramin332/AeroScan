@@ -91,6 +91,21 @@ MAX_WAYPOINTS_PER_MISSION = 65535
 MAX_FLIGHT_TIME_WITH_MANIFOLD_MIN = 32
 OBSTACLE_CLEARANCE_M = 2
 
+# WGS84 geodetic coefficients for local ENU ↔ WGS84 conversion.
+# Suitable for small areas (<1 km). Used by geometry, building_import, and visualize.
+WGS84_LAT_A = 111132.92  # base meters per degree latitude
+WGS84_LAT_B = -559.82  # 2nd-harmonic latitude correction
+WGS84_LAT_C = 1.175  # 4th-harmonic latitude correction
+WGS84_LON_A = 111412.84  # base meters per degree longitude
+WGS84_LON_B = -93.5  # 3rd-harmonic longitude correction
+
+
+def meters_per_deg(ref_lat_rad: float) -> tuple[float, float]:
+    """Return (meters_per_deg_lat, meters_per_deg_lon) at a reference latitude (radians)."""
+    m_lat = WGS84_LAT_A + WGS84_LAT_B * math.cos(2 * ref_lat_rad) + WGS84_LAT_C * math.cos(4 * ref_lat_rad)
+    m_lon = WGS84_LON_A * math.cos(ref_lat_rad) + WGS84_LON_B * math.cos(3 * ref_lat_rad)
+    return m_lat, m_lon
+
 
 @dataclass
 class CameraAction:
@@ -251,6 +266,55 @@ class Building:
 
     # Label
     label: str = ""
+
+
+@dataclass
+class AlgorithmConfig:
+    """Tunable algorithm parameters that are not backed by hardware specs.
+
+    These control internal thresholds, safety margins, and heuristics
+    throughout the pipeline. Defaults match the original hardcoded values.
+    """
+
+    # -- Flight time estimation (validate.py) --
+    hover_time_per_wp_s: float = 1.0  # assumed hover per inspection waypoint
+    takeoff_landing_overhead_s: float = 60.0  # fixed overhead for takeoff/landing
+    battery_warning_threshold: float = 0.80  # fraction of max flight time → RTH warning
+    battery_info_threshold: float = 0.65  # fraction of max flight time → info message
+    gimbal_near_limit_deg: float = -80.0  # pitch threshold for "near nadir" info
+
+    # -- Geometry / grid generation (geometry.py) --
+    facade_edge_inset_m: float = 0.1  # margin from facade edges for waypoints
+    transition_altitude_margin_m: float = 2.0  # extra height during facade transitions
+    roof_normal_threshold: float = 0.5  # abs(nz) > this → surface is roof (transitions)
+    min_altitude_m: float = 2.0  # safety floor for all waypoints
+
+    # -- Mesh import (building_import.py) --
+    default_building_height_m: float = 8.0  # fallback height when unknown
+    min_mesh_faces: int = 4  # reject meshes with fewer faces
+    downward_face_threshold: float = -0.3  # nz < this → floor/ceiling (filtered)
+    ground_level_threshold_m: float = 0.3  # z < this → ground-level surface (filtered)
+    occlusion_ray_offset_m: float = 0.05  # offset along normal for ray origin
+    occlusion_hit_fraction: float = 0.5  # hit dist < fraction of bbox → interior wall
+    flat_roof_normal_threshold: float = 0.95  # nz > this → flat roof
+    wall_normal_threshold: float = 0.3  # nz < this → wall
+    auto_scale_height_threshold_m: float = 50.0  # mesh height > this → assume wrong units
+    auto_scale_target_height_m: float = 8.0  # rescale target when auto-scaling
+    region_growing_angle_deg: float = 15.0  # coplanarity threshold for region growing
+
+    # -- Waypoint LOS occlusion (geometry.py) --
+    enable_waypoint_los: bool = True  # ray-cast LOS check per waypoint against mesh
+    los_tolerance_m: float = 0.5  # hit closer than (target_dist - tolerance) = occluded
+    los_min_visible_ratio: float = 0.4  # min fraction of sample rays that must reach facade
+
+    # -- Path optimization (optimize.py) --
+    enable_path_dedup: bool = True  # merge near-coincident cross-facade waypoints
+    enable_path_tsp: bool = True  # 2-opt TSP facade ordering (vs greedy nearest-neighbor)
+    enable_sweep_reversal: bool = True  # flip sweep direction per facade for shorter transitions
+    dedup_max_gimbal_diff_deg: float = 20.0  # max gimbal angle diff for merge eligibility
+
+    # -- KMZ export (kmz_builder.py) --
+    min_waypoint_height_m: float = 2.0  # clamp waypoint Z in KMZ output
 
 
 @dataclass

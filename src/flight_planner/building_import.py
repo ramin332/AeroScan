@@ -15,7 +15,11 @@ from typing import Optional
 
 import numpy as np
 
-from .models import Building, Facade, RoofType
+from .models import AlgorithmConfig, Building, Facade, meters_per_deg, RoofType
+
+# Module-level extraction stats populated by extract_facades / build_building_from_mesh.
+# Read by the API after calling these functions. Reset on each call.
+last_extraction_stats: dict = {}
 
 
 def _convex_hull_2d(points: list[tuple[float, float]]) -> list[tuple[float, float]]:
@@ -196,8 +200,7 @@ def build_building_from_geojson(
     center_lat = sum(lats) / len(lats)
 
     # Convert WGS84 to local ENU (meters from centroid)
-    m_per_lat = 111132.92 - 559.82 * math.cos(2 * math.radians(center_lat))
-    m_per_lon = 111412.84 * math.cos(math.radians(center_lat))
+    m_per_lat, m_per_lon = meters_per_deg(math.radians(center_lat))
 
     enu_coords: list[tuple[float, float]] = []
     for c in coords:
@@ -221,6 +224,7 @@ def _extract_region_growing(
     mesh: "trimesh.Trimesh",
     min_area_m2: float = 1.0,
     angle_threshold_deg: float = 15.0,
+    algo: AlgorithmConfig | None = None,
 ) -> Optional[list[Facade]]:
     """Extract building surfaces via region growing on the mesh face adjacency graph.
 
@@ -238,8 +242,14 @@ def _extract_region_growing(
     from scipy.sparse import csr_matrix
     from scipy.sparse.csgraph import connected_components
 
+    if algo is None:
+        algo = AlgorithmConfig()
+
+    # Use algo's angle threshold as the effective default
+    angle_threshold_deg = algo.region_growing_angle_deg
+
     n_faces = len(mesh.faces)
-    if n_faces < 4:
+    if n_faces < algo.min_mesh_faces:
         return None
 
     adj = mesh.face_adjacency                          # (M, 2) pairs
@@ -260,11 +270,26 @@ def _extract_region_growing(
     facades: list[Facade] = []
     idx = 0
 
+    # Stats tracking
+    _stats = {
+        "method": "region_growing",
+        "input_faces": n_faces,
+        "regions_found": n_comp,
+        "filtered_by_area": 0,
+        "filtered_by_normal": 0,
+        "filtered_by_ground": 0,
+        "filtered_by_occlusion": 0,
+        "facades_extracted": 0,
+        "walls": 0,
+        "roofs": 0,
+    }
+
     for comp_id in range(n_comp):
         face_mask = labels == comp_id
         comp_area = float(mesh.area_faces[face_mask].sum())
 
         if comp_area < min_area_m2:
+            _stats["filtered_by_area"] += 1
             continue
 
         # Area-weighted average normal
@@ -273,6 +298,7 @@ def _extract_region_growing(
         avg_normal = (comp_normals * comp_areas[:, np.newaxis]).sum(axis=0)
         norm_len = np.linalg.norm(avg_normal)
         if norm_len < 1e-9:
+            _stats["filtered_by_normal"] += 1
             continue
         avg_normal /= norm_len
 
@@ -289,32 +315,35 @@ def _extract_region_growing(
         nz = abs(avg_normal[2])
 
         # Skip downward-facing (floors/ceilings) and ground-level surfaces
-        if avg_normal[2] < -0.3:
+        if avg_normal[2] < algo.downward_face_threshold:
+            _stats["filtered_by_normal"] += 1
             continue
-        if center[2] < 0.3:
+        if center[2] < algo.ground_level_threshold_m:
+            _stats["filtered_by_ground"] += 1
             continue
 
         # Occlusion check (trimesh ray casting): cast ray from facade center
         # along outward normal. If it hits the mesh, a drone can't photograph
         # this surface from that direction (wall in the way).
-        ray_origin = center + avg_normal * 0.05
+        ray_origin = center + avg_normal * algo.occlusion_ray_offset_m
         hits = mesh.ray.intersects_location(
             ray_origins=[ray_origin],
             ray_directions=[avg_normal],
         )
         if len(hits[0]) > 0:
             hit_dist = float(np.linalg.norm(hits[0][0] - ray_origin))
-            if hit_dist < max_extent * 0.5:
+            if hit_dist < max_extent * algo.occlusion_hit_fraction:
+                _stats["filtered_by_occlusion"] += 1
                 continue
 
         # Classify surface type
-        if nz < 0.3:
+        if nz < algo.wall_normal_threshold:
             azimuth = math.degrees(math.atan2(avg_normal[0], avg_normal[1])) % 360
             direction = ("north_wall" if azimuth < 45 or azimuth >= 315 else
                          "east_wall" if azimuth < 135 else
                          "south_wall" if azimuth < 225 else "west_wall")
             component = "21.1"
-        elif nz > 0.95:
+        elif nz > algo.flat_roof_normal_threshold:
             direction = "roof_flat"
             component = "47.1"
         else:
@@ -360,13 +389,21 @@ def _extract_region_growing(
             index=idx,
         ))
         idx += 1
+        if component == "21.1":
+            _stats["walls"] += 1
+        else:
+            _stats["roofs"] += 1
 
+    _stats["facades_extracted"] = len(facades)
+    global last_extraction_stats
+    last_extraction_stats = _stats
     return facades if facades else None
 
 
 def _extract_convex_hull(
     mesh: "trimesh.Trimesh",
     min_area_m2: float = 1.0,
+    algo: AlgorithmConfig | None = None,
     **_kwargs: object,
 ) -> Optional[list[Facade]]:
     """Extract facades from the mesh's convex hull footprint.
@@ -400,6 +437,7 @@ def _extract_convex_hull(
 def _extract_meshlab(
     mesh: "trimesh.Trimesh",
     min_area_m2: float = 1.0,
+    algo: AlgorithmConfig | None = None,
     **_kwargs: object,
 ) -> Optional[list[Facade]]:
     """Extract facades using PyMeshLab's face-normal selection + connected components.
@@ -416,6 +454,9 @@ def _extract_meshlab(
     import tempfile
     import os
 
+    if algo is None:
+        algo = AlgorithmConfig()
+
     # Export trimesh to temp file for PyMeshLab (it needs a file path)
     with tempfile.NamedTemporaryFile(suffix=".ply", delete=False) as f:
         mesh.export(f.name)
@@ -423,18 +464,20 @@ def _extract_meshlab(
 
     try:
         building_center = mesh.centroid.copy()
+        wt = algo.wall_normal_threshold
+        frt = algo.flat_roof_normal_threshold
 
         # Direction conditions: muParser syntax for face normals (fnx, fny, fnz)
         direction_configs = [
-            ("north_wall", "fny > 0.85",                        "21.1"),
-            ("south_wall", "fny < -0.85",                       "21.1"),
-            ("east_wall",  "fnx > 0.85",                        "21.1"),
-            ("west_wall",  "fnx < -0.85",                       "21.1"),
-            ("roof_flat",  "fnz > 0.95",                        "47.1"),
-            ("roof_slope", "fnz > 0.3 && fnz <= 0.95 && fny > 0.3",  "47.1"),
-            ("roof_slope", "fnz > 0.3 && fnz <= 0.95 && fny < -0.3", "47.1"),
-            ("roof_slope", "fnz > 0.3 && fnz <= 0.95 && fnx > 0.3",  "47.1"),
-            ("roof_slope", "fnz > 0.3 && fnz <= 0.95 && fnx < -0.3", "47.1"),
+            ("north_wall", f"fny > {1 - wt:.2f}",                        "21.1"),
+            ("south_wall", f"fny < -{1 - wt:.2f}",                       "21.1"),
+            ("east_wall",  f"fnx > {1 - wt:.2f}",                        "21.1"),
+            ("west_wall",  f"fnx < -{1 - wt:.2f}",                       "21.1"),
+            ("roof_flat",  f"fnz > {frt}",                               "47.1"),
+            ("roof_slope", f"fnz > {wt} && fnz <= {frt} && fny > {wt}",  "47.1"),
+            ("roof_slope", f"fnz > {wt} && fnz <= {frt} && fny < -{wt}", "47.1"),
+            ("roof_slope", f"fnz > {wt} && fnz <= {frt} && fnx > {wt}",  "47.1"),
+            ("roof_slope", f"fnz > {wt} && fnz <= {frt} && fnx < -{wt}", "47.1"),
         ]
 
         facades: list[Facade] = []
@@ -490,19 +533,19 @@ def _extract_meshlab(
                     avg_normal = -avg_normal
 
                 # Skip downward / ground level
-                if avg_normal[2] < -0.3:
+                if avg_normal[2] < algo.downward_face_threshold:
                     continue
-                if center[2] < 0.3:
+                if center[2] < algo.ground_level_threshold_m:
                     continue
 
                 # Classify
                 nz = abs(avg_normal[2])
-                if nz < 0.3:
+                if nz < algo.wall_normal_threshold:
                     azimuth = math.degrees(math.atan2(avg_normal[0], avg_normal[1])) % 360
                     direction = ("north_wall" if azimuth < 45 or azimuth >= 315 else
                                  "east_wall" if azimuth < 135 else
                                  "south_wall" if azimuth < 225 else "west_wall")
-                elif nz > 0.95:
+                elif nz > algo.flat_roof_normal_threshold:
                     direction = "roof_flat"
                 else:
                     tilt = round(math.degrees(math.acos(min(nz, 1.0))))
@@ -560,6 +603,7 @@ def extract_facades(
     mesh: "trimesh.Trimesh",
     method: str = "region_growing",
     min_area_m2: float = 1.0,
+    algo: AlgorithmConfig | None = None,
     **kwargs: object,
 ) -> list[Facade]:
     """Extract facades from a mesh using the specified method.
@@ -568,11 +612,11 @@ def extract_facades(
     Falls back to convex_hull if the chosen method returns no results.
     """
     fn = EXTRACTION_METHODS.get(method, _extract_region_growing)
-    result = fn(mesh, min_area_m2=min_area_m2, **kwargs)
+    result = fn(mesh, min_area_m2=min_area_m2, algo=algo, **kwargs)
     if result:
         return result
     if method != "convex_hull":
-        result = _extract_convex_hull(mesh, min_area_m2=min_area_m2)
+        result = _extract_convex_hull(mesh, min_area_m2=min_area_m2, algo=algo)
     return result or []
 
 
@@ -588,6 +632,7 @@ def build_building_from_mesh(
     name: str = "",
     min_facade_area: float = 1.0,
     method: str = "region_growing",
+    algo: AlgorithmConfig | None = None,
 ) -> Building:
     """Create a Building from an OBJ/PLY/STL mesh file.
 
@@ -603,6 +648,9 @@ def build_building_from_mesh(
     """
     import io
     import trimesh
+
+    if algo is None:
+        algo = AlgorithmConfig()
 
     mesh = trimesh.load(io.BytesIO(mesh_data), file_type=file_type)
 
@@ -645,8 +693,8 @@ def build_building_from_mesh(
     # to 8m.
     if height is not None and height > 0:
         scale = height / mesh_height
-    elif mesh_height > 50:
-        height = 8.0
+    elif mesh_height > algo.auto_scale_height_threshold_m:
+        height = algo.auto_scale_target_height_m
         scale = height / mesh_height
     else:
         height = round(mesh_height, 1)
@@ -662,7 +710,7 @@ def build_building_from_mesh(
 
     # Try facet-based extraction first (gives real wall/roof planes from mesh).
     # Fall back to convex hull if facets aren't available.
-    facades = extract_facades(mesh, method=method, min_area_m2=min_facade_area)
+    facades = extract_facades(mesh, method=method, min_area_m2=min_facade_area, algo=algo)
 
     if facades:
         xs = [float(v[0]) for f in facades for v in f.vertices]

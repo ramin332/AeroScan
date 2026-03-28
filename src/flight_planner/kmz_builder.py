@@ -15,6 +15,7 @@ from djikmz.model.mission_config import FinishAction, RCLostAction
 
 from .models import (
     ActionType,
+    AlgorithmConfig,
     GIMBAL_TILT_MAX_DEG,
     GIMBAL_TILT_MIN_DEG,
     MAX_WAYPOINTS_PER_MISSION,
@@ -42,8 +43,12 @@ def _heading_to_djikmz(heading_deg: float) -> float:
 def _build_mission(
     waypoints: list[Waypoint],
     config: MissionConfig,
+    algo: AlgorithmConfig | None = None,
 ) -> DroneTask:
     """Build a djikmz DroneTask from our waypoints and config."""
+    if algo is None:
+        algo = AlgorithmConfig()
+
     if len(waypoints) > MAX_WAYPOINTS_PER_MISSION:
         raise ValueError(
             f"Mission has {len(waypoints)} waypoints, "
@@ -75,7 +80,7 @@ def _build_mission(
     mission._mission_config.take_off_height = config.takeoff_security_height_m
 
     for wp in waypoints:
-        wb = mission.fly_to(wp.lat, wp.lon, height=max(wp.z, 2.0))
+        wb = mission.fly_to(wp.lat, wp.lon, height=max(wp.z, algo.min_waypoint_height_m))
         wb.speed(wp.speed_ms)
 
         heading = _heading_to_djikmz(wp.heading_deg)
@@ -106,6 +111,7 @@ def build_kmz(
     waypoints: list[Waypoint],
     config: MissionConfig,
     output_path: str,
+    algo: AlgorithmConfig | None = None,
 ) -> str:
     """Generate a DJI WPML-compliant KMZ file.
 
@@ -113,12 +119,13 @@ def build_kmz(
         waypoints: Ordered list of mission waypoints.
         config: Mission configuration.
         output_path: Path to write the .kmz file.
+        algo: Algorithm configuration overrides.
 
     Returns:
         The absolute path to the generated KMZ file.
     """
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
-    mission = _build_mission(waypoints, config)
+    mission = _build_mission(waypoints, config, algo)
     mission.to_kmz(output_path)
     return os.path.abspath(output_path)
 
@@ -126,13 +133,14 @@ def build_kmz(
 def build_kmz_bytes(
     waypoints: list[Waypoint],
     config: MissionConfig,
+    algo: AlgorithmConfig | None = None,
 ) -> bytes:
     """Generate a DJI WPML-compliant KMZ file as bytes (in-memory)."""
     with tempfile.NamedTemporaryFile(suffix=".kmz", delete=False) as f:
         tmp_path = f.name
 
     try:
-        mission = _build_mission(waypoints, config)
+        mission = _build_mission(waypoints, config, algo)
         mission.to_kmz(tmp_path)
         with open(tmp_path, "rb") as f:
             return f.read()

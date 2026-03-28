@@ -22,7 +22,7 @@ class TestSimpleBoxEndToEnd:
         """Simple box -> waypoints -> KMZ -> validate."""
         building = simple_box()
         config = MissionConfig(target_gsd_mm_per_px=2.0)
-        waypoints = generate_mission_waypoints(building, config)
+        waypoints, _ = generate_mission_waypoints(building, config)
 
         assert len(waypoints) > 0
         assert all(wp.lat != 0 for wp in waypoints)
@@ -40,7 +40,7 @@ class TestSimpleBoxEndToEnd:
         """A 20x10x8m building at 2mm GSD should produce a manageable number of waypoints."""
         building = simple_box()
         config = MissionConfig(target_gsd_mm_per_px=2.0)
-        waypoints = generate_mission_waypoints(building, config)
+        waypoints, _ = generate_mission_waypoints(building, config)
         assert 10 < len(waypoints) < 1000
 
     def test_gsd_consistency(self):
@@ -50,7 +50,7 @@ class TestSimpleBoxEndToEnd:
         camera = get_camera(config.camera)
         expected_distance = compute_distance_for_gsd(camera, config.target_gsd_mm_per_px)
 
-        waypoints = generate_mission_waypoints(building, config)
+        waypoints, _ = generate_mission_waypoints(building, config)
         for wp in waypoints:
             if wp.facade_index < 4 and not wp.is_transition:
                 facade = building.facades[wp.facade_index]
@@ -66,7 +66,7 @@ class TestPitchedRoofEndToEnd:
     def test_full_pipeline(self):
         building = pitched_roof_house()
         config = MissionConfig(target_gsd_mm_per_px=2.0)
-        waypoints = generate_mission_waypoints(building, config)
+        waypoints, _ = generate_mission_waypoints(building, config)
 
         assert len(waypoints) > 0
 
@@ -84,7 +84,7 @@ class TestLShapedEndToEnd:
     def test_full_pipeline(self):
         building = l_shaped_block()
         config = MissionConfig(target_gsd_mm_per_px=2.0)
-        waypoints = generate_mission_waypoints(building, config)
+        waypoints, _ = generate_mission_waypoints(building, config)
 
         assert len(waypoints) > 0
         facade_indices = set(wp.facade_index for wp in waypoints)
@@ -99,7 +99,7 @@ class TestMaxWaypoints:
         """Even the largest preset should be under the 65535 waypoint limit."""
         building = large_apartment_block()
         config = MissionConfig(target_gsd_mm_per_px=2.0)
-        waypoints = generate_mission_waypoints(building, config)
+        waypoints, _ = generate_mission_waypoints(building, config)
         assert len(waypoints) <= 65535
 
 
@@ -108,7 +108,7 @@ class TestCoordinateFormat:
         """KMZ should be a valid ZIP with template.kml."""
         building = simple_box()
         config = MissionConfig()
-        waypoints = generate_mission_waypoints(building, config)
+        waypoints, _ = generate_mission_waypoints(building, config)
         kmz_bytes = build_kmz_bytes(waypoints, config)
 
         assert zipfile.is_zipfile(io.BytesIO(kmz_bytes))

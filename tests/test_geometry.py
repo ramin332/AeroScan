@@ -172,7 +172,7 @@ class TestWaypointGeneration:
             lat=53.2, lon=5.8, width=20, depth=10, height=3,
         )
         config = MissionConfig()
-        wps = generate_mission_waypoints(b, config)
+        wps, _ = generate_mission_waypoints(b, config)
         for wp in wps:
             assert wp.z >= 2.0, f"WP{wp.index} altitude {wp.z}m below minimum"
 

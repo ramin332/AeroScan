@@ -5,12 +5,15 @@ import * as THREE from 'three';
 import type { RawMeshData, ThreeJSData, WaypointData } from '../api/types';
 import { DroneMarker, getVisitedIndex, DRONE_LAYER } from './DroneAnimation';
 
+// Layers: 0 = base scene + ghost mesh, 1 = drone (hidden from PIP), 3 = solid mesh (PIP only)
+const MESH_SOLID_LAYER = 3;
+
 // Convert ENU (x=East, y=North, z=Up) to Three.js (x=right, y=up, z=toward camera)
 function enu(x: number, y: number, z: number): [number, number, number] {
   return [x, z, -y];
 }
 
-function FacadeMesh({ vertices, color }: { vertices: number[][]; color: string }) {
+function FacadeMesh({ vertices, color, hidden, highlighted }: { vertices: number[][]; color: string; hidden?: boolean; highlighted?: boolean }) {
   const geometry = useMemo(() => {
     const geo = new THREE.BufferGeometry();
     const positions: number[] = [];
@@ -33,42 +36,81 @@ function FacadeMesh({ vertices, color }: { vertices: number[][]; color: string }
     return pts;
   }, [vertices]);
 
+  if (hidden) return null;
+
   return (
     <group>
-      <mesh geometry={geometry}>
-        <meshStandardMaterial color={color} transparent opacity={0.35} side={THREE.DoubleSide} roughness={0.8} />
+      <mesh geometry={geometry} renderOrder={highlighted ? 1 : 0}>
+        <meshStandardMaterial
+          color={color} transparent
+          opacity={highlighted ? 0.7 : 0.35}
+          side={THREE.DoubleSide} roughness={0.8}
+          depthWrite={false}
+          emissive={highlighted ? color : '#000000'}
+          emissiveIntensity={highlighted ? 0.15 : 0}
+        />
       </mesh>
-      <Line points={edgePoints} color={color} lineWidth={1.5} />
+      <Line points={edgePoints} color={color} lineWidth={highlighted ? 2.5 : 1.5} />
     </group>
   );
 }
 
-function WaypointSpheres({ waypoints, color }: { waypoints: WaypointData[]; color: string }) {
-  const meshRef = useRef<THREE.InstancedMesh>(null);
+// Adaptive sphere detail: fewer polys when there are many waypoints
+function sphereArgs(count: number): [number, number, number] {
+  if (count > 2000) return [0.06, 3, 2];
+  if (count > 500)  return [0.08, 4, 3];
+  return [0.1, 6, 4];
+}
 
-  useMemo(() => {
-    if (!meshRef.current) return;
+const BATCH_SIZE = 500; // matrices per frame
+
+function WaypointSpheres({ waypoints, color, bright }: { waypoints: WaypointData[]; color: string; bright?: boolean }) {
+  const meshRef = useRef<THREE.InstancedMesh>(null);
+  const [radius, wSeg, hSeg] = sphereArgs(waypoints.length);
+
+  useEffect(() => {
+    if (!meshRef.current || waypoints.length === 0) return;
+    const mesh = meshRef.current;
     const dummy = new THREE.Object3D();
-    waypoints.forEach((wp, i) => {
-      dummy.position.set(...enu(wp.x, wp.y, wp.z));
-      dummy.updateMatrix();
-      meshRef.current!.setMatrixAt(i, dummy.matrix);
-    });
-    meshRef.current.instanceMatrix.needsUpdate = true;
+    let offset = 0;
+    let raf: number;
+
+    function batch() {
+      const end = Math.min(offset + BATCH_SIZE, waypoints.length);
+      for (let i = offset; i < end; i++) {
+        const wp = waypoints[i];
+        dummy.position.set(...enu(wp.x, wp.y, wp.z));
+        dummy.updateMatrix();
+        mesh.setMatrixAt(i, dummy.matrix);
+      }
+      mesh.instanceMatrix.needsUpdate = true;
+      offset = end;
+      if (offset < waypoints.length) {
+        raf = requestAnimationFrame(batch);
+      }
+    }
+    batch();
+    return () => cancelAnimationFrame(raf);
   }, [waypoints]);
 
+  if (waypoints.length === 0) return null;
+
   return (
-    <instancedMesh ref={meshRef} args={[undefined, undefined, waypoints.length]}>
-      <sphereGeometry args={[0.25, 8, 6]} />
-      <meshStandardMaterial color={color} roughness={0.4} metalness={0.1} />
+    <instancedMesh ref={meshRef} args={[undefined, undefined, waypoints.length]} frustumCulled={false}>
+      <sphereGeometry args={[bright ? radius * 1.3 : radius, wSeg, hSeg]} />
+      <meshStandardMaterial color={color} transparent opacity={bright ? 0.85 : 0.45} roughness={0.4} metalness={bright ? 0.2 : 0.1} emissive={bright ? color : '#000000'} emissiveIntensity={bright ? 0.3 : 0} />
     </instancedMesh>
   );
 }
 
-function CameraArrows({ waypoints, color }: { waypoints: WaypointData[]; color: string }) {
+function CameraArrows({ waypoints, color, bright }: { waypoints: WaypointData[]; color: string; bright?: boolean }) {
+  // For large sets, only draw every Nth arrow
+  const stride = waypoints.length > 2000 ? 4 : waypoints.length > 500 ? 2 : 1;
+
   const geometry = useMemo(() => {
     const positions: number[] = [];
-    for (const wp of waypoints) {
+    for (let j = 0; j < waypoints.length; j += stride) {
+      const wp = waypoints[j];
       const [ox, oy, oz] = enu(wp.x, wp.y, wp.z);
       const hr = (wp.heading * Math.PI) / 180;
       const pr = (wp.gimbal_pitch * Math.PI) / 180;
@@ -81,11 +123,11 @@ function CameraArrows({ waypoints, color }: { waypoints: WaypointData[]; color: 
     const geo = new THREE.BufferGeometry();
     geo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
     return geo;
-  }, [waypoints]);
+  }, [waypoints, stride]);
 
   return (
     <lineSegments geometry={geometry}>
-      <lineBasicMaterial color={color} transparent opacity={0.5} />
+      <lineBasicMaterial color={color} transparent opacity={bright ? 0.6 : 0.25} />
     </lineSegments>
   );
 }
@@ -113,6 +155,8 @@ function FlightPath({ waypoints }: { waypoints: WaypointData[] }) {
 }
 
 function RawMeshView({ mesh }: { mesh: RawMeshData }) {
+  const solidRef = useRef<THREE.Mesh>(null);
+
   const geometry = useMemo(() => {
     const geo = new THREE.BufferGeometry();
     // Convert ENU positions to Three.js coordinate system
@@ -128,24 +172,45 @@ function RawMeshView({ mesh }: { mesh: RawMeshData }) {
     return geo;
   }, [mesh]);
 
+  // Solid mesh only visible to PIP camera (layer 3); ghost mesh stays on default layer 0
+  useEffect(() => {
+    if (solidRef.current) {
+      solidRef.current.layers.set(MESH_SOLID_LAYER);
+    }
+  });
+
   return (
     <group>
-      <mesh geometry={geometry}>
+      {/* Ghost mesh: semi-transparent for orbital view */}
+      <group>
+        <mesh geometry={geometry}>
+          <meshStandardMaterial
+            color="#8899bb"
+            transparent
+            opacity={0.25}
+            side={THREE.DoubleSide}
+            roughness={0.7}
+            metalness={0.1}
+          />
+        </mesh>
+        <mesh geometry={geometry}>
+          <meshStandardMaterial
+            color="#aabbdd"
+            wireframe
+            transparent
+            opacity={0.15}
+          />
+        </mesh>
+      </group>
+
+      {/* Solid mesh: opaque for PIP camera preview (realistic building) */}
+      <mesh ref={solidRef} geometry={geometry}>
         <meshStandardMaterial
-          color="#8899bb"
-          transparent
-          opacity={0.25}
+          color="#c8ccd4"
           side={THREE.DoubleSide}
-          roughness={0.7}
-          metalness={0.1}
-        />
-      </mesh>
-      <mesh geometry={geometry}>
-        <meshStandardMaterial
-          color="#aabbdd"
-          wireframe
-          transparent
-          opacity={0.15}
+          roughness={0.85}
+          metalness={0.0}
+          flatShading
         />
       </mesh>
     </group>
@@ -155,8 +220,9 @@ function RawMeshView({ mesh }: { mesh: RawMeshData }) {
 function VisitedOverlay({ waypoints, visitedUpTo }: { waypoints: WaypointData[]; visitedUpTo: number }) {
   const meshRef = useRef<THREE.InstancedMesh>(null);
   const count = Math.min(visitedUpTo + 1, waypoints.length);
+  const [radius, wSeg, hSeg] = sphereArgs(waypoints.length);
 
-  useMemo(() => {
+  useEffect(() => {
     if (!meshRef.current || count <= 0) return;
     const dummy = new THREE.Object3D();
     for (let i = 0; i < count; i++) {
@@ -172,14 +238,14 @@ function VisitedOverlay({ waypoints, visitedUpTo }: { waypoints: WaypointData[];
   if (count <= 0) return null;
 
   return (
-    <instancedMesh ref={meshRef} args={[undefined, undefined, waypoints.length]}>
-      <sphereGeometry args={[0.3, 6, 4]} />
-      <meshStandardMaterial color="#888" transparent opacity={0.6} />
+    <instancedMesh ref={meshRef} args={[undefined, undefined, waypoints.length]} frustumCulled={false}>
+      <sphereGeometry args={[radius + 0.02, wSeg, hSeg]} />
+      <meshStandardMaterial color="#888" transparent opacity={0.35} />
     </instancedMesh>
   );
 }
 
-function Scene({ data, onWaypointClick, visitedIndex, showRawMesh }: { data: ThreeJSData; onWaypointClick: (wp: WaypointData | null) => void; visitedIndex: number; showRawMesh: boolean }) {
+function Scene({ data, onWaypointClick, visitedIndex, showRawMesh, captureView, activeFacades }: { data: ThreeJSData; onWaypointClick: (wp: WaypointData | null) => void; visitedIndex: number; showRawMesh: boolean; captureView: boolean; activeFacades: Set<number> | null }) {
   const { raycaster } = useThree();
 
   // Separate inspection and transition waypoints
@@ -227,14 +293,41 @@ function Scene({ data, onWaypointClick, visitedIndex, showRawMesh }: { data: Thr
       </mesh>
 
       {/* Facades */}
-      {data.facades.map((f) => (
-        <FacadeMesh key={f.index} vertices={f.vertices} color={f.color} />
-      ))}
+      {data.facades.map((f) => {
+        if (captureView && activeFacades) {
+          const isActive = activeFacades.has(f.index);
+          return (
+            <FacadeMesh key={f.index} vertices={f.vertices} color={f.color}
+              hidden={!isActive} highlighted={isActive} />
+          );
+        }
+        // Capture view with nothing selected: hide all facades (grey mesh only)
+        if (captureView) return <FacadeMesh key={f.index} vertices={f.vertices} color={f.color} hidden />;
+        return <FacadeMesh key={f.index} vertices={f.vertices} color={f.color} />;
+      })}
 
-      {/* Inspection waypoints + arrows per facade */}
+      {/* Waypoints + arrows */}
       {Object.entries(facadeWaypoints).map(([fi, wps]) => {
-        const facade = data.facades.find((f) => f.index === parseInt(fi));
+        const facadeIdx = parseInt(fi);
+        const facade = data.facades.find((f) => f.index === facadeIdx);
         const color = facade?.color || '#888';
+        if (captureView && activeFacades) {
+          const isActive = activeFacades.has(facadeIdx);
+          return (
+            <group key={fi}>
+              <WaypointSpheres waypoints={wps} color={isActive ? color : '#1a1a2a'} bright={isActive} />
+              {isActive && <CameraArrows waypoints={wps} color={color} bright />}
+            </group>
+          );
+        }
+        if (captureView) {
+          // Nothing selected: dim everything
+          return (
+            <group key={fi}>
+              <WaypointSpheres waypoints={wps} color="#333" />
+            </group>
+          );
+        }
         return (
           <group key={fi}>
             <WaypointSpheres waypoints={wps} color={color} />
@@ -243,9 +336,9 @@ function Scene({ data, onWaypointClick, visitedIndex, showRawMesh }: { data: Thr
         );
       })}
 
-      {/* Transition waypoints (smaller, grey) */}
+      {/* Transition waypoints */}
       {transitionWaypoints.length > 0 && (
-        <WaypointSpheres waypoints={transitionWaypoints} color="#555" />
+        <WaypointSpheres waypoints={transitionWaypoints} color={captureView ? '#111122' : '#555'} />
       )}
 
       {/* Flight path */}
@@ -279,20 +372,37 @@ const PIP_W = 280;
 const PIP_H = 210;
 const PIP_X = 12;
 const PIP_TOP = 12; // CSS px from top of canvas
+const SNAP_W = 200;
+const SNAP_H = 150;
 
-function CameraPreview({ waypoints, progress, cameraFov, timeline }: {
+function CameraPreview({ waypoints, progress, cameraFov, timeline, onSnapshot }: {
   waypoints: WaypointData[];
   progress: number;
   cameraFov?: CameraFOV;
   timeline?: Timeline;
+  onSnapshot: (dataUrl: string, wpIdx: number, photoNum: number) => void;
 }) {
   const pipCameraRef = useRef<THREE.PerspectiveCamera>(null);
   const { gl, scene, camera, size } = useThree();
+  const lastPhotoWpRef = useRef(-1);
+  const photoCountRef = useRef(0);
 
   const positions = useMemo(
     () => waypoints.map((wp) => new THREE.Vector3(wp.x, wp.z, -wp.y)),
     [waypoints],
   );
+
+  // Offscreen render target for snapshot capture
+  const renderTarget = useMemo(() => {
+    const rt = new THREE.WebGLRenderTarget(SNAP_W * 2, SNAP_H * 2);
+    return rt;
+  }, []);
+
+  // Reset photo counter on new data
+  useEffect(() => {
+    lastPhotoWpRef.current = -1;
+    photoCountRef.current = 0;
+  }, [waypoints]);
 
   const vFov = cameraFov?.fov_v_deg || 50;
 
@@ -320,7 +430,8 @@ function CameraPreview({ waypoints, progress, cameraFov, timeline }: {
       t = rawIdx - idx;
     }
 
-    const wp = waypoints[Math.min(idx + 1, waypoints.length - 1)];
+    const wpIdx = Math.min(idx + 1, waypoints.length - 1);
+    const wp = waypoints[wpIdx];
     const eased = wp.is_transition ? t * t * (3 - 2 * t) : t;
     const pos = new THREE.Vector3().lerpVectors(positions[idx], positions[idx + 1], eased);
 
@@ -333,14 +444,19 @@ function CameraPreview({ waypoints, progress, cameraFov, timeline }: {
     pipCameraRef.current.updateProjectionMatrix();
     pipCameraRef.current.updateMatrixWorld();
 
-    // Main camera sees drone layer too; PIP camera only sees layer 0
+    // Layer setup:
+    // Main camera: layer 0 (base + ghost mesh) + 1 (drone)
+    // PIP camera:  layer 0 (base + ghost mesh) + 3 (solid mesh), no drone
+    // The solid opaque mesh on layer 3 renders over the transparent ghost mesh on layer 0
     camera.layers.enable(DRONE_LAYER);
+    pipCameraRef.current.layers.set(0);
+    pipCameraRef.current.layers.enable(MESH_SOLID_LAYER);
 
     // 1. Render main scene (full viewport, auto-clear)
     gl.setViewport(0, 0, size.width, size.height);
     gl.render(scene, camera);
 
-    // 2. Render PIP (drone camera view)
+    // 2. Render PIP (drone camera view — solid building)
     const pipY = size.height - PIP_TOP - PIP_H; // WebGL y is bottom-up
     gl.autoClear = false;
     gl.setScissorTest(true);
@@ -351,6 +467,36 @@ function CameraPreview({ waypoints, progress, cameraFov, timeline }: {
     gl.setScissorTest(false);
     gl.setViewport(0, 0, size.width, size.height);
     gl.autoClear = true;
+
+    // 3. Capture snapshot at photo waypoints (t > 0.85, inspection WP)
+    if (!wp.is_transition && t > 0.85 && lastPhotoWpRef.current !== wpIdx) {
+      lastPhotoWpRef.current = wpIdx;
+      photoCountRef.current++;
+
+      // Render to offscreen target at snapshot camera position
+      pipCameraRef.current.aspect = SNAP_W / SNAP_H;
+      pipCameraRef.current.updateProjectionMatrix();
+      gl.setRenderTarget(renderTarget);
+      gl.clear(true, true, false);
+      gl.render(scene, pipCameraRef.current);
+      gl.setRenderTarget(null);
+
+      // Read pixels and create data URL
+      const w = renderTarget.width, h = renderTarget.height;
+      const buf = new Uint8Array(w * h * 4);
+      gl.readRenderTargetPixels(renderTarget, 0, 0, w, h, buf);
+      const c = document.createElement('canvas');
+      c.width = w; c.height = h;
+      const ctx = c.getContext('2d')!;
+      const img = ctx.createImageData(w, h);
+      for (let y = 0; y < h; y++) {
+        const src = (h - y - 1) * w * 4;
+        const dst = y * w * 4;
+        img.data.set(buf.subarray(src, src + w * 4), dst);
+      }
+      ctx.putImageData(img, 0, 0);
+      onSnapshot(c.toDataURL('image/jpeg', 0.7), wpIdx, photoCountRef.current);
+    }
   }, 1); // priority 1: take over rendering for dual viewport
 
   return (
@@ -369,8 +515,11 @@ export function Viewer3D({ data, cameraFov }: { data: ThreeJSData | null; camera
   const [playing, setPlaying] = useState(false);
   const [progress, setProgress] = useState(0);
   const [speed, setSpeed] = useState(1);
+  const [snapshot, setSnapshot] = useState<{ url: string; wpIdx: number; photoNum: number } | null>(null);
   const [usePhysics, setUsePhysics] = useState(true);
   const [showRawMesh, setShowRawMesh] = useState(true);
+  const [captureView, setCaptureView] = useState(false);
+  const [captureDir, setCaptureDir] = useState<string | null>(null);
   const showPip = playing || progress > 0;
   const animRef = useRef<number | null>(null);
   const lastTimeRef = useRef(0);
@@ -379,7 +528,12 @@ export function Viewer3D({ data, cameraFov }: { data: ThreeJSData | null; camera
   useEffect(() => {
     setPlaying(false);
     setProgress(0);
+    setSnapshot(null);
   }, [data]);
+
+  const handleSnapshot = useCallback((url: string, wpIdx: number, photoNum: number) => {
+    setSnapshot({ url, wpIdx, photoNum });
+  }, []);
 
   // Compute physics-based timeline: segment times from distances + speeds + dwell
   const timeline = useMemo(() => {
@@ -455,16 +609,30 @@ export function Viewer3D({ data, cameraFov }: { data: ThreeJSData | null; camera
     return groups;
   }, [data]);
 
-  if (!data) {
-    return <div className="empty-state">Click "Generate Mission" to start</div>;
-  }
+  // Current waypoint index for display (must be before early return for hook order)
+  const currentWpIdx = data
+    ? Math.min(Math.floor(progress * (data.waypoints.length - 1)), data.waypoints.length - 1)
+    : 0;
+  const currentWp = data?.waypoints[currentWpIdx] ?? null;
 
-  // Current waypoint index for display
-  const currentWpIdx = Math.min(
-    Math.floor(progress * (data.waypoints.length - 1)),
-    data.waypoints.length - 1,
-  );
-  const currentWp = data.waypoints[currentWpIdx];
+  // Active facade set for capture view
+  const activeFacadeSet = useMemo(() => {
+    if (!captureView || !data) return null;
+    if (selectedWp) return new Set([selectedWp.facade_index]);
+    if (progress > 0 && currentWp && !currentWp.is_transition) return new Set([currentWp.facade_index]);
+    if (captureDir) {
+      const indices = new Set<number>();
+      for (const f of data.facades) {
+        if (f.direction === captureDir) indices.add(f.index);
+      }
+      return indices.size > 0 ? indices : null;
+    }
+    return null;
+  }, [captureView, selectedWp, progress, currentWp, captureDir, data]);
+
+  if (!data) {
+    return <div className="empty-state">Ariana Engineering &times; AeroScan</div>;
+  }
 
   return (
     <div style={{ width: '100%', height: '100%', position: 'relative' }}>
@@ -483,12 +651,12 @@ export function Viewer3D({ data, cameraFov }: { data: ThreeJSData | null; camera
           enableDamping
           dampingFactor={0.08}
         />
-        <Scene data={data} onWaypointClick={setSelectedWp} visitedIndex={playing || progress > 0 ? getVisitedIndex(progress, data.waypoints.length) : -1} showRawMesh={showRawMesh} />
+        <Scene data={data} onWaypointClick={setSelectedWp} visitedIndex={playing || progress > 0 ? getVisitedIndex(progress, data.waypoints.length) : -1} showRawMesh={showRawMesh} captureView={captureView} activeFacades={activeFacadeSet} />
         {(playing || progress > 0) && (
           <DroneMarker waypoints={data.waypoints} progress={progress} cameraFov={cameraFov} timeline={usePhysics ? timeline : undefined} />
         )}
         {showPip && (
-          <CameraPreview waypoints={data.waypoints} progress={progress} cameraFov={cameraFov} timeline={usePhysics ? timeline : undefined} />
+          <CameraPreview waypoints={data.waypoints} progress={progress} cameraFov={cameraFov} timeline={usePhysics ? timeline : undefined} onSnapshot={handleSnapshot} />
         )}
       </Canvas>
 
@@ -500,8 +668,28 @@ export function Viewer3D({ data, cameraFov }: { data: ThreeJSData | null; camera
         </div>
       )}
 
+      {/* Last captured photo */}
+      {snapshot && (
+        <div className="snapshot-frame">
+          <img src={snapshot.url} alt={`Photo ${snapshot.photoNum}`} />
+          <div className="snapshot-info">
+            <span className="snapshot-label">Photo {snapshot.photoNum}</span>
+            <span className="snapshot-wp">WP {snapshot.wpIdx}</span>
+          </div>
+        </div>
+      )}
+
       {/* Legend */}
       <div className="legend-3d">
+        <label className="legend-item" style={{ cursor: 'pointer', marginBottom: 4 }}>
+          <input
+            type="checkbox"
+            checked={captureView}
+            onChange={(e) => setCaptureView(e.target.checked)}
+            style={{ marginRight: 6 }}
+          />
+          <span>Capture view</span>
+        </label>
         {data.rawMesh && (
           <label className="legend-item" style={{ cursor: 'pointer', marginBottom: 4 }}>
             <input
@@ -513,12 +701,22 @@ export function Viewer3D({ data, cameraFov }: { data: ThreeJSData | null; camera
             <span>Raw mesh</span>
           </label>
         )}
-        {Object.entries(directionGroups).map(([dir, g]) => (
-          <div key={dir} className="legend-item">
-            <span className="legend-dot" style={{ backgroundColor: g.color }} />
-            <span>{dir} ({g.facades}f / {g.waypoints}wp)</span>
-          </div>
-        ))}
+        {Object.entries(directionGroups).map(([dir, g]) => {
+          const isActive = captureView && captureDir === dir;
+          return (
+            <div key={dir} className={`legend-item${captureView ? ' clickable' : ''}`}
+              onClick={captureView ? () => setCaptureDir(captureDir === dir ? null : dir) : undefined}
+              style={captureView ? { cursor: 'pointer' } : undefined}>
+              <span className="legend-dot" style={{
+                backgroundColor: isActive ? g.color : captureView ? '#333344' : g.color,
+                boxShadow: isActive ? `0 0 6px ${g.color}` : undefined,
+              }} />
+              <span style={{ color: isActive ? 'var(--fg)' : captureView ? 'var(--fg3)' : undefined }}>
+                {dir} ({g.facades}f / {g.waypoints}wp)
+              </span>
+            </div>
+          );
+        })}
       </div>
 
       {/* Playback controls */}
@@ -559,13 +757,20 @@ export function Viewer3D({ data, cameraFov }: { data: ThreeJSData | null; camera
           <option value={2}>2x</option>
           <option value={4}>4x</option>
         </select>
-        <button
-          className={`mode-btn ${usePhysics ? 'active' : ''}`}
-          onClick={() => setUsePhysics(!usePhysics)}
-          title={usePhysics ? 'Physics timing (realistic)' : 'Linear timing (fast preview)'}
-        >
-          {usePhysics ? 'PHY' : 'LIN'}
-        </button>
+        <div className="playback-toggle">
+          <button
+            className={`playback-toggle-btn ${usePhysics ? 'active' : ''}`}
+            onClick={() => setUsePhysics(true)}
+          >
+            Real
+          </button>
+          <button
+            className={`playback-toggle-btn ${!usePhysics ? 'active' : ''}`}
+            onClick={() => setUsePhysics(false)}
+          >
+            Fast
+          </button>
+        </div>
         <button
           className="play-btn"
           onClick={() => { setProgress(0); setPlaying(false); }}

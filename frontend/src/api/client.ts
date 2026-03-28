@@ -47,6 +47,10 @@ export async function deleteVersion(id: string): Promise<void> {
   await request(`/versions/${id}`, { method: 'DELETE' });
 }
 
+export async function deleteAllVersions(): Promise<void> {
+  await request('/versions', { method: 'DELETE' });
+}
+
 export function kmzDownloadUrl(versionId: string): string {
   return `${BASE}/versions/${versionId}/kmz`;
 }

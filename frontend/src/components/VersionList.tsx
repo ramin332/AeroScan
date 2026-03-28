@@ -1,7 +1,7 @@
 import { useStore } from '../store';
 
 export function VersionList() {
-  const { versions, result, loadVersion, deleteVersion } = useStore();
+  const { versions, result, loadVersion, deleteVersion, deleteAllVersions } = useStore();
 
   if (versions.length === 0) {
     return <div className="empty-text">No versions yet</div>;
@@ -25,6 +25,13 @@ export function VersionList() {
           </span>
         </div>
       ))}
+      {versions.length > 1 && (
+        <button className="btn-secondary"
+          style={{ marginTop: 6, fontSize: 11, padding: '2px 8px', opacity: 0.7, width: '100%' }}
+          onClick={deleteAllVersions}>
+          Clear all history
+        </button>
+      )}
     </div>
   );
 }

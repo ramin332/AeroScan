@@ -33,11 +33,49 @@ export interface ValidationIssue {
   facade_index: number | null;
 }
 
+export interface AlgorithmParams {
+  // Flight time estimation
+  hover_time_per_wp_s: number;
+  takeoff_landing_overhead_s: number;
+  battery_warning_threshold: number;
+  battery_info_threshold: number;
+  gimbal_near_limit_deg: number;
+  // Geometry / grid generation
+  facade_edge_inset_m: number;
+  transition_altitude_margin_m: number;
+  roof_normal_threshold: number;
+  min_altitude_m: number;
+  // Mesh import
+  default_building_height_m: number;
+  min_mesh_faces: number;
+  downward_face_threshold: number;
+  ground_level_threshold_m: number;
+  occlusion_ray_offset_m: number;
+  occlusion_hit_fraction: number;
+  flat_roof_normal_threshold: number;
+  wall_normal_threshold: number;
+  auto_scale_height_threshold_m: number;
+  auto_scale_target_height_m: number;
+  region_growing_angle_deg: number;
+  // Waypoint LOS occlusion
+  enable_waypoint_los: boolean;
+  los_tolerance_m: number;
+  los_min_visible_ratio: number;
+  // Path optimization
+  enable_path_dedup: boolean;
+  enable_path_tsp: boolean;
+  enable_sweep_reversal: boolean;
+  dedup_max_gimbal_diff_deg: number;
+  // KMZ export
+  min_waypoint_height_m: number;
+}
+
 export interface GenerateRequest {
   preset?: string | null;
   building_id?: string | null;
   building: BuildingParams;
   mission: MissionParams;
+  algorithm: AlgorithmParams;
   min_facade_area?: number;
   extraction_method?: string;
 }
@@ -168,6 +206,48 @@ export interface ViewerData {
   leaflet: LeafletData;
 }
 
+export interface PerfStats {
+  total_ms: number;
+  building_ms: number;
+  waypoints_ms: number;
+  summary_ms: number;
+  validate_ms: number;
+  generation: {
+    facades_total: number;
+    facades_with_waypoints: number;
+    waypoints_before_dedup: number;
+    waypoints_after_dedup: number;
+    waypoints_deduped: number;
+    per_facade: { facade_index: number; label: string; waypoints: number; before_dedup: number }[];
+    optimization: {
+      waypoints_merged: number;
+      facade_order: number[];
+      facades_reversed: number[];
+      transit_distance_before_m: number;
+      transit_distance_after_m: number;
+      transit_saved_m: number;
+      two_opt_improvements: number;
+    };
+  };
+  extraction: {
+    method: string;
+    input_faces: number;
+    regions_found: number;
+    filtered_by_area: number;
+    filtered_by_normal: number;
+    filtered_by_ground: number;
+    filtered_by_occlusion: number;
+    facades_extracted: number;
+    walls: number;
+    roofs: number;
+  } | null;
+  validation_counts: {
+    errors: number;
+    warnings: number;
+    info: number;
+  };
+}
+
 export interface GenerateResponse {
   version_id: string;
   timestamp: string;
@@ -175,9 +255,11 @@ export interface GenerateResponse {
   viewer_data: ViewerData;
   validation: ValidationIssue[];
   can_export: boolean;
+  perf?: PerfStats;
   config_snapshot: {
     building: BuildingParams;
     mission: MissionParams;
+    algorithm?: AlgorithmParams;
   };
 }
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+import time
 from typing import Literal, Optional
 
 from fastapi import APIRouter, Form, HTTPException, UploadFile
@@ -21,6 +22,7 @@ from ..camera import compute_distance_for_gsd, compute_footprint, get_camera
 from ..geometry import build_rectangular_building, generate_mission_waypoints
 from ..kmz_builder import build_kmz_bytes
 from ..models import (
+    AlgorithmConfig,
     CAMERAS,
     CameraName,
     GIMBAL_PAN_MAX_DEG,
@@ -75,6 +77,42 @@ class MissionParams(BaseModel):
     takeoff_security_height_m: float = Field(5.0, ge=1.2, le=1500.0)
 
 
+class AlgorithmParams(BaseModel):
+    """Tunable algorithm parameters (not backed by hardware specs)."""
+    # Flight time estimation
+    hover_time_per_wp_s: float = Field(1.0, ge=0.0, le=10.0)
+    takeoff_landing_overhead_s: float = Field(60.0, ge=0.0, le=300.0)
+    battery_warning_threshold: float = Field(0.80, ge=0.5, le=0.99)
+    battery_info_threshold: float = Field(0.65, ge=0.3, le=0.95)
+    gimbal_near_limit_deg: float = Field(-80.0, ge=-90.0, le=0.0)
+    # Geometry / grid generation
+    facade_edge_inset_m: float = Field(0.1, ge=0.0, le=1.0)
+    transition_altitude_margin_m: float = Field(2.0, ge=0.0, le=10.0)
+    roof_normal_threshold: float = Field(0.5, ge=0.1, le=0.9)
+    min_altitude_m: float = Field(2.0, ge=0.5, le=10.0)
+    # Mesh import
+    default_building_height_m: float = Field(8.0, ge=1.0, le=100.0)
+    min_mesh_faces: int = Field(4, ge=1, le=100)
+    downward_face_threshold: float = Field(-0.3, ge=-1.0, le=0.0)
+    ground_level_threshold_m: float = Field(0.3, ge=0.0, le=5.0)
+    occlusion_ray_offset_m: float = Field(0.05, ge=0.001, le=1.0)
+    occlusion_hit_fraction: float = Field(0.5, ge=0.1, le=1.0)
+    flat_roof_normal_threshold: float = Field(0.95, ge=0.5, le=1.0)
+    wall_normal_threshold: float = Field(0.3, ge=0.01, le=0.9)
+    auto_scale_height_threshold_m: float = Field(50.0, ge=10.0, le=500.0)
+    auto_scale_target_height_m: float = Field(8.0, ge=1.0, le=100.0)
+    region_growing_angle_deg: float = Field(15.0, ge=1.0, le=45.0)
+    # Waypoint LOS occlusion
+    enable_waypoint_los: bool = True
+    los_tolerance_m: float = Field(0.5, ge=0.1, le=2.0)
+    los_min_visible_ratio: float = Field(0.4, ge=0.1, le=1.0)
+    # KMZ export
+    min_waypoint_height_m: float = Field(2.0, ge=0.5, le=10.0)
+
+    def to_algorithm_config(self) -> AlgorithmConfig:
+        return AlgorithmConfig(**self.model_dump())
+
+
 class GenerateRequest(BaseModel):
     preset: Optional[Literal[
         "simple_box", "pitched_roof_house", "l_shaped_block", "large_apartment_block"
@@ -82,6 +120,7 @@ class GenerateRequest(BaseModel):
     building_id: Optional[str] = None
     building: BuildingParams = BuildingParams()
     mission: MissionParams = MissionParams()
+    algorithm: AlgorithmParams = AlgorithmParams()
     min_facade_area: float = Field(1.0, ge=0.1, le=50.0)
     extraction_method: str = "region_growing"
 
@@ -201,9 +240,9 @@ async def upload_building_file(
     # Convert the computed footprint back to GeoJSON for storage.
     # This lets the generate endpoint reconstruct the building without
     # needing the original mesh binary.
+    from ..models import meters_per_deg as _m_per_deg
     import math as _math
-    m_per_lat = 111132.92 - 559.82 * _math.cos(2 * _math.radians(building.lat))
-    m_per_lon = 111412.84 * _math.cos(_math.radians(building.lat))
+    m_per_lat, m_per_lon = _m_per_deg(_math.radians(building.lat))
     # Extract ground-level wall vertices to rebuild the footprint polygon
     footprint_coords = []
     for facade in building.facades:
@@ -298,6 +337,22 @@ def delete_building(building_id: str):
 # --- Existing endpoints ---
 
 
+@router.get("/config")
+def get_config():
+    """Return all configurable parameters with defaults and ranges."""
+    algo_defaults = AlgorithmParams()
+    algo_schema = AlgorithmParams.model_json_schema()
+    algo_fields = {}
+    for name, prop in algo_schema.get("properties", {}).items():
+        algo_fields[name] = {
+            "default": getattr(algo_defaults, name),
+            "min": prop.get("minimum") if "minimum" in prop else prop.get("exclusiveMinimum"),
+            "max": prop.get("maximum") if "maximum" in prop else prop.get("exclusiveMaximum"),
+            "type": prop.get("type", "number"),
+        }
+    return {"algorithm": algo_fields}
+
+
 @router.get("/presets")
 def get_presets():
     return {"presets": PRESET_DEFAULTS}
@@ -338,8 +393,13 @@ def get_drone():
 
 @router.post("/generate")
 def generate(request: GenerateRequest):
+    t_start = time.perf_counter()
+
+    algo = request.algorithm.to_algorithm_config()
+
     # Build the building from one of three sources: uploaded, preset, or custom box
     raw_mesh = None  # raw 3D mesh data for viewer (mesh uploads only)
+    mesh_obj = None  # trimesh object for LOS occlusion checks
 
     if request.building_id:
         db = get_db()
@@ -362,7 +422,7 @@ def generate(request: GenerateRequest):
                 indices = np.array(raw_mesh["indices"], dtype=np.int64).reshape(-1, 3)
                 mesh_obj = trimesh.Trimesh(vertices=positions, faces=indices)
 
-                facades = extract_facades(mesh_obj, method=request.extraction_method, min_area_m2=request.min_facade_area)
+                facades = extract_facades(mesh_obj, method=request.extraction_method, min_area_m2=request.min_facade_area, algo=algo)
                 if facades:
                     xs = [float(v[0]) for f in facades for v in f.vertices]
                     ys = [float(v[1]) for f in facades for v in f.vertices]
@@ -431,8 +491,12 @@ def generate(request: GenerateRequest):
         takeoff_security_height_m=request.mission.takeoff_security_height_m,
     )
 
-    # Generate waypoints
-    waypoints = generate_mission_waypoints(building, config)
+    t_building = time.perf_counter()
+
+    # Generate waypoints (pass mesh for LOS occlusion checks on mesh buildings)
+    waypoints, generation_stats = generate_mission_waypoints(building, config, algo, mesh=mesh_obj)
+
+    t_waypoints = time.perf_counter()
 
     # Compute summary with path metrics
     camera_spec = get_camera(camera_name)
@@ -480,7 +544,7 @@ def generate(request: GenerateRequest):
         speed = waypoints[i].speed_ms or config.flight_speed_ms
         est_time_s += seg_dist / speed
         if not waypoints[i].is_transition:
-            est_time_s += 1.0  # hover time for photo
+            est_time_s += algo.hover_time_per_wp_s
 
     # Per-facade waypoint counts
     facade_wp_counts = {}
@@ -513,8 +577,10 @@ def generate(request: GenerateRequest):
         },
     }
 
+    t_summary = time.perf_counter()
+
     # Validate mission against hardware constraints
-    validation = validate_mission(waypoints, config, building)
+    validation = validate_mission(waypoints, config, building, algo)
     validation_data = [
         {"severity": v.severity, "code": v.code, "message": v.message,
          "waypoint_indices": v.waypoint_indices, "facade_index": v.facade_index}
@@ -541,7 +607,29 @@ def generate(request: GenerateRequest):
         config=config,
         summary=summary,
         viewer_data=viewer_data,
+        algo=algo,
     )
+
+    t_end = time.perf_counter()
+
+    # Extraction stats from mesh import (if applicable)
+    from ..building_import import last_extraction_stats
+    extraction = dict(last_extraction_stats) if last_extraction_stats else None
+
+    perf = {
+        "total_ms": round((t_end - t_start) * 1000, 1),
+        "building_ms": round((t_building - t_start) * 1000, 1),
+        "waypoints_ms": round((t_waypoints - t_building) * 1000, 1),
+        "summary_ms": round((t_summary - t_waypoints) * 1000, 1),
+        "validate_ms": round((t_end - t_summary) * 1000, 1),
+        "generation": generation_stats,
+        "extraction": extraction,
+        "validation_counts": {
+            "errors": sum(1 for v in validation if v.severity == "error"),
+            "warnings": sum(1 for v in validation if v.severity == "warning"),
+            "info": sum(1 for v in validation if v.severity == "info"),
+        },
+    }
 
     return {
         "version_id": version.version_id,
@@ -550,9 +638,11 @@ def generate(request: GenerateRequest):
         "viewer_data": viewer_data,
         "validation": validation_data,
         "can_export": not has_errors,
+        "perf": perf,
         "config_snapshot": {
             "building": request.building.model_dump(),
             "mission": request.mission.model_dump(),
+            "algorithm": request.algorithm.model_dump(),
         },
     }
 
@@ -585,7 +675,7 @@ def download_kmz(version_id: str):
     if not version:
         raise HTTPException(status_code=404, detail="Version not found")
 
-    kmz_bytes = build_kmz_bytes(version.waypoints, version.config)
+    kmz_bytes = build_kmz_bytes(version.waypoints, version.config, version.algo)
     filename = f"{version.config.mission_name.replace(' ', '_')}_{version_id}.kmz"
 
     return Response(
@@ -600,3 +690,9 @@ def delete_version(version_id: str):
     if not session.delete(version_id):
         raise HTTPException(status_code=404, detail="Version not found")
     return {"deleted": version_id}
+
+
+@router.delete("/versions")
+def delete_all_versions():
+    count = session.clear()
+    return {"deleted": count}

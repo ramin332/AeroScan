@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Optional
 
-from ..models import Building, MissionConfig, Waypoint
+from ..models import AlgorithmConfig, Building, MissionConfig, Waypoint
 
 
 @dataclass
@@ -21,6 +21,7 @@ class MissionVersion:
     building: Building
     waypoints: list[Waypoint]
     config: MissionConfig
+    algo: AlgorithmConfig
     summary: dict
     viewer_data: dict  # threejs + leaflet data
 
@@ -47,6 +48,7 @@ class SessionState:
         config: MissionConfig,
         summary: dict,
         viewer_data: dict,
+        algo: AlgorithmConfig | None = None,
     ) -> MissionVersion:
         version_id = _make_version_id()
         version = MissionVersion(
@@ -57,6 +59,7 @@ class SessionState:
             building=building,
             waypoints=waypoints,
             config=config,
+            algo=algo or AlgorithmConfig(),
             summary=summary,
             viewer_data=viewer_data,
         )
@@ -89,6 +92,13 @@ class SessionState:
             self._order.remove(version_id)
             return True
         return False
+
+    def clear(self) -> int:
+        """Delete all versions. Returns the count deleted."""
+        count = len(self._versions)
+        self._versions.clear()
+        self._order.clear()
+        return count
 
 
 # Module-level singleton

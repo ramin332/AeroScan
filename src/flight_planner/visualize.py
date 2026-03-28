@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import math
 
-from .models import Building, Waypoint
+from .models import Building, meters_per_deg, Waypoint
 
 
 DIRECTION_COLORS = {
@@ -63,8 +63,9 @@ def prepare_leaflet_data(building: Building, waypoints: list[Waypoint]) -> dict:
         if abs(facade.normal[2]) < 0.01:  # vertical walls only
             for v in facade.vertices:
                 if abs(v[2]) < 0.1:  # ground-level vertices
-                    lat_offset = v[1] / (111132.92 - 559.82 * math.cos(2 * math.radians(center_lat)))
-                    lon_offset = v[0] / (111412.84 * math.cos(math.radians(center_lat)))
+                    m_lat, m_lon = meters_per_deg(math.radians(center_lat))
+                    lat_offset = v[1] / m_lat
+                    lon_offset = v[0] / m_lon
                     ground_coords.append([center_lon + lon_offset, center_lat + lat_offset])
 
     if ground_coords:

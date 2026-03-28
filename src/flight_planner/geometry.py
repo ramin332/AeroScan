@@ -14,8 +14,10 @@ import numpy as np
 from pyproj import Transformer
 
 from .camera import compute_distance_for_gsd, compute_footprint, compute_grid_spacing, get_camera
+from .optimize import optimize_flight_path
 from .models import (
     ActionType,
+    AlgorithmConfig,
     Building,
     CameraAction,
     CameraName,
@@ -23,6 +25,7 @@ from .models import (
     GIMBAL_TILT_MAX_DEG,
     GIMBAL_TILT_MIN_DEG,
     MAX_SPEED_MS,
+    meters_per_deg,
     MIN_ALTITUDE_M,
     MissionConfig,
     RoofType,
@@ -204,6 +207,8 @@ def build_rectangular_building(
 def generate_waypoints_for_facade(
     facade: Facade,
     config: MissionConfig,
+    algo: AlgorithmConfig | None = None,
+    mesh: object | None = None,
 ) -> list[Waypoint]:
     """Generate a grid of waypoints for a single facade.
 
@@ -211,6 +216,9 @@ def generate_waypoints_for_facade(
     by the distance needed to achieve the target GSD. Waypoints are ordered
     in a boustrophedon (lawnmower) pattern.
     """
+    if algo is None:
+        algo = AlgorithmConfig()
+
     camera = get_camera(config.camera)
     distance = compute_distance_for_gsd(camera, config.target_gsd_mm_per_px)
 
@@ -262,7 +270,7 @@ def generate_waypoints_for_facade(
     v_min, v_max = float(v_coords.min()), float(v_coords.max())
 
     # Add small inset to avoid edge photos
-    inset = 0.1  # 10cm inset from edges
+    inset = algo.facade_edge_inset_m
     u_min += inset
     u_max -= inset
     v_min += inset
@@ -294,6 +302,17 @@ def generate_waypoints_for_facade(
     # Offset vector from facade surface to camera position
     offset = normal * distance
 
+    # LOS sample offsets for multi-ray visibility check
+    _los_samples = None
+    if mesh is not None and algo.enable_waypoint_los:
+        _los_samples = [
+            np.zeros(3),
+            u_axis * h_step * 0.3,
+            -u_axis * h_step * 0.3,
+            v_axis * v_step * 0.3,
+            -v_axis * v_step * 0.3,
+        ]
+
     waypoints = []
     for row in range(n_rows):
         v_pos = v_start + row * v_step
@@ -310,8 +329,43 @@ def generate_waypoints_for_facade(
             cam_pos = target_pos + offset
 
             # Ensure minimum altitude
-            if cam_pos[2] < MIN_ALTITUDE_M:
-                cam_pos[2] = float(MIN_ALTITUDE_M)
+            if cam_pos[2] < algo.min_altitude_m:
+                cam_pos[2] = algo.min_altitude_m
+
+            # Line-of-sight check: cast rays from camera to facade sample
+            # points and skip waypoints where the mesh blocks the view.
+            if _los_samples is not None:
+                origins = []
+                directions = []
+                ray_lengths = []
+                for s_off in _los_samples:
+                    sample_target = target_pos + s_off
+                    ray_vec = sample_target - cam_pos
+                    ray_len = float(np.linalg.norm(ray_vec))
+                    if ray_len < 1e-6:
+                        continue
+                    origins.append(cam_pos.copy())
+                    directions.append(ray_vec / ray_len)
+                    ray_lengths.append(ray_len)
+
+                if origins:
+                    hits, idx_ray, _ = mesh.ray.intersects_location(
+                        ray_origins=np.array(origins),
+                        ray_directions=np.array(directions),
+                    )
+                    n_visible = len(origins)
+                    tol = algo.los_tolerance_m
+                    for ri in range(len(origins)):
+                        mask = idx_ray == ri
+                        if mask.any():
+                            hit_dists = np.linalg.norm(
+                                hits[mask] - origins[ri], axis=1
+                            )
+                            if float(hit_dists.min()) < ray_lengths[ri] - tol:
+                                n_visible -= 1
+
+                    if n_visible < len(origins) * algo.los_min_visible_ratio:
+                        continue  # too much of the view is blocked
 
             # Per-waypoint look-at vector: from camera to target surface point
             look = target_pos - cam_pos
@@ -363,10 +417,11 @@ def _make_transition_waypoint(
     x: float, y: float, z: float,
     heading_deg: float,
     speed_ms: float,
+    min_altitude_m: float = MIN_ALTITUDE_M,
 ) -> Waypoint:
     """Create a transit waypoint (no photo, higher speed)."""
     return Waypoint(
-        x=x, y=y, z=max(z, MIN_ALTITUDE_M),
+        x=x, y=y, z=max(z, min_altitude_m),
         heading_deg=heading_deg,
         gimbal_pitch_deg=0.0,
         speed_ms=speed_ms,
@@ -382,6 +437,7 @@ def _generate_transition_waypoints(
     next_facade: Facade,
     clearance: float,
     speed: float,
+    algo: AlgorithmConfig | None = None,
 ) -> list[Waypoint]:
     """Generate clearance waypoints for transitioning between facades.
 
@@ -391,8 +447,11 @@ def _generate_transition_waypoints(
     """
     import numpy as np
 
+    if algo is None:
+        algo = AlgorithmConfig()
+
     # For transitions to/from roof, just go straight (already above building)
-    if abs(prev_facade.normal[2]) > 0.5 or abs(next_facade.normal[2]) > 0.5:
+    if abs(prev_facade.normal[2]) > algo.roof_normal_threshold or abs(next_facade.normal[2]) > algo.roof_normal_threshold:
         return []
 
     # Exit point: fly further out along prev facade normal
@@ -404,14 +463,14 @@ def _generate_transition_waypoints(
     entry_pos[:2] += next_facade.normal[:2] * clearance
 
     # Use a safe altitude for transition (highest of exit/entry + margin)
-    transit_z = max(exit_pos[2], entry_pos[2], prev_wp.z, next_wp.z) + 2.0
+    transit_z = max(exit_pos[2], entry_pos[2], prev_wp.z, next_wp.z) + algo.transition_altitude_margin_m
 
     transition_wps = []
 
     # Exit waypoint: pull out from facade
     transition_wps.append(_make_transition_waypoint(
         float(exit_pos[0]), float(exit_pos[1]), transit_z,
-        prev_wp.heading_deg, speed,
+        prev_wp.heading_deg, speed, algo.min_altitude_m,
     ))
 
     # Corner waypoint (if exit and entry are far apart)
@@ -427,13 +486,13 @@ def _generate_transition_waypoints(
             mid[:2] += mid_dir * clearance * 0.5
         transition_wps.append(_make_transition_waypoint(
             float(mid[0]), float(mid[1]), transit_z,
-            next_wp.heading_deg, speed,
+            next_wp.heading_deg, speed, algo.min_altitude_m,
         ))
 
     # Entry waypoint: approach next facade
     transition_wps.append(_make_transition_waypoint(
         float(entry_pos[0]), float(entry_pos[1]), transit_z,
-        next_wp.heading_deg, speed,
+        next_wp.heading_deg, speed, algo.min_altitude_m,
     ))
 
     return transition_wps
@@ -483,28 +542,59 @@ def _nearest_neighbor_order(groups: list[list[Waypoint]]) -> list[list[Waypoint]
 def generate_mission_waypoints(
     building: Building,
     config: MissionConfig,
-) -> list[Waypoint]:
+    algo: AlgorithmConfig | None = None,
+    mesh: object | None = None,
+) -> tuple[list[Waypoint], dict]:
     """Generate all waypoints for a building inspection mission.
 
     Generates inspection waypoint grids per facade, reorders by nearest-neighbor
     to minimize transit distance, and lets the DJI flight controller handle
     obstacle avoidance between waypoints (APAS).
+
+    Returns (waypoints, stats) where stats contains generation metrics.
     """
+    if algo is None:
+        algo = AlgorithmConfig()
+
     facade_groups: list[list[Waypoint]] = []
+    total_before_dedup = 0
+    per_facade_stats: list[dict] = []
+
     for facade in building.facades:
-        facade_wps = generate_waypoints_for_facade(facade, config)
+        facade_wps = generate_waypoints_for_facade(facade, config, algo, mesh=mesh)
+        before = len(facade_wps)
+        total_before_dedup += before
         if facade_wps:
             facade_groups.append(facade_wps)
+            per_facade_stats.append({
+                "facade_index": facade.index,
+                "label": facade.label,
+                "waypoints": len(facade_wps),
+                "before_dedup": before,
+            })
 
-    # Reorder facades by nearest-neighbor to minimize transit distance
-    if len(facade_groups) > 2:
-        facade_groups = _nearest_neighbor_order(facade_groups)
+    facades_with_wps = len(facade_groups)
+
+    # Optimize flight path: dedup + TSP ordering + sweep direction reversal
+    # Replaces the old greedy nearest-neighbor with proper 2-opt TSP.
+    # Respects PSDK constraints: preserves per-waypoint gimbal angles,
+    # only merges waypoints with similar gimbal targets (< 20 deg diff).
+    facade_groups, opt_result = optimize_flight_path(
+        facade_groups,
+        merge_radius_m=config.min_photo_distance_m,
+        enable_dedup=algo.enable_path_dedup,
+        enable_tsp=algo.enable_path_tsp,
+        enable_sweep_reversal=algo.enable_sweep_reversal,
+        max_gimbal_angle_diff_deg=algo.dedup_max_gimbal_diff_deg,
+    )
 
     # Concatenate all inspection waypoints — no artificial transition waypoints.
     # The drone flies straight between facades; its obstacle avoidance handles clearance.
     all_waypoints: list[Waypoint] = []
     for group in facade_groups:
         all_waypoints.extend(group)
+
+    total_after_dedup = len(all_waypoints)
 
     # Assign global indices
     for i, wp in enumerate(all_waypoints):
@@ -513,7 +603,27 @@ def generate_mission_waypoints(
     # Convert local ENU to WGS84
     convert_enu_to_wgs84(all_waypoints, building.lat, building.lon, building.ground_altitude)
 
-    return all_waypoints
+    stats = {
+        "facades_total": len(building.facades),
+        "facades_with_waypoints": facades_with_wps,
+        "waypoints_before_dedup": total_before_dedup,
+        "waypoints_after_dedup": total_after_dedup,
+        "waypoints_deduped": total_before_dedup - total_after_dedup,
+        "per_facade": per_facade_stats,
+        "optimization": {
+            "waypoints_merged": opt_result.waypoints_merged,
+            "facade_order": opt_result.facade_order_after,
+            "facades_reversed": opt_result.facades_reversed,
+            "transit_distance_before_m": round(opt_result.transit_distance_before, 2),
+            "transit_distance_after_m": round(opt_result.transit_distance_after, 2),
+            "transit_saved_m": round(
+                opt_result.transit_distance_before - opt_result.transit_distance_after, 2
+            ),
+            "two_opt_improvements": opt_result.two_opt_improvements,
+        },
+    }
+
+    return all_waypoints, stats
 
 
 def convert_enu_to_wgs84(
@@ -529,8 +639,7 @@ def convert_enu_to_wgs84(
     """
     # Approximate meters per degree at the reference latitude
     lat_rad = math.radians(ref_lat)
-    meters_per_deg_lat = 111132.92 - 559.82 * math.cos(2 * lat_rad) + 1.175 * math.cos(4 * lat_rad)
-    meters_per_deg_lon = 111412.84 * math.cos(lat_rad) - 93.5 * math.cos(3 * lat_rad)
+    meters_per_deg_lat, meters_per_deg_lon = meters_per_deg(lat_rad)
 
     for wp in waypoints:
         wp.lat = ref_lat + wp.y / meters_per_deg_lat
@@ -575,8 +684,7 @@ def build_l_shaped_building(
 
     # Approximate GPS offset
     lat_rad = math.radians(lat)
-    meters_per_deg_lat = 111132.92 - 559.82 * math.cos(2 * lat_rad) + 1.175 * math.cos(4 * lat_rad)
-    meters_per_deg_lon = 111412.84 * math.cos(lat_rad) - 93.5 * math.cos(3 * lat_rad)
+    meters_per_deg_lat, meters_per_deg_lon = meters_per_deg(lat_rad)
 
     lat2 = lat + enu_offset[1] / meters_per_deg_lat
     lon2 = lon + enu_offset[0] / meters_per_deg_lon

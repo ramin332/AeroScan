@@ -1,5 +1,5 @@
 import { create } from 'zustand';
-import type { BuildingParams, GenerateResponse, MissionParams, UploadedBuilding, VersionSummary } from './api/types';
+import type { AlgorithmParams, BuildingParams, GenerateResponse, MissionParams, UploadedBuilding, VersionSummary } from './api/types';
 import * as api from './api/client';
 
 export const DEFAULT_BUILDING: BuildingParams = {
@@ -27,6 +27,43 @@ export const DEFAULT_MISSION: MissionParams = {
   yaw_rate_deg_per_s: 60.0,
 };
 
+export const DEFAULT_ALGORITHM: AlgorithmParams = {
+  // Flight time estimation
+  hover_time_per_wp_s: 1.0,
+  takeoff_landing_overhead_s: 60.0,
+  battery_warning_threshold: 0.80,
+  battery_info_threshold: 0.65,
+  gimbal_near_limit_deg: -80.0,
+  // Geometry / grid generation
+  facade_edge_inset_m: 0.1,
+  transition_altitude_margin_m: 2.0,
+  roof_normal_threshold: 0.5,
+  min_altitude_m: 2.0,
+  // Mesh import
+  default_building_height_m: 8.0,
+  min_mesh_faces: 4,
+  downward_face_threshold: -0.3,
+  ground_level_threshold_m: 0.3,
+  occlusion_ray_offset_m: 0.05,
+  occlusion_hit_fraction: 0.5,
+  flat_roof_normal_threshold: 0.95,
+  wall_normal_threshold: 0.3,
+  auto_scale_height_threshold_m: 50.0,
+  auto_scale_target_height_m: 8.0,
+  region_growing_angle_deg: 15.0,
+  // Waypoint LOS occlusion
+  enable_waypoint_los: true,
+  los_tolerance_m: 0.5,
+  los_min_visible_ratio: 0.4,
+  // Path optimization
+  enable_path_dedup: true,
+  enable_path_tsp: true,
+  enable_sweep_reversal: true,
+  dedup_max_gimbal_diff_deg: 20.0,
+  // KMZ export
+  min_waypoint_height_m: 2.0,
+};
+
 export const PRESETS: Record<string, Partial<BuildingParams>> = {
   simple_box: { width: 20, depth: 10, height: 8, heading_deg: 0, roof_type: 'flat', roof_pitch_deg: 0, num_stories: 3 },
   pitched_roof_house: { width: 30, depth: 10, height: 6, heading_deg: 45, roof_type: 'pitched', roof_pitch_deg: 30, num_stories: 2 },
@@ -47,6 +84,7 @@ interface AppState {
   preset: string | null;
   building: BuildingParams;
   mission: MissionParams;
+  algorithm: AlgorithmParams;
 
   // Mesh settings
   minFacadeArea: number;
@@ -65,10 +103,13 @@ interface AppState {
   setPreset: (name: string | null) => void;
   setBuilding: (patch: Partial<BuildingParams>) => void;
   setMission: (patch: Partial<MissionParams>) => void;
+  setAlgorithm: (patch: Partial<AlgorithmParams>) => void;
+  resetAlgorithm: () => void;
   setActiveTab: (tab: Tab) => void;
   generate: () => Promise<void>;
   loadVersion: (id: string) => Promise<void>;
   deleteVersion: (id: string) => Promise<void>;
+  deleteAllVersions: () => Promise<void>;
   refreshVersions: () => Promise<void>;
 
   // Building upload actions
@@ -88,6 +129,7 @@ export const useStore = create<AppState>((set, get) => ({
   preset: 'simple_box',
   building: { ...DEFAULT_BUILDING },
   mission: { ...DEFAULT_MISSION },
+  algorithm: { ...DEFAULT_ALGORITHM },
   result: null,
   versions: [],
   loading: false,
@@ -125,10 +167,15 @@ export const useStore = create<AppState>((set, get) => ({
   setMission: (patch) =>
     set((s) => ({ mission: { ...s.mission, ...patch } })),
 
+  setAlgorithm: (patch) =>
+    set((s) => ({ algorithm: { ...s.algorithm, ...patch } })),
+
+  resetAlgorithm: () => set({ algorithm: { ...DEFAULT_ALGORITHM } }),
+
   setActiveTab: (tab) => set({ activeTab: tab }),
 
   generate: async () => {
-    const { preset, selectedBuildingId, buildingSource, building, mission, minFacadeArea, extractionMethod } = get();
+    const { preset, selectedBuildingId, buildingSource, building, mission, algorithm, minFacadeArea, extractionMethod } = get();
     set({ loading: true });
     try {
       const result = await api.generate({
@@ -136,6 +183,7 @@ export const useStore = create<AppState>((set, get) => ({
         building_id: buildingSource === 'upload' ? selectedBuildingId : undefined,
         building,
         mission,
+        algorithm,
         min_facade_area: buildingSource === 'upload' ? minFacadeArea : undefined,
         extraction_method: buildingSource === 'upload' ? extractionMethod : undefined,
       });
@@ -155,6 +203,7 @@ export const useStore = create<AppState>((set, get) => ({
         result,
         building: result.config_snapshot.building,
         mission: result.config_snapshot.mission,
+        algorithm: result.config_snapshot.algorithm || { ...DEFAULT_ALGORITHM },
         loading: false,
       });
     } catch (e) {
@@ -169,6 +218,15 @@ export const useStore = create<AppState>((set, get) => ({
       get().refreshVersions();
     } catch (e) {
       console.error('Delete version failed:', e);
+    }
+  },
+
+  deleteAllVersions: async () => {
+    try {
+      await api.deleteAllVersions();
+      set({ versions: [] });
+    } catch (e) {
+      console.error('Delete all versions failed:', e);
     }
   },
 

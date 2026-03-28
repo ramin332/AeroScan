@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 
 from .models import (
+    AlgorithmConfig,
     GIMBAL_PAN_MAX_DEG,
     GIMBAL_PAN_MIN_DEG,
     GIMBAL_TILT_MAX_DEG,
@@ -44,11 +45,15 @@ def validate_mission(
     waypoints: list[Waypoint],
     config: MissionConfig,
     building: Building | None = None,
+    algo: AlgorithmConfig | None = None,
 ) -> list[ValidationIssue]:
     """Validate a generated mission against hardware and quality constraints.
 
     Returns a list of issues sorted by severity (errors first).
     """
+    if algo is None:
+        algo = AlgorithmConfig()
+
     issues: list[ValidationIssue] = []
 
     if not waypoints:
@@ -105,13 +110,13 @@ def validate_mission(
             ))
             break  # don't repeat for every waypoint on same facade
 
-    # Gimbal at safety margin (pitch near -85° clamped from -90°)
-    near_limit_wps = [wp for wp in inspection_wps if wp.gimbal_pitch_deg <= -80]
+    # Gimbal at safety margin (pitch near nadir limit)
+    near_limit_wps = [wp for wp in inspection_wps if wp.gimbal_pitch_deg <= algo.gimbal_near_limit_deg]
     if near_limit_wps:
         issues.append(ValidationIssue(
             severity=Severity.INFO,
             code="gimbal_near_limit",
-            message=f"{len(near_limit_wps)} waypoints use gimbal pitch near nadir limit ({near_limit_wps[0].gimbal_pitch_deg:.0f}°) — 5° safety margin applied",
+            message=f"{len(near_limit_wps)} waypoints use gimbal pitch near nadir limit ({near_limit_wps[0].gimbal_pitch_deg:.0f}°) — {config.gimbal_pitch_margin_deg}° safety margin applied",
             waypoint_indices=[wp.index for wp in near_limit_wps[:5]],
         ))
 
@@ -155,8 +160,8 @@ def validate_mission(
         if heading_diff > 1 and config.yaw_rate_deg_per_s > 0:
             yaw_time_s += heading_diff / config.yaw_rate_deg_per_s
 
-    # Add 60s overhead for takeoff/landing sequence
-    est_time_s = total_dist / config.flight_speed_ms + len(inspection_wps) * 1.0 + yaw_time_s + 60.0
+    # Add overhead for takeoff/landing sequence and per-waypoint hover
+    est_time_s = total_dist / config.flight_speed_ms + len(inspection_wps) * algo.hover_time_per_wp_s + yaw_time_s + algo.takeoff_landing_overhead_s
     est_time_min = est_time_s / 60
 
     if est_time_min > MAX_FLIGHT_TIME_WITH_MANIFOLD_MIN:
@@ -165,13 +170,13 @@ def validate_mission(
             code="exceeds_flight_time",
             message=f"Estimated flight time {est_time_min:.0f}min exceeds battery limit ({MAX_FLIGHT_TIME_WITH_MANIFOLD_MIN}min)",
         ))
-    elif est_time_min > MAX_FLIGHT_TIME_WITH_MANIFOLD_MIN * 0.8:
+    elif est_time_min > MAX_FLIGHT_TIME_WITH_MANIFOLD_MIN * algo.battery_warning_threshold:
         issues.append(ValidationIssue(
             severity=Severity.WARNING,
             code="exceeds_flight_time",
-            message=f"Estimated flight time {est_time_min:.0f}min exceeds 80% of battery limit — insufficient RTH reserve",
+            message=f"Estimated flight time {est_time_min:.0f}min exceeds {algo.battery_warning_threshold:.0%} of battery limit — insufficient RTH reserve",
         ))
-    elif est_time_min > MAX_FLIGHT_TIME_WITH_MANIFOLD_MIN * 0.65:
+    elif est_time_min > MAX_FLIGHT_TIME_WITH_MANIFOLD_MIN * algo.battery_info_threshold:
         issues.append(ValidationIssue(
             severity=Severity.INFO,
             code="near_flight_time_limit",
