@@ -218,6 +218,7 @@ export function Sidebar() {
             <select value={extractionMethod}
               onChange={(e) => { setExtractionMethod(e.target.value); autoGen(); }}>
               <option value="region_growing">Region Growing</option>
+              <option value="meshlab">MeshLab</option>
               <option value="convex_hull">Convex Hull</option>
             </select>
           </div>

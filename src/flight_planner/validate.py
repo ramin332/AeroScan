@@ -155,16 +155,23 @@ def validate_mission(
         if heading_diff > 1 and config.yaw_rate_deg_per_s > 0:
             yaw_time_s += heading_diff / config.yaw_rate_deg_per_s
 
-    est_time_s = total_dist / config.flight_speed_ms + len(inspection_wps) * 1.0 + yaw_time_s
+    # Add 60s overhead for takeoff/landing sequence
+    est_time_s = total_dist / config.flight_speed_ms + len(inspection_wps) * 1.0 + yaw_time_s + 60.0
     est_time_min = est_time_s / 60
 
     if est_time_min > MAX_FLIGHT_TIME_WITH_MANIFOLD_MIN:
         issues.append(ValidationIssue(
-            severity=Severity.WARNING,
+            severity=Severity.ERROR,
             code="exceeds_flight_time",
-            message=f"Estimated flight time {est_time_min:.0f}min exceeds battery limit ({MAX_FLIGHT_TIME_WITH_MANIFOLD_MIN}min) — consider splitting into multiple missions",
+            message=f"Estimated flight time {est_time_min:.0f}min exceeds battery limit ({MAX_FLIGHT_TIME_WITH_MANIFOLD_MIN}min)",
         ))
     elif est_time_min > MAX_FLIGHT_TIME_WITH_MANIFOLD_MIN * 0.8:
+        issues.append(ValidationIssue(
+            severity=Severity.WARNING,
+            code="exceeds_flight_time",
+            message=f"Estimated flight time {est_time_min:.0f}min exceeds 80% of battery limit — insufficient RTH reserve",
+        ))
+    elif est_time_min > MAX_FLIGHT_TIME_WITH_MANIFOLD_MIN * 0.65:
         issues.append(ValidationIssue(
             severity=Severity.INFO,
             code="near_flight_time_limit",

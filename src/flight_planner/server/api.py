@@ -69,6 +69,10 @@ class MissionParams(BaseModel):
     gimbal_pitch_margin_deg: float = Field(5.0, ge=0.0, le=15.0)
     min_photo_distance_m: float = Field(1.5, ge=0.5, le=5.0)
     yaw_rate_deg_per_s: float = Field(60.0, ge=30.0, le=120.0)
+    # DJI Pilot 2 safety defaults (operator can adjust before flying)
+    rc_lost_action: str = "go_home"
+    finish_action: str = "return_home"
+    takeoff_security_height_m: float = Field(5.0, ge=1.2, le=1500.0)
 
 
 class GenerateRequest(BaseModel):
@@ -422,6 +426,9 @@ def generate(request: GenerateRequest):
         gimbal_pitch_margin_deg=request.mission.gimbal_pitch_margin_deg,
         min_photo_distance_m=request.mission.min_photo_distance_m,
         yaw_rate_deg_per_s=request.mission.yaw_rate_deg_per_s,
+        rc_lost_action=request.mission.rc_lost_action,
+        finish_action=request.mission.finish_action,
+        takeoff_security_height_m=request.mission.takeoff_security_height_m,
     )
 
     # Generate waypoints

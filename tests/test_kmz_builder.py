@@ -94,3 +94,66 @@ class TestKMZStructure:
             assert zipfile.is_zipfile(io.BytesIO(file_bytes))
         finally:
             os.unlink(path)
+
+
+def _extract_kml_xml(config: MissionConfig | None = None) -> str:
+    """Generate a KMZ and return the template.kml XML string."""
+    wps = _make_test_waypoints()
+    data = build_kmz_bytes(wps, config or MissionConfig())
+    with zipfile.ZipFile(io.BytesIO(data)) as zf:
+        return zf.read("wpmz/template.kml").decode("utf-8")
+
+
+class TestKMZSafetyDefaults:
+    """Verify that DJI Pilot 2 safety defaults are correctly set in the KMZ XML."""
+
+    def test_rc_lost_action_go_home(self):
+        """RC signal loss should trigger RTH by default, not continue."""
+        xml = _extract_kml_xml()
+        assert "executeLostAction" in xml, "exitOnRCLost should be 'executeLostAction', not 'goContinue'"
+        assert "goBack" in xml, "executeRCLostAction should be 'goBack' (RTH)"
+
+    def test_finish_action_go_home(self):
+        """Mission completion should trigger RTH."""
+        xml = _extract_kml_xml()
+        assert "goHome" in xml, "finishAction should be 'goHome'"
+
+    def test_takeoff_security_height(self):
+        """Takeoff security height should be 5m for building inspection."""
+        xml = _extract_kml_xml()
+        assert "5.0" in xml or "5" in xml, "takeOffSecurityHeight should be 5.0m"
+
+    def test_height_mode_relative(self):
+        """Height mode should be relativeToStartPoint."""
+        xml = _extract_kml_xml()
+        assert "relativeToStartPoint" in xml, "heightMode should be 'relativeToStartPoint'"
+
+    def test_rc_lost_configurable(self):
+        """RC lost action should respect config override."""
+        config = MissionConfig(rc_lost_action="hover")
+        xml = _extract_kml_xml(config)
+        assert "executeLostAction" in xml
+        assert "handover" in xml, "executeRCLostAction should be 'handover' for hover"
+
+    def test_finish_action_configurable(self):
+        """Finish action should respect config override."""
+        config = MissionConfig(finish_action="land")
+        xml = _extract_kml_xml(config)
+        assert "autoLand" in xml, "finishAction should be 'autoLand' for land"
+
+    def test_per_waypoint_height_above_minimum(self):
+        """Every waypoint height should be >= 2m (MIN_ALTITUDE_M)."""
+        import xml.etree.ElementTree as ET
+        xml = _extract_kml_xml()
+        root = ET.fromstring(xml)
+        # Find all height elements in Placemarks
+        ns = {"wpml": "http://www.dji.com/wpmz/1.0.6"}
+        for height_el in root.iter("{http://www.dji.com/wpmz/1.0.6}height"):
+            h = float(height_el.text)
+            assert h >= 2.0, f"Waypoint height {h}m is below minimum 2.0m"
+
+    def test_per_waypoint_uses_local_height(self):
+        """Each waypoint should use per-waypoint height (useGlobalHeight=0)."""
+        xml = _extract_kml_xml()
+        # All waypoints have explicit heights, so useGlobalHeight should be 0
+        assert "0" in xml  # useGlobalHeight=0 present

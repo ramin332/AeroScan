@@ -287,3 +287,8 @@ class MissionConfig:
     gimbal_pitch_margin_deg: float = 5.0  # safety margin from hardware pitch limits
     min_photo_distance_m: float = 1.5  # min distance between photo waypoints (dedup)
     yaw_rate_deg_per_s: float = 60.0  # assumed drone yaw rate for time estimates
+
+    # DJI Pilot 2 safety defaults (pre-populate the operator's UI)
+    rc_lost_action: str = "go_home"  # "go_home" | "hover" | "land" — what drone does on signal loss
+    finish_action: str = "return_home"  # "return_home" | "hover" | "land" — what drone does after last waypoint
+    takeoff_security_height_m: float = 5.0  # safe climb height before starting route (building proximity)

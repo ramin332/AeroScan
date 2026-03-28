@@ -11,6 +11,7 @@ import os
 import tempfile
 
 from djikmz import DroneTask
+from djikmz.model.mission_config import FinishAction, RCLostAction
 
 from .models import (
     ActionType,
@@ -49,9 +50,29 @@ def _build_mission(
             f"exceeding max {MAX_WAYPOINTS_PER_MISSION}"
         )
 
+    _RC_LOST_MAP = {
+        "go_home": RCLostAction.GO_HOME,
+        "hover": RCLostAction.HOVER,
+        "land": RCLostAction.LAND,
+    }
+    _FINISH_MAP = {
+        "return_home": FinishAction.GO_HOME,
+        "hover": FinishAction.NO_ACTION,
+        "land": FinishAction.AUTOLAND,
+    }
+
     mission = DroneTask(_DEFAULT_DRONE_MODEL, "AeroScan")
     mission.name(config.mission_name)
     mission.speed(config.flight_speed_ms)
+
+    # Safety defaults for DJI Pilot 2 (operator can adjust before flying)
+    mission._mission_config.rclost_action = _RC_LOST_MAP.get(
+        config.rc_lost_action, RCLostAction.GO_HOME
+    )
+    mission._mission_config.finish_action = _FINISH_MAP.get(
+        config.finish_action, FinishAction.GO_HOME
+    )
+    mission._mission_config.take_off_height = config.takeoff_security_height_m
 
     for wp in waypoints:
         wb = mission.fly_to(wp.lat, wp.lon, height=max(wp.z, 2.0))

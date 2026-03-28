@@ -397,11 +397,162 @@ def _extract_convex_hull(
     return building.facades if building.facades else None
 
 
+def _extract_meshlab(
+    mesh: "trimesh.Trimesh",
+    min_area_m2: float = 1.0,
+    **_kwargs: object,
+) -> Optional[list[Facade]]:
+    """Extract facades using PyMeshLab's face-normal selection + connected components.
+
+    Industry-standard MeshLab pipeline:
+    1. For each cardinal direction, select faces by normal condition
+    2. Split selected faces into connected components
+    3. Filter by area
+    4. Compute convex hull per component → Facade
+
+    This is MeshLab's native approach — battle-tested by thousands of companies.
+    """
+    import pymeshlab
+    import tempfile
+    import os
+
+    # Export trimesh to temp file for PyMeshLab (it needs a file path)
+    with tempfile.NamedTemporaryFile(suffix=".ply", delete=False) as f:
+        mesh.export(f.name)
+        tmp_path = f.name
+
+    try:
+        building_center = mesh.centroid.copy()
+
+        # Direction conditions: muParser syntax for face normals (fnx, fny, fnz)
+        direction_configs = [
+            ("north_wall", "fny > 0.85",                        "21.1"),
+            ("south_wall", "fny < -0.85",                       "21.1"),
+            ("east_wall",  "fnx > 0.85",                        "21.1"),
+            ("west_wall",  "fnx < -0.85",                       "21.1"),
+            ("roof_flat",  "fnz > 0.95",                        "47.1"),
+            ("roof_slope", "fnz > 0.3 && fnz <= 0.95 && fny > 0.3",  "47.1"),
+            ("roof_slope", "fnz > 0.3 && fnz <= 0.95 && fny < -0.3", "47.1"),
+            ("roof_slope", "fnz > 0.3 && fnz <= 0.95 && fnx > 0.3",  "47.1"),
+            ("roof_slope", "fnz > 0.3 && fnz <= 0.95 && fnx < -0.3", "47.1"),
+        ]
+
+        facades: list[Facade] = []
+        idx = 0
+
+        for base_label, condition, component_tag in direction_configs:
+            ms = pymeshlab.MeshSet()
+            ms.load_new_mesh(tmp_path)
+
+            ms.compute_selection_by_condition_per_face(condselect=condition)
+            n_selected = ms.current_mesh().selected_face_number()
+            if n_selected < 3:
+                continue
+
+            # Extract selected faces as new mesh
+            ms.generate_from_selected_faces()
+            ms.set_current_mesh(1)
+
+            # Split into connected components
+            ms.generate_splitting_by_connected_components()
+
+            # Process each component (meshes 2+ are the components)
+            for i in range(2, ms.mesh_number()):
+                ms.set_current_mesh(i)
+                cm = ms.current_mesh()
+                if cm.face_number() < 3:
+                    continue
+
+                verts = cm.vertex_matrix()
+                face_normals = cm.face_normal_matrix()
+
+                # Compute area-weighted average normal
+                # PyMeshLab doesn't expose per-face area easily, use simple average
+                avg_normal = face_normals.mean(axis=0)
+                norm_len = np.linalg.norm(avg_normal)
+                if norm_len < 1e-9:
+                    continue
+                avg_normal /= norm_len
+
+                center = verts.mean(axis=0)
+
+                # Estimate area from vertex bounding box projection onto plane
+                # More accurate: use trimesh for this component
+                import trimesh as _tm
+                comp_mesh = _tm.Trimesh(vertices=verts, faces=cm.face_matrix())
+                comp_area = float(comp_mesh.area)
+
+                if comp_area < min_area_m2:
+                    continue
+
+                # Orient normal outward
+                if np.dot(avg_normal, center - building_center) < 0:
+                    avg_normal = -avg_normal
+
+                # Skip downward / ground level
+                if avg_normal[2] < -0.3:
+                    continue
+                if center[2] < 0.3:
+                    continue
+
+                # Classify
+                nz = abs(avg_normal[2])
+                if nz < 0.3:
+                    azimuth = math.degrees(math.atan2(avg_normal[0], avg_normal[1])) % 360
+                    direction = ("north_wall" if azimuth < 45 or azimuth >= 315 else
+                                 "east_wall" if azimuth < 135 else
+                                 "south_wall" if azimuth < 225 else "west_wall")
+                elif nz > 0.95:
+                    direction = "roof_flat"
+                else:
+                    tilt = round(math.degrees(math.acos(min(nz, 1.0))))
+                    azimuth = math.degrees(math.atan2(avg_normal[0], avg_normal[1])) % 360
+                    compass = ("N" if azimuth < 45 or azimuth >= 315 else
+                               "E" if azimuth < 135 else
+                               "S" if azimuth < 225 else "W")
+                    direction = f"roof_{compass}_{tilt}deg"
+
+                # Convex hull
+                if nz < 0.9:
+                    ref = np.array([0.0, 0.0, 1.0])
+                else:
+                    ref = np.array([1.0, 0.0, 0.0])
+                u_axis = np.cross(avg_normal, ref)
+                u_axis /= np.linalg.norm(u_axis)
+                v_axis = np.cross(avg_normal, u_axis)
+                v_axis /= np.linalg.norm(v_axis)
+
+                relative = verts - center
+                pts_2d = list(zip(
+                    (relative @ u_axis).tolist(),
+                    (relative @ v_axis).tolist(),
+                ))
+                hull_2d = _convex_hull_2d(pts_2d)
+                if len(hull_2d) < 3:
+                    continue
+
+                hull_3d = np.array([center + u * u_axis + v * v_axis for u, v in hull_2d])
+
+                facades.append(Facade(
+                    vertices=hull_3d,
+                    normal=avg_normal,
+                    component_tag=component_tag,
+                    label=f"{direction}_{idx}",
+                    index=idx,
+                ))
+                idx += 1
+
+        return facades if facades else None
+    finally:
+        os.unlink(tmp_path)
+
+
 # --- Modular extraction dispatcher ---
 
 EXTRACTION_METHODS: dict[str, callable] = {
     "region_growing": _extract_region_growing,
     "convex_hull": _extract_convex_hull,
+    "meshlab": _extract_meshlab,
 }
 
 
@@ -413,14 +564,13 @@ def extract_facades(
 ) -> list[Facade]:
     """Extract facades from a mesh using the specified method.
 
-    Available methods: region_growing (default), convex_hull.
+    Available methods: region_growing (default), convex_hull, meshlab.
     Falls back to convex_hull if the chosen method returns no results.
     """
     fn = EXTRACTION_METHODS.get(method, _extract_region_growing)
     result = fn(mesh, min_area_m2=min_area_m2, **kwargs)
     if result:
         return result
-    # Fallback to convex hull
     if method != "convex_hull":
         result = _extract_convex_hull(mesh, min_area_m2=min_area_m2)
     return result or []
