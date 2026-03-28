@@ -264,11 +264,28 @@ def build_building_from_mesh(
     z_max = float(mesh.vertices[:, 2].max())
     mesh_height = z_max - z_min
 
-    if height is None:
-        height = round(mesh_height, 1)
+    if mesh_height < 1e-6:
+        raise ValueError("Mesh has zero height")
 
-    # Shift so ground is at z=0
-    mesh.vertices[:, 2] -= z_min
+    # Auto-scale: OBJ/STL files from 3D modelling tools often use arbitrary
+    # units (cm, inches, etc.). If the user provides a target height, scale
+    # the mesh to match. Otherwise auto-detect: if the raw height looks
+    # unreasonable (>50m for a building), assume non-meter units and default
+    # to 8m.
+    if height is not None and height > 0:
+        scale = height / mesh_height
+    elif mesh_height > 50:
+        height = 8.0
+        scale = height / mesh_height
+    else:
+        height = round(mesh_height, 1)
+        scale = 1.0
+
+    mesh.vertices *= scale
+
+    # Recompute after scaling
+    z_min = float(mesh.vertices[:, 2].min())
+    mesh.vertices[:, 2] -= z_min  # shift so ground is at z=0
 
     # Project vertices to 2D (bird's eye view) and compute convex hull footprint
     points_2d = [(float(v[0]), float(v[1])) for v in mesh.vertices]

@@ -71,6 +71,13 @@ export interface Summary {
   estimated_flight_time_s: number;
   transitions: FacadeTransition[];
   facade_waypoint_counts: Record<number, number>;
+  camera: {
+    name: string;
+    fov_h_deg: number;
+    fov_v_deg: number;
+    distance_m: number;
+    focal_length_mm: number;
+  };
 }
 
 // Three.js viewer data

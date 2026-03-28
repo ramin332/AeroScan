@@ -204,7 +204,13 @@ function Scene({ data, onWaypointClick, visitedIndex }: { data: ThreeJSData; onW
   );
 }
 
-export function Viewer3D({ data }: { data: ThreeJSData | null }) {
+interface CameraFOV {
+  fov_h_deg: number;
+  fov_v_deg: number;
+  distance_m: number;
+}
+
+export function Viewer3D({ data, cameraFov }: { data: ThreeJSData | null; cameraFov?: CameraFOV }) {
   const [selectedWp, setSelectedWp] = useState<WaypointData | null>(null);
   const [playing, setPlaying] = useState(false);
   const [progress, setProgress] = useState(0);
@@ -282,7 +288,7 @@ export function Viewer3D({ data }: { data: ThreeJSData | null }) {
         />
         <Scene data={data} onWaypointClick={setSelectedWp} visitedIndex={playing || progress > 0 ? getVisitedIndex(progress, data.waypoints.length) : -1} />
         {(playing || progress > 0) && (
-          <DroneMarker waypoints={data.waypoints} progress={progress} />
+          <DroneMarker waypoints={data.waypoints} progress={progress} cameraFov={cameraFov} />
         )}
       </Canvas>
 

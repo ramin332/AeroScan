@@ -34,7 +34,7 @@ export default function App() {
         </div>
         <div className="view-container">
           <div className={`view ${activeTab === '3d' ? 'active' : ''}`}>
-            <Viewer3D data={result?.viewer_data.threejs ?? null} />
+            <Viewer3D data={result?.viewer_data.threejs ?? null} cameraFov={result?.summary.camera} />
           </div>
           <div className={`view ${activeTab === 'map' ? 'active' : ''}`}>
             <MapView data={result?.viewer_data.leaflet ?? null} />

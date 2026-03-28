@@ -279,15 +279,14 @@ def generate_waypoints_for_facade(
     # We want to face the facade, so heading is opposite to normal
     heading_deg = (heading_deg + 180) % 360
 
-    # Gimbal pitch
-    if is_vertical:
-        gimbal_pitch = 0.0  # horizontal
-    elif is_horizontal:
-        gimbal_pitch = -90.0  # straight down
-    else:
-        # Pitched roof: tilt down by (90 - roof_angle_from_horizontal)
-        roof_angle = math.degrees(math.asin(abs(normal[2])))
-        gimbal_pitch = -(90.0 - roof_angle)
+    # Gimbal pitch: compute from the look-at direction (-normal)
+    # The camera looks opposite to the outward normal (toward the surface).
+    # Pitch = atan2(vertical_component, horizontal_magnitude) of the look direction.
+    look_dir = -normal  # look toward the surface
+    horiz_mag = math.sqrt(look_dir[0] ** 2 + look_dir[1] ** 2)
+    gimbal_pitch = math.degrees(math.atan2(look_dir[2], horiz_mag))
+    # Vertical wall: pitch=0 (horizontal), flat roof: pitch=-90 (nadir),
+    # 30° pitched roof: pitch=-60° (tilted well down)
 
     # Clamp gimbal pitch to hardware limits
     gimbal_pitch = max(-90.0, min(35.0, gimbal_pitch))

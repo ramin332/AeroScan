@@ -182,10 +182,38 @@ async def upload_building_file(
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Failed to parse mesh: {e}")
 
+    # Convert the computed footprint back to GeoJSON for storage.
+    # This lets the generate endpoint reconstruct the building without
+    # needing the original mesh binary.
+    import math as _math
+    m_per_lat = 111132.92 - 559.82 * _math.cos(2 * _math.radians(building.lat))
+    m_per_lon = 111412.84 * _math.cos(_math.radians(building.lat))
+    # Extract ground-level wall vertices to rebuild the footprint polygon
+    footprint_coords = []
+    for facade in building.facades:
+        if abs(facade.normal[2]) < 0.01:  # vertical walls only
+            v0 = facade.vertices[0]  # first ground vertex
+            lon_v = building.lon + v0[0] / m_per_lon
+            lat_v = building.lat + v0[1] / m_per_lat
+            footprint_coords.append([round(lon_v, 8), round(lat_v, 8)])
+    # Close the ring
+    if footprint_coords:
+        footprint_coords.append(footprint_coords[0])
+    footprint_geojson = {
+        "type": "Feature",
+        "geometry": {"type": "Polygon", "coordinates": [footprint_coords]},
+        "properties": {
+            "name": build_name,
+            "height": building.height,
+            "num_stories": num_stories,
+            "source": f"mesh_{ext}",
+        },
+    }
+
     record = BuildingRecord(
         name=build_name,
         source_type=f"mesh_{ext}",
-        geometry_data=None,  # mesh files are not stored as JSON
+        geometry_data=json.dumps(footprint_geojson),
         lat=building.lat,
         lon=building.lon,
         height=building.height,
@@ -195,7 +223,6 @@ async def upload_building_file(
         heading_deg=0.0,
         properties_json=json.dumps({
             "mesh_format": ext,
-            "mesh_vertices": len(building.facades),
             "auto_height": building.height,
         }),
     )
@@ -397,6 +424,10 @@ def generate(request: GenerateRequest):
         if not wp.is_transition:
             facade_wp_counts[wp.facade_index] = facade_wp_counts.get(wp.facade_index, 0) + 1
 
+    # Horizontal and vertical FOV from sensor geometry
+    h_fov_deg = round(2 * math.degrees(math.atan(camera_spec.sensor_width_mm / (2 * camera_spec.focal_length_mm))), 1)
+    v_fov_deg = round(2 * math.degrees(math.atan(camera_spec.sensor_height_mm / (2 * camera_spec.focal_length_mm))), 1)
+
     summary = {
         "waypoint_count": len(waypoints),
         "inspection_waypoints": n_inspection,
@@ -409,6 +440,13 @@ def generate(request: GenerateRequest):
         "estimated_flight_time_s": round(est_time_s),
         "transitions": transitions,
         "facade_waypoint_counts": facade_wp_counts,
+        "camera": {
+            "name": camera_name.value,
+            "fov_h_deg": h_fov_deg,
+            "fov_v_deg": v_fov_deg,
+            "distance_m": round(distance, 2),
+            "focal_length_mm": camera_spec.focal_length_mm,
+        },
     }
 
     # Prepare viewer data
