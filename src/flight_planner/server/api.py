@@ -224,6 +224,7 @@ async def upload_building_file(
         properties_json=json.dumps({
             "mesh_format": ext,
             "auto_height": building.height,
+            "mesh_viewer": getattr(building, "_mesh_viewer_data", None),
         }),
     )
 
@@ -320,6 +321,8 @@ def get_drone():
 @router.post("/generate")
 def generate(request: GenerateRequest):
     # Build the building from one of three sources: uploaded, preset, or custom box
+    raw_mesh = None  # raw 3D mesh data for viewer (mesh uploads only)
+
     if request.building_id:
         db = get_db()
         try:
@@ -335,6 +338,10 @@ def generate(request: GenerateRequest):
                 roof_pitch_deg=request.building.roof_pitch_deg,
                 name=record.name,
             )
+            # Load raw mesh viewer data if available (from mesh uploads)
+            if record.properties_json:
+                props = json.loads(record.properties_json)
+                raw_mesh = props.get("mesh_viewer")
         finally:
             db.close()
     elif request.preset and request.preset in PRESET_MAP:
@@ -450,8 +457,12 @@ def generate(request: GenerateRequest):
     }
 
     # Prepare viewer data
+    threejs_data = prepare_threejs_data(building, waypoints)
+    if raw_mesh:
+        threejs_data["rawMesh"] = raw_mesh
+
     viewer_data = {
-        "threejs": prepare_threejs_data(building, waypoints),
+        "threejs": threejs_data,
         "leaflet": prepare_leaflet_data(building, waypoints),
     }
 

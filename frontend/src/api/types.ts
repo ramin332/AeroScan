@@ -102,12 +102,18 @@ export interface WaypointData {
   is_transition: boolean;
 }
 
+export interface RawMeshData {
+  positions: number[]; // flat [x0,y0,z0, x1,y1,z1, ...]
+  indices: number[];   // flat [i0,j0,k0, i1,j1,k1, ...]
+}
+
 export interface ThreeJSData {
   facades: FacadeData[];
   waypoints: WaypointData[];
   buildingLabel: string;
   buildingDims: string;
   buildingHeight: number;
+  rawMesh?: RawMeshData | null;
 }
 
 // Leaflet viewer data

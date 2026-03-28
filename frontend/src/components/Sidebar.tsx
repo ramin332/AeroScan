@@ -55,15 +55,15 @@ export function Sidebar() {
   };
 
   const isUploadMode = buildingSource === 'upload';
+  const selectedBuilding = buildings.find((b) => b.id === selectedBuildingId);
   const showBoxParams = !isUploadMode && preset !== 'l_shaped_block';
 
   return (
     <aside className="sidebar">
       <h1>AeroScan Flight Planner</h1>
-
       <DroneInfo />
 
-      {/* Building source toggle */}
+      {/* ---- Building source toggle ---- */}
       <div className="section">
         <h3>Building</h3>
         <div className="source-toggle">
@@ -71,7 +71,7 @@ export function Sidebar() {
             className={`source-btn ${isUploadMode ? 'active' : ''}`}
             onClick={() => setBuildingSource('upload')}
           >
-            Upload Map
+            Upload
           </button>
           <button
             className={`source-btn ${!isUploadMode ? 'active' : ''}`}
@@ -82,7 +82,7 @@ export function Sidebar() {
         </div>
       </div>
 
-      {/* Upload mode */}
+      {/* ---- Upload mode ---- */}
       {isUploadMode && (
         <div className="section">
           <div
@@ -104,7 +104,7 @@ export function Sidebar() {
               <>
                 <span className="upload-icon">+</span>
                 <span className="upload-text">Upload Building</span>
-                <span className="upload-hint">GeoJSON, OBJ, PLY, or STL</span>
+                <span className="upload-hint">GeoJSON, OBJ, PLY, STL</span>
               </>
             )}
           </div>
@@ -134,33 +134,32 @@ export function Sidebar() {
             </div>
           )}
 
-          {selectedBuildingId && (
-            <>
-              <div style={{ marginTop: 8 }}>
-                <Field label="Height (m)" value={building.height} min={1} max={100} step={0.5}
-                  onChange={(v) => setBuilding({ height: v })} />
-                <Field label="Stories" value={building.num_stories} min={1} max={20} step={1}
-                  onChange={(v) => setBuilding({ num_stories: v })} />
-                <div className="field">
-                  <label>Roof</label>
-                  <select value={building.roof_type}
-                    onChange={(e) => setBuilding({ roof_type: e.target.value as 'flat' | 'pitched' })}>
-                    <option value="flat">Flat</option>
-                    <option value="pitched">Pitched</option>
-                  </select>
-                </div>
-                {building.roof_type === 'pitched' && (
-                  <SliderField label="Pitch angle" value={building.roof_pitch_deg} min={5} max={60} step={5}
-                    format={(v) => `${v}\u00B0`}
-                    onChange={(v) => setBuilding({ roof_pitch_deg: v })} />
-                )}
+          {/* Editable overrides for uploaded building */}
+          {selectedBuilding && (
+            <div style={{ marginTop: 8 }}>
+              <Field label="Height (m)" value={building.height} min={1} max={100} step={0.5}
+                onChange={(v) => setBuilding({ height: v })} />
+              <Field label="Stories" value={building.num_stories} min={1} max={20} step={1}
+                onChange={(v) => setBuilding({ num_stories: v })} />
+              <div className="field">
+                <label>Roof</label>
+                <select value={building.roof_type}
+                  onChange={(e) => setBuilding({ roof_type: e.target.value as 'flat' | 'pitched' })}>
+                  <option value="flat">Flat</option>
+                  <option value="pitched">Pitched</option>
+                </select>
               </div>
-            </>
+              {building.roof_type === 'pitched' && (
+                <SliderField label="Pitch" value={building.roof_pitch_deg} min={5} max={60} step={5}
+                  format={(v) => `${v}\u00B0`}
+                  onChange={(v) => setBuilding({ roof_pitch_deg: v })} />
+              )}
+            </div>
           )}
         </div>
       )}
 
-      {/* Preset mode */}
+      {/* ---- Preset mode ---- */}
       {!isUploadMode && (
         <>
           <div className="section">
@@ -196,7 +195,7 @@ export function Sidebar() {
                 </select>
               </div>
               {building.roof_type === 'pitched' && (
-                <SliderField label="Pitch angle" value={building.roof_pitch_deg} min={5} max={60} step={5}
+                <SliderField label="Pitch" value={building.roof_pitch_deg} min={5} max={60} step={5}
                   format={(v) => `${v}\u00B0`}
                   onChange={(v) => setBuilding({ roof_pitch_deg: v })} />
               )}
@@ -209,10 +208,11 @@ export function Sidebar() {
         </>
       )}
 
+      {/* ---- Mission parameters (always shown) ---- */}
       <div className="section">
-        <h3>Mission</h3>
+        <h3>Inspection</h3>
         <SliderField label="GSD (mm/px)" value={mission.target_gsd_mm_per_px}
-          min={0.5} max={10} step={0.5}
+          min={1} max={5} step={0.25}
           onChange={(v) => setMission({ target_gsd_mm_per_px: v })} />
         <div className="field">
           <label>Camera</label>
@@ -224,18 +224,28 @@ export function Sidebar() {
           </select>
         </div>
         <SliderField label="Front overlap" value={mission.front_overlap}
-          min={0.3} max={0.95} step={0.05}
+          min={0.5} max={0.95} step={0.05}
           format={(v) => `${Math.round(v * 100)}%`}
           onChange={(v) => setMission({ front_overlap: v })} />
         <SliderField label="Side overlap" value={mission.side_overlap}
-          min={0.3} max={0.95} step={0.05}
+          min={0.5} max={0.95} step={0.05}
           format={(v) => `${Math.round(v * 100)}%`}
           onChange={(v) => setMission({ side_overlap: v })} />
-        <SliderField label="Speed (m/s)" value={mission.flight_speed_ms}
-          min={0.5} max={21} step={0.5}
-          onChange={(v) => setMission({ flight_speed_ms: v })} />
       </div>
 
+      <div className="section">
+        <h3>Flight</h3>
+        <SliderField label="Inspect speed" value={mission.flight_speed_ms}
+          min={1} max={8} step={0.5}
+          format={(v) => `${v} m/s`}
+          onChange={(v) => setMission({ flight_speed_ms: v })} />
+        <SliderField label="Clearance" value={mission.obstacle_clearance_m}
+          min={1} max={10} step={0.5}
+          format={(v) => `${v} m`}
+          onChange={(v) => setMission({ obstacle_clearance_m: v })} />
+      </div>
+
+      {/* ---- Generate + results ---- */}
       <div className="section">
         <button className="btn-primary" onClick={generate} disabled={loading || (isUploadMode && !selectedBuildingId)}>
           {loading ? 'Generating...' : 'Generate Mission'}
@@ -252,7 +262,7 @@ export function Sidebar() {
       </div>
 
       <div className="section">
-        <h3>Version History</h3>
+        <h3>History</h3>
         <VersionList />
       </div>
     </aside>

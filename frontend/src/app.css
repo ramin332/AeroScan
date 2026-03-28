@@ -51,6 +51,9 @@ body {
 .field input:focus, .field select:focus { border-color: var(--accent); }
 .field input[type='range'] { padding: 0; border: none; background: transparent; }
 .field .val { font-size: 11px; color: var(--fg3); min-width: 40px; text-align: right; }
+.field.readonly { opacity: 0.7; }
+.field.readonly label { color: var(--fg3); }
+.val-fixed { font-size: 11px; color: var(--fg3); text-align: right; flex: 1; }
 
 .btn-primary {
   display: block; width: 100%; padding: 8px; background: var(--accent); color: #fff;

@@ -255,11 +255,21 @@ def build_building_from_mesh(
     if not isinstance(mesh, trimesh.Trimesh) or len(mesh.vertices) == 0:
         raise ValueError("Could not load mesh or mesh is empty")
 
+    # OBJ/GLTF/FBX files typically use Y-up convention.
+    # PLY/STL files typically use Z-up.
+    # We need Z-up (ENU: x=East, y=North, z=Up) for our coordinate system.
+    # Y-up → Z-up rotation: (x, y, z) → (x, -z, y)
+    if file_type in ("obj", "glb", "gltf"):
+        verts = mesh.vertices.copy()
+        mesh.vertices[:, 0] = verts[:, 0]   # x stays
+        mesh.vertices[:, 1] = -verts[:, 2]  # y_new = -z_old (forward)
+        mesh.vertices[:, 2] = verts[:, 1]   # z_new = y_old (up)
+
     # Center the mesh at origin
     centroid = mesh.centroid.copy()
     mesh.vertices -= centroid
 
-    # Get building height from mesh bounding box
+    # Get building height from mesh bounding box (Z is up after rotation)
     z_min = float(mesh.vertices[:, 2].min())
     z_max = float(mesh.vertices[:, 2].max())
     mesh_height = z_max - z_min
@@ -296,7 +306,7 @@ def build_building_from_mesh(
 
     name = name or "Mesh building"
 
-    return _footprint_to_building(
+    building = _footprint_to_building(
         enu_coords=hull,
         center_lat=lat,
         center_lon=lon,
@@ -306,3 +316,12 @@ def build_building_from_mesh(
         roof_pitch_deg=roof_pitch_deg,
         name=name,
     )
+
+    # Attach processed mesh geometry for 3D viewer rendering.
+    # Stored as a compact dict of flat arrays (positions + face indices).
+    building._mesh_viewer_data = {
+        "positions": mesh.vertices.flatten().round(3).tolist(),
+        "indices": mesh.faces.flatten().tolist(),
+    }
+
+    return building

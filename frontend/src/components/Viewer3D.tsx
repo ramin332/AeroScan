@@ -2,7 +2,7 @@ import { useRef, useMemo, useState, useCallback, useEffect } from 'react';
 import { Canvas, useThree, type ThreeEvent } from '@react-three/fiber';
 import { OrbitControls, Line } from '@react-three/drei';
 import * as THREE from 'three';
-import type { ThreeJSData, WaypointData } from '../api/types';
+import type { RawMeshData, ThreeJSData, WaypointData } from '../api/types';
 import { DroneMarker, getVisitedIndex } from './DroneAnimation';
 
 // Convert ENU (x=East, y=North, z=Up) to Three.js (x=right, y=up, z=toward camera)
@@ -97,6 +97,46 @@ function FlightPath({ waypoints }: { waypoints: WaypointData[] }) {
   return <Line points={points} color="white" lineWidth={0.5} opacity={0.3} transparent />;
 }
 
+function RawMeshView({ mesh }: { mesh: RawMeshData }) {
+  const geometry = useMemo(() => {
+    const geo = new THREE.BufferGeometry();
+    // Convert ENU positions to Three.js coordinate system
+    const pos = new Float32Array(mesh.positions.length);
+    for (let i = 0; i < mesh.positions.length; i += 3) {
+      pos[i] = mesh.positions[i];       // x → x
+      pos[i + 1] = mesh.positions[i + 2]; // z → y (up)
+      pos[i + 2] = -mesh.positions[i + 1]; // -y → z (toward camera)
+    }
+    geo.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+    geo.setIndex(new THREE.BufferAttribute(new Uint32Array(mesh.indices), 1));
+    geo.computeVertexNormals();
+    return geo;
+  }, [mesh]);
+
+  return (
+    <group>
+      <mesh geometry={geometry}>
+        <meshStandardMaterial
+          color="#8899bb"
+          transparent
+          opacity={0.25}
+          side={THREE.DoubleSide}
+          roughness={0.7}
+          metalness={0.1}
+        />
+      </mesh>
+      <mesh geometry={geometry}>
+        <meshStandardMaterial
+          color="#aabbdd"
+          wireframe
+          transparent
+          opacity={0.15}
+        />
+      </mesh>
+    </group>
+  );
+}
+
 function VisitedOverlay({ waypoints, visitedUpTo }: { waypoints: WaypointData[]; visitedUpTo: number }) {
   const meshRef = useRef<THREE.InstancedMesh>(null);
   const count = Math.min(visitedUpTo + 1, waypoints.length);
@@ -124,7 +164,7 @@ function VisitedOverlay({ waypoints, visitedUpTo }: { waypoints: WaypointData[];
   );
 }
 
-function Scene({ data, onWaypointClick, visitedIndex }: { data: ThreeJSData; onWaypointClick: (wp: WaypointData | null) => void; visitedIndex: number }) {
+function Scene({ data, onWaypointClick, visitedIndex, showRawMesh }: { data: ThreeJSData; onWaypointClick: (wp: WaypointData | null) => void; visitedIndex: number; showRawMesh: boolean }) {
   const { raycaster } = useThree();
 
   // Separate inspection and transition waypoints
@@ -200,6 +240,11 @@ function Scene({ data, onWaypointClick, visitedIndex }: { data: ThreeJSData; onW
       {visitedIndex >= 0 && (
         <VisitedOverlay waypoints={data.waypoints} visitedUpTo={visitedIndex} />
       )}
+
+      {/* Raw 3D mesh from uploaded file */}
+      {showRawMesh && data.rawMesh && (
+        <RawMeshView mesh={data.rawMesh} />
+      )}
     </group>
   );
 }
@@ -215,6 +260,7 @@ export function Viewer3D({ data, cameraFov }: { data: ThreeJSData | null; camera
   const [playing, setPlaying] = useState(false);
   const [progress, setProgress] = useState(0);
   const [speed, setSpeed] = useState(1);
+  const [showRawMesh, setShowRawMesh] = useState(true);
   const animRef = useRef<number | null>(null);
   const lastTimeRef = useRef(0);
 
@@ -286,7 +332,7 @@ export function Viewer3D({ data, cameraFov }: { data: ThreeJSData | null; camera
           enableDamping
           dampingFactor={0.08}
         />
-        <Scene data={data} onWaypointClick={setSelectedWp} visitedIndex={playing || progress > 0 ? getVisitedIndex(progress, data.waypoints.length) : -1} />
+        <Scene data={data} onWaypointClick={setSelectedWp} visitedIndex={playing || progress > 0 ? getVisitedIndex(progress, data.waypoints.length) : -1} showRawMesh={showRawMesh} />
         {(playing || progress > 0) && (
           <DroneMarker waypoints={data.waypoints} progress={progress} cameraFov={cameraFov} />
         )}
@@ -294,6 +340,17 @@ export function Viewer3D({ data, cameraFov }: { data: ThreeJSData | null; camera
 
       {/* Legend */}
       <div className="legend-3d">
+        {data.rawMesh && (
+          <label className="legend-item" style={{ cursor: 'pointer', marginBottom: 4 }}>
+            <input
+              type="checkbox"
+              checked={showRawMesh}
+              onChange={(e) => setShowRawMesh(e.target.checked)}
+              style={{ marginRight: 6 }}
+            />
+            <span>Raw mesh</span>
+          </label>
+        )}
         {data.facades.map((f) => (
           <div key={f.index} className="legend-item">
             <span className="legend-dot" style={{ backgroundColor: f.color }} />
