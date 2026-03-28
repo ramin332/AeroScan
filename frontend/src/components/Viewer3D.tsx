@@ -300,19 +300,10 @@ export function Viewer3D({ data, cameraFov }: { data: ThreeJSData | null; camera
     };
   }, [playing, speed, data]);
 
-  if (!data) {
-    return <div className="empty-state">Click "Generate Mission" to start</div>;
-  }
-
-  // Current waypoint index for display
-  const currentWpIdx = Math.min(
-    Math.floor(progress * (data.waypoints.length - 1)),
-    data.waypoints.length - 1,
-  );
-  const currentWp = data.waypoints[currentWpIdx];
-
   // Group facades and waypoints by cardinal direction for legend
+  // (must be before early return to satisfy Rules of Hooks)
   const directionGroups = useMemo(() => {
+    if (!data) return {};
     const groups: Record<string, { color: string; facades: number; waypoints: number }> = {};
     for (const f of data.facades) {
       const dir = f.direction || 'other';
@@ -327,6 +318,17 @@ export function Viewer3D({ data, cameraFov }: { data: ThreeJSData | null; camera
     }
     return groups;
   }, [data]);
+
+  if (!data) {
+    return <div className="empty-state">Click "Generate Mission" to start</div>;
+  }
+
+  // Current waypoint index for display
+  const currentWpIdx = Math.min(
+    Math.floor(progress * (data.waypoints.length - 1)),
+    data.waypoints.length - 1,
+  );
+  const currentWp = data.waypoints[currentWpIdx];
 
   return (
     <div style={{ width: '100%', height: '100%', position: 'relative' }}>

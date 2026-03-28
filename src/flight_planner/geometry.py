@@ -433,6 +433,47 @@ def _generate_transition_waypoints(
     return transition_wps
 
 
+def _nearest_neighbor_order(groups: list[list[Waypoint]]) -> list[list[Waypoint]]:
+    """Reorder facade waypoint groups by nearest-neighbor to minimize transit.
+
+    Uses the last waypoint of the current group → first waypoint of the next
+    group as the distance metric. Greedy nearest-neighbor starting from
+    the group closest to the origin.
+    """
+    n = len(groups)
+    if n <= 2:
+        return groups
+
+    # Compute centroid (midpoint of first and last waypoint) for each group
+    centroids = []
+    for g in groups:
+        cx = (g[0].x + g[-1].x) / 2
+        cy = (g[0].y + g[-1].y) / 2
+        cz = (g[0].z + g[-1].z) / 2
+        centroids.append((cx, cy, cz))
+
+    # Start from the group closest to the origin (building center)
+    remaining = set(range(n))
+    start = min(remaining, key=lambda i: centroids[i][0] ** 2 + centroids[i][1] ** 2 + centroids[i][2] ** 2)
+
+    order = [start]
+    remaining.discard(start)
+
+    while remaining:
+        last = order[-1]
+        # Distance from the last waypoint of current group to first of candidates
+        lx, ly, lz = groups[last][-1].x, groups[last][-1].y, groups[last][-1].z
+        nearest = min(remaining, key=lambda i: (
+            (groups[i][0].x - lx) ** 2 +
+            (groups[i][0].y - ly) ** 2 +
+            (groups[i][0].z - lz) ** 2
+        ))
+        order.append(nearest)
+        remaining.discard(nearest)
+
+    return [groups[i] for i in order]
+
+
 def generate_mission_waypoints(
     building: Building,
     config: MissionConfig,
@@ -448,6 +489,11 @@ def generate_mission_waypoints(
         facade_wps = generate_waypoints_for_facade(facade, config)
         if facade_wps:
             facade_groups.append(facade_wps)
+
+    # Reorder facades by nearest-neighbor to minimize transit distance.
+    # Use facade centroid (average of first/last waypoint) as the location.
+    if len(facade_groups) > 2:
+        facade_groups = _nearest_neighbor_order(facade_groups)
 
     # Assemble with transition waypoints between facades
     all_waypoints: list[Waypoint] = []
