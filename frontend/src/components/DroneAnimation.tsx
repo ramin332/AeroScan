@@ -15,7 +15,7 @@ interface Props {
 
 export function DroneMarker({ waypoints, progress }: Props) {
   const groupRef = useRef<THREE.Group>(null);
-  const gimbalGroupRef = useRef<THREE.Group>(null);
+  const gimbalRef = useRef<THREE.Group>(null);
   const beamRef = useRef<THREE.Mesh>(null);
 
   const positions = useMemo(
@@ -31,25 +31,28 @@ export function DroneMarker({ waypoints, progress }: Props) {
     const idx = Math.min(Math.floor(rawIdx), n - 1);
     const t = rawIdx - idx;
 
-    // Position
+    // Position: linear interp
     const pos = new THREE.Vector3().lerpVectors(positions[idx], positions[idx + 1], t);
     groupRef.current.position.copy(pos);
 
-    // Heading (rotate whole group)
+    // Heading: rotate whole drone around Y
     const wp = waypoints[Math.min(idx + 1, waypoints.length - 1)];
     groupRef.current.rotation.y = -(wp.heading * Math.PI) / 180;
 
-    // Gimbal pitch
-    if (gimbalGroupRef.current) {
-      gimbalGroupRef.current.rotation.x = (wp.gimbal_pitch * Math.PI) / 180;
+    // Gimbal pitch:
+    //   DJI convention: 0° = horizontal (camera looks forward), -90° = nadir (straight down)
+    //   Three.js: gimbal group default points along -Z (forward in drone local)
+    //   We rotate around X: pitch 0° → look forward (no rotation), pitch -90° → look down (+90° on X)
+    if (gimbalRef.current) {
+      gimbalRef.current.rotation.x = -(wp.gimbal_pitch * Math.PI) / 180;
     }
 
-    // Pulse the beam opacity for photo waypoints
+    // Flash beam on photo
     if (beamRef.current) {
       const mat = beamRef.current.material as THREE.MeshStandardMaterial;
       const isPhoto = t > 0.85 && !wp.is_transition;
-      mat.opacity = isPhoto ? 0.5 : 0.15;
-      mat.emissiveIntensity = isPhoto ? 1.0 : 0.2;
+      mat.opacity = isPhoto ? 0.4 : 0.12;
+      mat.emissiveIntensity = isPhoto ? 0.8 : 0.1;
     }
   });
 
@@ -57,52 +60,54 @@ export function DroneMarker({ waypoints, progress }: Props) {
 
   return (
     <group ref={groupRef}>
-      {/* Drone: small white dot with ring */}
+      {/* Drone marker: white dot + ring */}
       <mesh>
-        <sphereGeometry args={[0.3, 12, 8]} />
-        <meshStandardMaterial color="#fff" emissive="#fff" emissiveIntensity={0.5} />
+        <sphereGeometry args={[0.25, 12, 8]} />
+        <meshStandardMaterial color="#fff" emissive="#fff" emissiveIntensity={0.6} />
       </mesh>
       <mesh rotation={[Math.PI / 2, 0, 0]}>
-        <ringGeometry args={[0.5, 0.6, 16]} />
-        <meshBasicMaterial color="#fff" transparent opacity={0.3} side={THREE.DoubleSide} />
+        <ringGeometry args={[0.45, 0.55, 16]} />
+        <meshBasicMaterial color="#fff" transparent opacity={0.25} side={THREE.DoubleSide} />
       </mesh>
 
-      {/* Heading indicator: small forward line */}
+      {/* Heading line: thin white line pointing forward (-Z in local = north when heading=0) */}
       <Line
-        points={[[0, 0, 0], [0, 0, -1.2]]}
+        points={[[0, 0, 0], [0, 0, -1.0]]}
         color="#fff"
         lineWidth={1.5}
-        opacity={0.5}
+        opacity={0.4}
         transparent
       />
 
-      {/* Gimbal + camera beam */}
-      <group ref={gimbalGroupRef}>
-        {/* Camera lens dot */}
-        <mesh position={[0, -0.15, 0]}>
-          <sphereGeometry args={[0.1, 8, 6]} />
+      {/* Gimbal group: rotates around X axis based on pitch.
+          Default orientation: beam points along -Z (forward).
+          pitch=0 → forward, pitch=-90 → down (+90° rotation around X) */}
+      <group ref={gimbalRef}>
+        {/* Camera lens */}
+        <mesh position={[0, 0, -0.3]}>
+          <sphereGeometry args={[0.08, 8, 6]} />
           <meshStandardMaterial color="#f59e0b" emissive="#f59e0b" emissiveIntensity={0.8} />
         </mesh>
 
-        {/* Camera beam / projection cone showing where camera is looking */}
-        <mesh ref={beamRef} position={[0, -3, 0]}>
-          <cylinderGeometry args={[0.05, 1.5, 5, 8, 1, true]} />
+        {/* Camera beam: cone projecting along -Z (forward in gimbal space) */}
+        <mesh ref={beamRef} position={[0, 0, -3]} rotation={[Math.PI / 2, 0, 0]}>
+          <cylinderGeometry args={[0.05, 1.2, 5, 8, 1, true]} />
           <meshStandardMaterial
             color="#f59e0b"
             emissive="#f59e0b"
-            emissiveIntensity={0.2}
+            emissiveIntensity={0.1}
             transparent
-            opacity={0.15}
+            opacity={0.12}
             side={THREE.DoubleSide}
           />
         </mesh>
 
-        {/* Camera center line */}
+        {/* Camera center line along -Z */}
         <Line
-          points={[[0, -0.15, 0], [0, -5.5, 0]]}
+          points={[[0, 0, -0.3], [0, 0, -5.5]]}
           color="#f59e0b"
           lineWidth={1}
-          opacity={0.6}
+          opacity={0.5}
           transparent
         />
       </group>
