@@ -66,35 +66,50 @@ function WaypointSpheres({ waypoints, color }: { waypoints: WaypointData[]; colo
 }
 
 function CameraArrows({ waypoints, color }: { waypoints: WaypointData[]; color: string }) {
-  const lines = useMemo(() => {
-    return waypoints.map((wp) => {
-      const origin = enu(wp.x, wp.y, wp.z);
+  const geometry = useMemo(() => {
+    const positions: number[] = [];
+    for (const wp of waypoints) {
+      const [ox, oy, oz] = enu(wp.x, wp.y, wp.z);
       const hr = (wp.heading * Math.PI) / 180;
       const pr = (wp.gimbal_pitch * Math.PI) / 180;
       const dx = Math.sin(hr) * Math.cos(pr);
       const dy = Math.cos(hr) * Math.cos(pr);
       const dz = Math.sin(pr);
-      const end = enu(wp.x + dx * 2, wp.y + dy * 2, wp.z + dz * 2);
-      return [origin, end] as [[number, number, number], [number, number, number]];
-    });
+      const [ex, ey, ez] = enu(wp.x + dx * 2, wp.y + dy * 2, wp.z + dz * 2);
+      positions.push(ox, oy, oz, ex, ey, ez);
+    }
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+    return geo;
   }, [waypoints]);
 
   return (
-    <>
-      {lines.map((pts, i) => (
-        <Line key={i} points={pts} color={color} lineWidth={1} opacity={0.5} transparent />
-      ))}
-    </>
+    <lineSegments geometry={geometry}>
+      <lineBasicMaterial color={color} transparent opacity={0.5} />
+    </lineSegments>
   );
 }
 
 function FlightPath({ waypoints }: { waypoints: WaypointData[] }) {
-  const points = useMemo(
-    () => waypoints.map((wp) => enu(wp.x, wp.y, wp.z) as [number, number, number]),
-    [waypoints],
+  const geometry = useMemo(() => {
+    if (waypoints.length < 2) return null;
+    const positions: number[] = [];
+    for (let i = 0; i < waypoints.length - 1; i++) {
+      const [x1, y1, z1] = enu(waypoints[i].x, waypoints[i].y, waypoints[i].z);
+      const [x2, y2, z2] = enu(waypoints[i + 1].x, waypoints[i + 1].y, waypoints[i + 1].z);
+      positions.push(x1, y1, z1, x2, y2, z2);
+    }
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+    return geo;
+  }, [waypoints]);
+
+  if (!geometry) return null;
+  return (
+    <lineSegments geometry={geometry}>
+      <lineBasicMaterial color="white" transparent opacity={0.15} />
+    </lineSegments>
   );
-  if (points.length < 2) return null;
-  return <Line points={points} color="white" lineWidth={0.5} opacity={0.3} transparent />;
 }
 
 function RawMeshView({ mesh }: { mesh: RawMeshData }) {
@@ -260,6 +275,7 @@ export function Viewer3D({ data, cameraFov }: { data: ThreeJSData | null; camera
   const [playing, setPlaying] = useState(false);
   const [progress, setProgress] = useState(0);
   const [speed, setSpeed] = useState(1);
+  const [usePhysics, setUsePhysics] = useState(true);
   const [showRawMesh, setShowRawMesh] = useState(true);
   const animRef = useRef<number | null>(null);
   const lastTimeRef = useRef(0);
@@ -298,7 +314,10 @@ export function Viewer3D({ data, cameraFov }: { data: ThreeJSData | null; camera
   useEffect(() => {
     if (!playing || !data) return;
 
-    const duration = (timeline.totalTime / speed) * 1000;
+    const baseSec = usePhysics
+      ? timeline.totalTime
+      : Math.max(5, data.waypoints.length * 0.08);
+    const duration = (baseSec / speed) * 1000;
 
     lastTimeRef.current = performance.now();
 
@@ -357,6 +376,7 @@ export function Viewer3D({ data, cameraFov }: { data: ThreeJSData | null; camera
       <Canvas
         camera={{ position: [35, 25, 35], fov: 50, near: 0.1, far: 500 }}
         style={{ background: '#0f1117' }}
+        frameloop={playing ? 'always' : 'demand'}
         onClick={() => setSelectedWp(null)}
       >
         <ambientLight intensity={0.5} />
@@ -370,7 +390,7 @@ export function Viewer3D({ data, cameraFov }: { data: ThreeJSData | null; camera
         />
         <Scene data={data} onWaypointClick={setSelectedWp} visitedIndex={playing || progress > 0 ? getVisitedIndex(progress, data.waypoints.length) : -1} showRawMesh={showRawMesh} />
         {(playing || progress > 0) && (
-          <DroneMarker waypoints={data.waypoints} progress={progress} cameraFov={cameraFov} timeline={timeline} />
+          <DroneMarker waypoints={data.waypoints} progress={progress} cameraFov={cameraFov} timeline={usePhysics ? timeline : undefined} />
         )}
       </Canvas>
 
@@ -433,6 +453,13 @@ export function Viewer3D({ data, cameraFov }: { data: ThreeJSData | null; camera
           <option value={2}>2x</option>
           <option value={4}>4x</option>
         </select>
+        <button
+          className={`mode-btn ${usePhysics ? 'active' : ''}`}
+          onClick={() => setUsePhysics(!usePhysics)}
+          title={usePhysics ? 'Physics timing (realistic)' : 'Linear timing (fast preview)'}
+        >
+          {usePhysics ? 'PHY' : 'LIN'}
+        </button>
         <button
           className="play-btn"
           onClick={() => { setProgress(0); setPlaying(false); }}
