@@ -75,7 +75,7 @@ export async function deleteBuilding(id: string): Promise<void> {
 
 export async function uploadMeshFile(
   file: File,
-  params: { name: string; lat: number; lon: number; height: number; num_stories: number },
+  params: { name: string; lat: number; lon: number; height: number; num_stories: number; min_facade_area: number },
 ): Promise<UploadedBuilding> {
   const form = new FormData();
   form.append('file', file);
@@ -84,5 +84,6 @@ export async function uploadMeshFile(
   form.append('lon', String(params.lon));
   form.append('height', String(params.height));
   form.append('num_stories', String(params.num_stories));
+  form.append('min_facade_area', String(params.min_facade_area));
   return request('/buildings/upload-file', { method: 'POST', body: form });
 }

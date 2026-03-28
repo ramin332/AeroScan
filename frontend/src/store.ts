@@ -22,6 +22,9 @@ export const DEFAULT_MISSION: MissionParams = {
   flight_speed_ms: 3.0,
   obstacle_clearance_m: 2.0,
   mission_name: 'AeroScan Inspection',
+  gimbal_pitch_margin_deg: 5.0,
+  min_photo_distance_m: 1.5,
+  yaw_rate_deg_per_s: 60.0,
 };
 
 export const PRESETS: Record<string, Partial<BuildingParams>> = {
@@ -45,6 +48,9 @@ interface AppState {
   building: BuildingParams;
   mission: MissionParams;
 
+  // Mesh settings
+  minFacadeArea: number;
+
   // Result
   result: GenerateResponse | null;
   versions: VersionSummary[];
@@ -53,6 +59,7 @@ interface AppState {
   activeTab: Tab;
 
   // Actions
+  setMinFacadeArea: (v: number) => void;
   setBuildingSource: (source: BuildingSource) => void;
   setPreset: (name: string | null) => void;
   setBuilding: (patch: Partial<BuildingParams>) => void;
@@ -74,6 +81,7 @@ export const useStore = create<AppState>((set, get) => ({
   buildingSource: 'preset',
   selectedBuildingId: null,
   buildings: [],
+  minFacadeArea: 1.0,
 
   preset: 'simple_box',
   building: { ...DEFAULT_BUILDING },
@@ -83,6 +91,8 @@ export const useStore = create<AppState>((set, get) => ({
   loading: false,
   uploading: false,
   activeTab: '3d',
+
+  setMinFacadeArea: (v) => set({ minFacadeArea: v }),
 
   setBuildingSource: (source) => {
     set({ buildingSource: source });
@@ -115,7 +125,7 @@ export const useStore = create<AppState>((set, get) => ({
   setActiveTab: (tab) => set({ activeTab: tab }),
 
   generate: async () => {
-    const { preset, selectedBuildingId, buildingSource, building, mission } = get();
+    const { preset, selectedBuildingId, buildingSource, building, mission, minFacadeArea } = get();
     set({ loading: true });
     try {
       const result = await api.generate({
@@ -123,6 +133,7 @@ export const useStore = create<AppState>((set, get) => ({
         building_id: buildingSource === 'upload' ? selectedBuildingId : undefined,
         building,
         mission,
+        min_facade_area: buildingSource === 'upload' ? minFacadeArea : undefined,
       });
       set({ result, loading: false });
       get().refreshVersions();
@@ -178,13 +189,14 @@ export const useStore = create<AppState>((set, get) => ({
       if (isMesh) {
         // Mesh file → multipart upload
         const name = file.name.replace(/\.[^.]+$/, '') || 'Mesh building';
-        const { building } = get();
+        const { building, minFacadeArea } = get();
         uploaded = await api.uploadMeshFile(file, {
           name,
           lat: building.lat,
           lon: building.lon,
           height: 0, // auto-detect from mesh
           num_stories: 1,
+          min_facade_area: minFacadeArea,
         });
       } else {
         // GeoJSON → JSON upload

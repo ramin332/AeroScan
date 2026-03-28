@@ -274,8 +274,9 @@ export function Viewer3D({ data, cameraFov }: { data: ThreeJSData | null; camera
   useEffect(() => {
     if (!playing || !data) return;
 
-    // Base duration: 30s for the whole mission at 1x speed
-    const duration = (30 / speed) * 1000;
+    // Scale with waypoint count so speed stays consistent (~0.15s per WP at 1x)
+    const baseSec = Math.max(10, data.waypoints.length * 0.15);
+    const duration = (baseSec / speed) * 1000;
 
     lastTimeRef.current = performance.now();
 
@@ -310,11 +311,22 @@ export function Viewer3D({ data, cameraFov }: { data: ThreeJSData | null; camera
   );
   const currentWp = data.waypoints[currentWpIdx];
 
-  // Group counts for legend
-  const facadeCounts: Record<number, number> = {};
-  data.waypoints.forEach((wp) => {
-    if (!wp.is_transition) facadeCounts[wp.facade_index] = (facadeCounts[wp.facade_index] || 0) + 1;
-  });
+  // Group facades and waypoints by cardinal direction for legend
+  const directionGroups = useMemo(() => {
+    const groups: Record<string, { color: string; facades: number; waypoints: number }> = {};
+    for (const f of data.facades) {
+      const dir = f.direction || 'other';
+      if (!groups[dir]) groups[dir] = { color: f.color, facades: 0, waypoints: 0 };
+      groups[dir].facades++;
+    }
+    for (const wp of data.waypoints) {
+      if (wp.is_transition) continue;
+      const facade = data.facades.find((f) => f.index === wp.facade_index);
+      const dir = facade?.direction || 'other';
+      if (groups[dir]) groups[dir].waypoints++;
+    }
+    return groups;
+  }, [data]);
 
   return (
     <div style={{ width: '100%', height: '100%', position: 'relative' }}>
@@ -351,10 +363,10 @@ export function Viewer3D({ data, cameraFov }: { data: ThreeJSData | null; camera
             <span>Raw mesh</span>
           </label>
         )}
-        {data.facades.map((f) => (
-          <div key={f.index} className="legend-item">
-            <span className="legend-dot" style={{ backgroundColor: f.color }} />
-            <span>{f.label} ({facadeCounts[f.index] || 0})</span>
+        {Object.entries(directionGroups).map(([dir, g]) => (
+          <div key={dir} className="legend-item">
+            <span className="legend-dot" style={{ backgroundColor: g.color }} />
+            <span>{dir} ({g.facades}f / {g.waypoints}wp)</span>
           </div>
         ))}
       </div>

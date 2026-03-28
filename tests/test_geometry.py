@@ -132,7 +132,7 @@ class TestWaypointGeneration:
                 assert wp.gimbal_pitch_deg == 0.0
 
     def test_gimbal_down_for_flat_roof(self):
-        """Gimbal pitch should be -90° for flat roof."""
+        """Gimbal pitch should be near -90° for flat roof (clamped with safety margin)."""
         b = build_rectangular_building(
             lat=53.2, lon=5.8, width=20, depth=10, height=8,
         )
@@ -140,7 +140,8 @@ class TestWaypointGeneration:
         roof = b.facades[4]
         wps = generate_waypoints_for_facade(roof, config)
         for wp in wps:
-            assert wp.gimbal_pitch_deg == -90.0
+            assert wp.gimbal_pitch_deg <= -80.0, "Flat roof gimbal should be near nadir"
+            assert wp.gimbal_pitch_deg >= -90.0, "Gimbal should not exceed hardware limit"
 
     def test_boustrophedon_order(self):
         """Consecutive waypoints in the same row should be close together."""

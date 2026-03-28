@@ -20,6 +20,17 @@ export interface MissionParams {
   flight_speed_ms: number;
   obstacle_clearance_m: number;
   mission_name: string;
+  gimbal_pitch_margin_deg: number;
+  min_photo_distance_m: number;
+  yaw_rate_deg_per_s: number;
+}
+
+export interface ValidationIssue {
+  severity: 'error' | 'warning' | 'info';
+  code: string;
+  message: string;
+  waypoint_indices: number[];
+  facade_index: number | null;
 }
 
 export interface GenerateRequest {
@@ -27,6 +38,7 @@ export interface GenerateRequest {
   building_id?: string | null;
   building: BuildingParams;
   mission: MissionParams;
+  min_facade_area?: number;
 }
 
 export interface UploadedBuilding {
@@ -90,6 +102,7 @@ export interface FacadeData {
   index: number;
   component: string;
   color: string;
+  direction: string;
 }
 
 export interface WaypointData {
@@ -159,6 +172,8 @@ export interface GenerateResponse {
   timestamp: string;
   summary: Summary;
   viewer_data: ViewerData;
+  validation: ValidationIssue[];
+  can_export: boolean;
   config_snapshot: {
     building: BuildingParams;
     mission: MissionParams;

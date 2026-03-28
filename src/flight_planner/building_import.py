@@ -217,6 +217,123 @@ def build_building_from_geojson(
     )
 
 
+def _extract_facades_from_mesh(
+    mesh: "trimesh.Trimesh",
+    min_area_m2: float = 1.0,
+) -> Optional[list[Facade]]:
+    """Extract real planar surfaces from a mesh using trimesh facet detection.
+
+    Groups coplanar adjacent faces into facets, then creates a Facade for each
+    facet above the minimum area threshold. Returns walls, pitched roof slopes,
+    and flat roofs — each with correct normals for waypoint generation.
+
+    Returns None if facet detection fails (caller should fall back to convex hull).
+    """
+    try:
+        facets = mesh.facets
+        normals = mesh.facets_normal
+    except Exception:
+        return None
+
+    if len(facets) == 0:
+        return None
+
+    # Compute area per facet
+    areas = np.array([float(mesh.area_faces[f].sum()) for f in facets])
+
+    facades: list[Facade] = []
+    idx = 0
+
+    for face_indices, normal, area in zip(facets, normals, areas):
+        if area < min_area_m2:
+            continue
+
+        normal = normal / np.linalg.norm(normal)
+        nz = abs(normal[2])
+
+        # Skip downward-facing surfaces (floors, ceilings) and ground plane
+        if normal[2] < -0.5:
+            continue
+
+        # Get unique vertices for this facet
+        vert_indices = np.unique(mesh.faces[face_indices].flatten())
+        verts_3d = mesh.vertices[vert_indices]
+
+        # Skip surfaces at ground level
+        if np.mean(verts_3d[:, 2]) < 0.3:
+            continue
+
+        # Classify surface type
+        if nz < 0.1:
+            # Vertical wall
+            azimuth = math.degrees(math.atan2(normal[0], normal[1])) % 360
+            if azimuth < 45 or azimuth >= 315:
+                direction = "north_wall"
+            elif azimuth < 135:
+                direction = "east_wall"
+            elif azimuth < 225:
+                direction = "south_wall"
+            else:
+                direction = "west_wall"
+            component = "21.1"
+        elif nz > 0.95:
+            # Flat roof
+            direction = "roof_flat"
+            component = "47.1"
+        else:
+            # Pitched roof slope
+            tilt_deg = round(math.degrees(math.acos(nz)))
+            azimuth = math.degrees(math.atan2(normal[0], normal[1])) % 360
+            if azimuth < 45 or azimuth >= 315:
+                compass = "N"
+            elif azimuth < 135:
+                compass = "E"
+            elif azimuth < 225:
+                compass = "S"
+            else:
+                compass = "W"
+            direction = f"roof_{compass}_{tilt_deg}deg"
+            component = "47.1"
+
+        # Compute bounding polygon: project vertices onto facet plane, hull, back to 3D
+        if abs(normal[2]) < 0.9:
+            ref = np.array([0.0, 0.0, 1.0])
+        else:
+            ref = np.array([1.0, 0.0, 0.0])
+
+        u_axis = np.cross(normal, ref)
+        u_axis = u_axis / np.linalg.norm(u_axis)
+        v_axis = np.cross(normal, u_axis)
+        v_axis = v_axis / np.linalg.norm(v_axis)
+
+        center = verts_3d.mean(axis=0)
+        relative = verts_3d - center
+        u_coords = relative @ u_axis
+        v_coords = relative @ v_axis
+
+        pts_2d = list(zip(u_coords.tolist(), v_coords.tolist()))
+        hull_2d = _convex_hull_2d(pts_2d)
+
+        if len(hull_2d) < 3:
+            continue
+
+        hull_3d = np.array([
+            center + u * u_axis + v * v_axis
+            for u, v in hull_2d
+        ])
+
+        facades.append(Facade(
+            vertices=hull_3d,
+            normal=normal,
+            component_tag=component,
+            label=f"{direction}_{idx}",
+            index=idx,
+        ))
+        idx += 1
+
+    return facades if facades else None
+
+
 def build_building_from_mesh(
     mesh_data: bytes,
     file_type: str,
@@ -227,6 +344,7 @@ def build_building_from_mesh(
     roof_type: str = "flat",
     roof_pitch_deg: float = 0.0,
     name: str = "",
+    min_facade_area: float = 1.0,
 ) -> Building:
     """Create a Building from an OBJ/PLY/STL mesh file.
 
@@ -297,25 +415,47 @@ def build_building_from_mesh(
     z_min = float(mesh.vertices[:, 2].min())
     mesh.vertices[:, 2] -= z_min  # shift so ground is at z=0
 
-    # Project vertices to 2D (bird's eye view) and compute convex hull footprint
-    points_2d = [(float(v[0]), float(v[1])) for v in mesh.vertices]
-    hull = _convex_hull_2d(points_2d)
-
-    if len(hull) < 3:
-        raise ValueError("Mesh footprint has fewer than 3 hull points")
-
     name = name or "Mesh building"
 
-    building = _footprint_to_building(
-        enu_coords=hull,
-        center_lat=lat,
-        center_lon=lon,
-        height=height,
-        num_stories=num_stories,
-        roof_type_str=roof_type,
-        roof_pitch_deg=roof_pitch_deg,
-        name=name,
-    )
+    # Try facet-based extraction first (gives real wall/roof planes from mesh).
+    # Fall back to convex hull if facets aren't available.
+    facades = _extract_facades_from_mesh(mesh, min_area_m2=min_facade_area)
+
+    if facades:
+        xs = [float(v[0]) for f in facades for v in f.vertices]
+        ys = [float(v[1]) for f in facades for v in f.vertices]
+        width = round(max(xs) - min(xs), 1) if xs else 0
+        depth = round(max(ys) - min(ys), 1) if ys else 0
+
+        building = Building(
+            lat=lat,
+            lon=lon,
+            width=width,
+            depth=depth,
+            height=height,
+            heading_deg=0.0,
+            roof_type=RoofType(roof_type),
+            roof_pitch_deg=roof_pitch_deg,
+            num_stories=num_stories,
+            facades=facades,
+            label=name,
+        )
+    else:
+        # Fallback: convex hull footprint + flat roof
+        points_2d = [(float(v[0]), float(v[1])) for v in mesh.vertices]
+        hull = _convex_hull_2d(points_2d)
+        if len(hull) < 3:
+            raise ValueError("Mesh footprint has fewer than 3 hull points")
+        building = _footprint_to_building(
+            enu_coords=hull,
+            center_lat=lat,
+            center_lon=lon,
+            height=height,
+            num_stories=num_stories,
+            roof_type_str=roof_type,
+            roof_pitch_deg=roof_pitch_deg,
+            name=name,
+        )
 
     # Attach processed mesh geometry for 3D viewer rendering.
     # Stored as a compact dict of flat arrays (positions + face indices).

@@ -12,17 +12,30 @@ import tempfile
 
 from djikmz import DroneTask
 
-from .models import ActionType, MissionConfig, Waypoint
-
-# Map our CameraName to djikmz lens identifiers
-_LENS_MAP = {
-    "wide": "wide",
-    "medium_tele": "zoom",
-    "telephoto": "zoom",
-}
+from .models import (
+    ActionType,
+    GIMBAL_TILT_MAX_DEG,
+    GIMBAL_TILT_MIN_DEG,
+    MAX_WAYPOINTS_PER_MISSION,
+    MissionConfig,
+    Waypoint,
+)
 
 # TODO: confirm droneEnumValue for Matrice 4E — using M3E as closest match
 _DEFAULT_DRONE_MODEL = "M3E"
+
+
+def _clamp_pitch(pitch: float) -> float:
+    """Clamp gimbal pitch to hardware limits."""
+    return max(GIMBAL_TILT_MIN_DEG, min(GIMBAL_TILT_MAX_DEG, pitch))
+
+
+def _heading_to_djikmz(heading_deg: float) -> float:
+    """Convert 0-360 heading to djikmz range (-180 to 180)."""
+    h = heading_deg % 360
+    if h > 180:
+        h -= 360
+    return h
 
 
 def _build_mission(
@@ -30,26 +43,35 @@ def _build_mission(
     config: MissionConfig,
 ) -> DroneTask:
     """Build a djikmz DroneTask from our waypoints and config."""
+    if len(waypoints) > MAX_WAYPOINTS_PER_MISSION:
+        raise ValueError(
+            f"Mission has {len(waypoints)} waypoints, "
+            f"exceeding max {MAX_WAYPOINTS_PER_MISSION}"
+        )
+
     mission = DroneTask(_DEFAULT_DRONE_MODEL, "AeroScan")
     mission.name(config.mission_name)
     mission.speed(config.flight_speed_ms)
 
     for wp in waypoints:
-        # Add waypoint
-        wb = mission.fly_to(wp.lat, wp.lon, height=wp.z)
+        wb = mission.fly_to(wp.lat, wp.lon, height=max(wp.z, 2.0))
         wb.speed(wp.speed_ms)
 
-        # Set aircraft heading to face the facade
-        heading = wp.heading_deg
-        # djikmz expects -180 to 180
-        if heading > 180:
-            heading -= 360
+        heading = _heading_to_djikmz(wp.heading_deg)
         wb.heading(heading)
 
-        # Set gimbal orientation
-        wb.gimbal_rotate(pitch=wp.gimbal_pitch_deg, yaw=wp.gimbal_yaw_deg)
+        if wp.is_transition:
+            # Transit: fly through without stopping, no gimbal/photo
+            wb.turn_mode("curve_and_pass")
+            continue
 
-        # Execute actions
+        # Inspection: stop at waypoint, set gimbal, take photo
+        wb.turn_mode("curve_and_stop")
+        wb.gimbal_rotate(
+            pitch=_clamp_pitch(wp.gimbal_pitch_deg),
+            yaw=wp.gimbal_yaw_deg,
+        )
+
         for action in wp.actions:
             if action.action_type == ActionType.TAKE_PHOTO:
                 wb.take_photo(f"wp{wp.index}")

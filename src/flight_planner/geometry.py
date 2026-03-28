@@ -20,6 +20,8 @@ from .models import (
     CameraAction,
     CameraName,
     Facade,
+    GIMBAL_TILT_MAX_DEG,
+    GIMBAL_TILT_MIN_DEG,
     MAX_SPEED_MS,
     MIN_ALTITUDE_M,
     MissionConfig,
@@ -288,8 +290,10 @@ def generate_waypoints_for_facade(
     # Vertical wall: pitch=0 (horizontal), flat roof: pitch=-90 (nadir),
     # 30° pitched roof: pitch=-60° (tilted well down)
 
-    # Clamp gimbal pitch to hardware limits
-    gimbal_pitch = max(-90.0, min(35.0, gimbal_pitch))
+    # Clamp gimbal pitch to hardware limits with configurable safety margin
+    pitch_min = GIMBAL_TILT_MIN_DEG + config.gimbal_pitch_margin_deg
+    pitch_max = GIMBAL_TILT_MAX_DEG - config.gimbal_pitch_margin_deg
+    gimbal_pitch = max(pitch_min, min(pitch_max, gimbal_pitch))
 
     # Offset vector from facade surface to camera position
     offset = normal * distance
@@ -333,6 +337,18 @@ def generate_waypoints_for_facade(
                 component_tag=facade.component_tag,
             )
             waypoints.append(wp)
+
+    # Deduplicate waypoints closer than min_photo_distance
+    if len(waypoints) > 1 and config.min_photo_distance_m > 0:
+        deduped = [waypoints[0]]
+        for wp in waypoints[1:]:
+            prev = deduped[-1]
+            dist = math.sqrt(
+                (wp.x - prev.x) ** 2 + (wp.y - prev.y) ** 2 + (wp.z - prev.z) ** 2
+            )
+            if dist >= config.min_photo_distance_m:
+                deduped.append(wp)
+        waypoints = deduped
 
     return waypoints
 

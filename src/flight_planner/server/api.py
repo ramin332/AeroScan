@@ -35,6 +35,7 @@ from ..models import (
     MissionConfig,
     RoofType,
 )
+from ..validate import validate_mission
 from ..visualize import prepare_leaflet_data, prepare_threejs_data
 from .database import BuildingRecord, get_db
 from .state import session
@@ -64,6 +65,10 @@ class MissionParams(BaseModel):
     flight_speed_ms: float = Field(3.0, ge=0.5, le=21.0)
     obstacle_clearance_m: float = Field(2.0, ge=1.0, le=20.0)
     mission_name: str = "AeroScan Inspection"
+    # Advanced tunable constraints
+    gimbal_pitch_margin_deg: float = Field(5.0, ge=0.0, le=15.0)
+    min_photo_distance_m: float = Field(1.5, ge=0.5, le=5.0)
+    yaw_rate_deg_per_s: float = Field(60.0, ge=30.0, le=120.0)
 
 
 class GenerateRequest(BaseModel):
@@ -73,6 +78,7 @@ class GenerateRequest(BaseModel):
     building_id: Optional[str] = None
     building: BuildingParams = BuildingParams()
     mission: MissionParams = MissionParams()
+    min_facade_area: float = Field(1.0, ge=0.1, le=50.0)
 
 
 class BuildingUploadRequest(BaseModel):
@@ -157,6 +163,7 @@ async def upload_building_file(
     num_stories: int = Form(1),
     roof_type: str = Form("flat"),
     roof_pitch_deg: float = Form(0.0),
+    min_facade_area: float = Form(1.0),
 ):
     """Upload an OBJ/PLY/STL mesh file and create a building from it."""
     if not file.filename:
@@ -181,6 +188,7 @@ async def upload_building_file(
             roof_type=roof_type,
             roof_pitch_deg=roof_pitch_deg,
             name=build_name,
+            min_facade_area=min_facade_area,
         )
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Failed to parse mesh: {e}")
@@ -334,19 +342,52 @@ def generate(request: GenerateRequest):
             record = db.query(BuildingRecord).filter_by(id=request.building_id).first()
             if not record:
                 raise HTTPException(status_code=404, detail="Building not found")
-            geojson = json.loads(record.geometry_data)
-            building = build_building_from_geojson(
-                geojson,
-                height=request.building.height,
-                num_stories=request.building.num_stories,
-                roof_type=request.building.roof_type,
-                roof_pitch_deg=request.building.roof_pitch_deg,
-                name=record.name,
-            )
-            # Load raw mesh viewer data if available (from mesh uploads)
-            if record.properties_json:
-                props = json.loads(record.properties_json)
-                raw_mesh = props.get("mesh_viewer")
+
+            props = json.loads(record.properties_json) if record.properties_json else {}
+            raw_mesh = props.get("mesh_viewer")
+
+            if raw_mesh:
+                # Reconstruct mesh from stored vertices/indices and re-run
+                # facet detection with the requested min_facade_area threshold.
+                from ..building_import import _extract_facades_from_mesh, _convex_hull_2d
+                import trimesh
+                import numpy as np
+
+                positions = np.array(raw_mesh["positions"], dtype=np.float64).reshape(-1, 3)
+                indices = np.array(raw_mesh["indices"], dtype=np.int64).reshape(-1, 3)
+                mesh_obj = trimesh.Trimesh(vertices=positions, faces=indices)
+
+                facades = _extract_facades_from_mesh(mesh_obj, min_area_m2=request.min_facade_area)
+                if facades:
+                    xs = [float(v[0]) for f in facades for v in f.vertices]
+                    ys = [float(v[1]) for f in facades for v in f.vertices]
+                    width = round(max(xs) - min(xs), 1) if xs else 0
+                    depth = round(max(ys) - min(ys), 1) if ys else 0
+                    from ..models import Building as BuildingModel
+                    building = BuildingModel(
+                        lat=record.lat,
+                        lon=record.lon,
+                        width=width,
+                        depth=depth,
+                        height=record.height,
+                        facades=facades,
+                        label=record.name,
+                    )
+                else:
+                    # Fallback to GeoJSON footprint
+                    geojson = json.loads(record.geometry_data)
+                    building = build_building_from_geojson(geojson, height=record.height, name=record.name)
+            else:
+                # GeoJSON-only building (no mesh data)
+                geojson = json.loads(record.geometry_data)
+                building = build_building_from_geojson(
+                    geojson,
+                    height=request.building.height,
+                    num_stories=request.building.num_stories,
+                    roof_type=request.building.roof_type,
+                    roof_pitch_deg=request.building.roof_pitch_deg,
+                    name=record.name,
+                )
         finally:
             db.close()
     elif request.preset and request.preset in PRESET_MAP:
@@ -377,6 +418,9 @@ def generate(request: GenerateRequest):
         flight_speed_ms=request.mission.flight_speed_ms,
         obstacle_clearance_m=request.mission.obstacle_clearance_m,
         mission_name=request.mission.mission_name,
+        gimbal_pitch_margin_deg=request.mission.gimbal_pitch_margin_deg,
+        min_photo_distance_m=request.mission.min_photo_distance_m,
+        yaw_rate_deg_per_s=request.mission.yaw_rate_deg_per_s,
     )
 
     # Generate waypoints
@@ -461,6 +505,15 @@ def generate(request: GenerateRequest):
         },
     }
 
+    # Validate mission against hardware constraints
+    validation = validate_mission(waypoints, config, building)
+    validation_data = [
+        {"severity": v.severity, "code": v.code, "message": v.message,
+         "waypoint_indices": v.waypoint_indices, "facade_index": v.facade_index}
+        for v in validation
+    ]
+    has_errors = any(v.severity == "error" for v in validation)
+
     # Prepare viewer data
     threejs_data = prepare_threejs_data(building, waypoints)
     if raw_mesh:
@@ -487,6 +540,8 @@ def generate(request: GenerateRequest):
         "timestamp": version.timestamp,
         "summary": summary,
         "viewer_data": viewer_data,
+        "validation": validation_data,
+        "can_export": not has_errors,
         "config_snapshot": {
             "building": request.building.model_dump(),
             "mission": request.mission.model_dump(),

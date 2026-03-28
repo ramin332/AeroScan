@@ -11,13 +11,34 @@ import math
 from .models import Building, Waypoint
 
 
-def _facade_color(index: int) -> str:
-    colors = [
-        "#2563eb", "#dc2626", "#16a34a", "#ca8a04",
-        "#9333ea", "#0891b2", "#ea580c", "#6d28d9",
-        "#0d9488", "#65a30d",
-    ]
-    return colors[index % len(colors)]
+DIRECTION_COLORS = {
+    "north": "#2563eb",  # blue
+    "east": "#16a34a",   # green
+    "south": "#dc2626",  # red
+    "west": "#ca8a04",   # amber
+    "roof": "#0891b2",   # teal
+    "other": "#9333ea",  # purple
+}
+
+
+def _facade_direction(normal: list[float]) -> str:
+    """Classify a facade by cardinal direction from its normal vector."""
+    nz = abs(normal[2])
+    if nz > 0.3:
+        return "roof"
+    azimuth = math.degrees(math.atan2(normal[0], normal[1])) % 360
+    if azimuth < 45 or azimuth >= 315:
+        return "north"
+    elif azimuth < 135:
+        return "east"
+    elif azimuth < 225:
+        return "south"
+    else:
+        return "west"
+
+
+def _facade_color(normal: list[float]) -> str:
+    return DIRECTION_COLORS.get(_facade_direction(normal), DIRECTION_COLORS["other"])
 
 
 def _escape_html(text: str) -> str:
@@ -72,9 +93,11 @@ def prepare_leaflet_data(building: Building, waypoints: list[Waypoint]) -> dict:
 
     facade_meta = {}
     for f in building.facades:
+        normal_list = f.normal.tolist()
         facade_meta[str(f.index)] = {
             "label": f.label,
-            "color": _facade_color(f.index),
+            "color": _facade_color(normal_list),
+            "direction": _facade_direction(normal_list),
             "azimuth": round(f.azimuth_deg, 0),
             "component": f.component_tag,
         }
@@ -96,13 +119,15 @@ def prepare_threejs_data(building: Building, waypoints: list[Waypoint]) -> dict:
     """Prepare JSON-serializable data for the 3D Three.js viewer."""
     facade_data = []
     for f in building.facades:
+        normal_list = f.normal.tolist()
         facade_data.append({
             "vertices": f.vertices.tolist(),
-            "normal": f.normal.tolist(),
+            "normal": normal_list,
             "label": f.label,
             "index": f.index,
             "component": f.component_tag,
-            "color": _facade_color(f.index),
+            "color": _facade_color(normal_list),
+            "direction": _facade_direction(normal_list),
         })
 
     wp_data = []

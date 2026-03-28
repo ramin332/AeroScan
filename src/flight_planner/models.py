@@ -282,3 +282,8 @@ class MissionConfig:
     # Detail capture: take telephoto photos at flagged points
     enable_detail_capture: bool = False
     detail_camera: CameraName = CameraName.MEDIUM_TELE
+
+    # Tunable constraints (exposed as frontend levers)
+    gimbal_pitch_margin_deg: float = 5.0  # safety margin from hardware pitch limits
+    min_photo_distance_m: float = 1.5  # min distance between photo waypoints (dedup)
+    yaw_rate_deg_per_s: float = 60.0  # assumed drone yaw rate for time estimates
