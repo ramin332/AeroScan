@@ -51,6 +51,10 @@ export const DEFAULT_ALGORITHM: AlgorithmParams = {
   auto_scale_height_threshold_m: 50.0,
   auto_scale_target_height_m: 8.0,
   region_growing_angle_deg: 15.0,
+  // Surface sampling
+  surface_sample_count: 2000,
+  surface_dedup_radius_m: 0.5,
+  surface_dedup_max_angle_deg: 30.0,
   // Waypoint LOS occlusion
   enable_waypoint_los: true,
   los_tolerance_m: 0.5,
@@ -60,6 +64,7 @@ export const DEFAULT_ALGORITHM: AlgorithmParams = {
   enable_path_tsp: true,
   enable_sweep_reversal: true,
   dedup_max_gimbal_diff_deg: 20.0,
+  tsp_method: 'auto' as const,
   // KMZ export
   min_waypoint_height_m: 2.0,
 };
@@ -89,6 +94,7 @@ interface AppState {
   // Mesh settings
   minFacadeArea: number;
   extractionMethod: string;
+  waypointStrategy: string;
 
   // Result
   result: GenerateResponse | null;
@@ -99,6 +105,7 @@ interface AppState {
 
   // Actions
   setMinFacadeArea: (v: number) => void;
+  setWaypointStrategy: (v: string) => void;
   setBuildingSource: (source: BuildingSource) => void;
   setPreset: (name: string | null) => void;
   setBuilding: (patch: Partial<BuildingParams>) => void;
@@ -125,6 +132,7 @@ export const useStore = create<AppState>((set, get) => ({
   buildings: [],
   minFacadeArea: 1.0,
   extractionMethod: 'region_growing',
+  waypointStrategy: 'facade_grid',
 
   preset: 'simple_box',
   building: { ...DEFAULT_BUILDING },
@@ -138,6 +146,7 @@ export const useStore = create<AppState>((set, get) => ({
 
   setMinFacadeArea: (v) => set({ minFacadeArea: v }),
   setExtractionMethod: (v: string) => set({ extractionMethod: v }),
+  setWaypointStrategy: (v: string) => set({ waypointStrategy: v }),
 
   setBuildingSource: (source) => {
     set({ buildingSource: source });
@@ -175,7 +184,7 @@ export const useStore = create<AppState>((set, get) => ({
   setActiveTab: (tab) => set({ activeTab: tab }),
 
   generate: async () => {
-    const { preset, selectedBuildingId, buildingSource, building, mission, algorithm, minFacadeArea, extractionMethod } = get();
+    const { preset, selectedBuildingId, buildingSource, building, mission, algorithm, minFacadeArea, extractionMethod, waypointStrategy } = get();
     set({ loading: true });
     try {
       const result = await api.generate({
@@ -186,6 +195,7 @@ export const useStore = create<AppState>((set, get) => ({
         algorithm,
         min_facade_area: buildingSource === 'upload' ? minFacadeArea : undefined,
         extraction_method: buildingSource === 'upload' ? extractionMethod : undefined,
+        waypoint_strategy: buildingSource === 'upload' ? waypointStrategy : undefined,
       });
       set({ result, loading: false });
       get().refreshVersions();

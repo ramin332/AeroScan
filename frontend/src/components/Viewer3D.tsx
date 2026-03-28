@@ -40,14 +40,15 @@ function FacadeMesh({ vertices, color, hidden, highlighted }: { vertices: number
 
   return (
     <group>
-      <mesh geometry={geometry} renderOrder={highlighted ? 1 : 0}>
+      <mesh geometry={geometry} renderOrder={highlighted ? 10 : 0}>
         <meshStandardMaterial
           color={color} transparent
-          opacity={highlighted ? 0.7 : 0.35}
+          opacity={highlighted ? 0.85 : 0.35}
           side={THREE.DoubleSide} roughness={0.8}
-          depthWrite={false}
+          depthWrite={highlighted ? true : false}
+          depthTest={true}
           emissive={highlighted ? color : '#000000'}
-          emissiveIntensity={highlighted ? 0.15 : 0}
+          emissiveIntensity={highlighted ? 0.3 : 0}
         />
       </mesh>
       <Line points={edgePoints} color={color} lineWidth={highlighted ? 2.5 : 1.5} />
@@ -154,7 +155,7 @@ function FlightPath({ waypoints }: { waypoints: WaypointData[] }) {
   );
 }
 
-function RawMeshView({ mesh }: { mesh: RawMeshData }) {
+function RawMeshView({ mesh, dimmed }: { mesh: RawMeshData; dimmed?: boolean }) {
   const solidRef = useRef<THREE.Mesh>(null);
 
   const geometry = useMemo(() => {
@@ -183,22 +184,24 @@ function RawMeshView({ mesh }: { mesh: RawMeshData }) {
     <group>
       {/* Ghost mesh: semi-transparent for orbital view */}
       <group>
-        <mesh geometry={geometry}>
+        <mesh geometry={geometry} renderOrder={-1}>
           <meshStandardMaterial
             color="#8899bb"
             transparent
-            opacity={0.25}
+            opacity={dimmed ? 0.08 : 0.25}
             side={THREE.DoubleSide}
             roughness={0.7}
             metalness={0.1}
+            depthWrite={false}
           />
         </mesh>
-        <mesh geometry={geometry}>
+        <mesh geometry={geometry} renderOrder={-1}>
           <meshStandardMaterial
             color="#aabbdd"
             wireframe
             transparent
-            opacity={0.15}
+            opacity={dimmed ? 0.04 : 0.15}
+            depthWrite={false}
           />
         </mesh>
       </group>
@@ -351,7 +354,7 @@ function Scene({ data, onWaypointClick, visitedIndex, showRawMesh, captureView, 
 
       {/* Raw 3D mesh from uploaded file */}
       {showRawMesh && data.rawMesh && (
-        <RawMeshView mesh={data.rawMesh} />
+        <RawMeshView mesh={data.rawMesh} dimmed={captureView && activeFacades != null} />
       )}
     </group>
   );

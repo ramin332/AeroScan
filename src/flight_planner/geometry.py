@@ -539,46 +539,263 @@ def _nearest_neighbor_order(groups: list[list[Waypoint]]) -> list[list[Waypoint]
     return [groups[i] for i in order]
 
 
+def _generate_surface_sample_waypoints(
+    mesh: object,
+    building: Building,
+    config: MissionConfig,
+    algo: AlgorithmConfig,
+) -> tuple[list[list[Waypoint]], dict]:
+    """Generate waypoints by uniformly sampling the mesh surface.
+
+    Instead of per-facade boustrophedon grids, this places cameras at every
+    sample point offset along the face normal. Covers the entire building
+    surface like a blanket — dormers, curves, corners, overhangs — not just
+    the planes that facade extraction identifies.
+
+    Uses trimesh.sample (Poisson-disk) for uniform coverage,
+    scipy.spatial.KDTree for deduplication, and nearest-neighbor
+    traversal for an efficient flight path.
+
+    Returns (facade_groups, stats) ready for optimize_flight_path.
+    """
+    from scipy.spatial import KDTree
+
+    camera = get_camera(config.camera)
+    distance = compute_distance_for_gsd(camera, config.target_gsd_mm_per_px)
+    distance = max(distance, config.obstacle_clearance_m)
+
+    pitch_min = GIMBAL_TILT_MIN_DEG + config.gimbal_pitch_margin_deg
+    pitch_max = GIMBAL_TILT_MAX_DEG - config.gimbal_pitch_margin_deg
+
+    # 1. Sample the mesh surface
+    points, face_indices = mesh.sample(algo.surface_sample_count, return_index=True)
+    normals = mesh.face_normals[face_indices].copy()
+
+    # 2. Orient normals outward (away from mesh centroid)
+    centroid = mesh.centroid
+    to_point = points - centroid
+    flip_mask = np.einsum('ij,ij->i', normals, to_point) < 0
+    normals[flip_mask] *= -1
+
+    # 3. Filter surfaces that can't produce useful photos:
+    #    - downward-facing (floors/ceilings)
+    #    - at ground level (foundations)
+    #    - normals pointing downward after outward orientation (interior floors)
+    keep = (
+        (normals[:, 2] >= algo.downward_face_threshold)
+        & (points[:, 2] >= algo.ground_level_threshold_m)
+    )
+    points = points[keep]
+    normals = normals[keep]
+    n_filtered = int((~keep).sum())
+
+    # 4. Compute camera positions
+    cam_positions = points + normals * distance
+
+    # Filter out cameras that would be underground (below min_altitude)
+    # rather than clamping them (clamped cameras point in wrong directions)
+    altitude_ok = cam_positions[:, 2] >= algo.min_altitude_m
+    cam_positions = cam_positions[altitude_ok]
+    points = points[altitude_ok]
+    normals = normals[altitude_ok]
+    n_filtered += int((~altitude_ok).sum())
+
+    # Compute look vectors and orientations
+    look = points - cam_positions
+    horiz_mag = np.sqrt(look[:, 0] ** 2 + look[:, 1] ** 2)
+
+    headings = np.degrees(np.arctan2(look[:, 0], look[:, 1])) % 360
+    pitches = np.where(
+        horiz_mag > 1e-6,
+        np.degrees(np.arctan2(look[:, 2], horiz_mag)),
+        -90.0,
+    )
+    pitches = np.clip(pitches, pitch_min, pitch_max)
+
+    # 5. Spatial deduplication via KDTree
+    n_before_dedup = len(cam_positions)
+    if n_before_dedup > 1:
+        tree = KDTree(cam_positions)
+        pairs = tree.query_pairs(r=algo.surface_dedup_radius_m)
+        removed: set[int] = set()
+        for i, j in sorted(pairs):
+            if i in removed or j in removed:
+                continue
+            h_diff = abs(headings[i] - headings[j])
+            if h_diff > 180:
+                h_diff = 360 - h_diff
+            if h_diff < algo.surface_dedup_max_angle_deg:
+                if abs(pitches[i]) <= abs(pitches[j]):
+                    removed.add(j)
+                else:
+                    removed.add(i)
+        keep_idx = sorted(set(range(n_before_dedup)) - removed)
+        cam_positions = cam_positions[keep_idx]
+        points = points[keep_idx]
+        headings = headings[keep_idx]
+        pitches = pitches[keep_idx]
+
+    n_deduped = n_before_dedup - len(cam_positions)
+
+    # 6. LOS check against mesh
+    n_los_removed = 0
+    if algo.enable_waypoint_los and len(cam_positions) > 0:
+        visible_mask = np.ones(len(cam_positions), dtype=bool)
+        for i in range(len(cam_positions)):
+            ray_vec = points[i] - cam_positions[i]
+            ray_len = float(np.linalg.norm(ray_vec))
+            if ray_len < 1e-6:
+                visible_mask[i] = False
+                continue
+            ray_dir = ray_vec / ray_len
+            hits, _, _ = mesh.ray.intersects_location(
+                ray_origins=[cam_positions[i]],
+                ray_directions=[ray_dir],
+            )
+            if len(hits) > 0:
+                hit_dists = np.linalg.norm(hits - cam_positions[i], axis=1)
+                if float(hit_dists.min()) < ray_len - algo.los_tolerance_m:
+                    visible_mask[i] = False
+        n_los_removed = int((~visible_mask).sum())
+        cam_positions = cam_positions[visible_mask]
+        points = points[visible_mask]
+        headings = headings[visible_mask]
+        pitches = pitches[visible_mask]
+
+    # 7. Assign facade_index by nearest facade center (for viewer coloring)
+    facade_centers = np.array([f.center for f in building.facades])
+    facade_tags = {f.index: f.component_tag for f in building.facades}
+
+    facade_indices = np.zeros(len(points), dtype=int)
+    if len(facade_centers) > 0 and len(points) > 0:
+        facade_tree = KDTree(facade_centers)
+        _, nearest = facade_tree.query(points)
+        for i, ni in enumerate(nearest):
+            facade_indices[i] = building.facades[ni].index
+
+    # 8. Nearest-neighbor ordering for efficient flight path
+    #    Instead of facade-based groups (which scatter spatially),
+    #    order all waypoints as a single spatial chain.
+    n_wps = len(cam_positions)
+    if n_wps > 1:
+        order = [0]
+        used = np.zeros(n_wps, dtype=bool)
+        used[0] = True
+        nn_tree = KDTree(cam_positions)
+        for _ in range(n_wps - 1):
+            # Query enough neighbors to likely find an unused one
+            k = min(32, n_wps)
+            _, ii = nn_tree.query(cam_positions[order[-1]], k=k)
+            found = False
+            for idx in ii:
+                if not used[idx]:
+                    order.append(idx)
+                    used[idx] = True
+                    found = True
+                    break
+            if not found:
+                # Fallback: brute-force nearest unused
+                unused = np.where(~used)[0]
+                dists = np.linalg.norm(
+                    cam_positions[unused] - cam_positions[order[-1]], axis=1
+                )
+                best = unused[np.argmin(dists)]
+                order.append(best)
+                used[best] = True
+        cam_positions = cam_positions[order]
+        points = points[order]
+        headings = headings[order]
+        pitches = pitches[order]
+        facade_indices = facade_indices[order]
+
+    # 9. Build Waypoint objects — single ordered list, split into
+    #    contiguous runs of the same facade_index for coloring.
+    all_wps: list[Waypoint] = []
+    for i in range(len(cam_positions)):
+        fi = int(facade_indices[i])
+        all_wps.append(Waypoint(
+            x=float(cam_positions[i][0]),
+            y=float(cam_positions[i][1]),
+            z=float(cam_positions[i][2]),
+            heading_deg=float(headings[i]),
+            gimbal_pitch_deg=float(pitches[i]),
+            speed_ms=config.flight_speed_ms,
+            actions=[CameraAction(action_type=ActionType.TAKE_PHOTO, camera=config.camera)],
+            facade_index=fi,
+            component_tag=facade_tags.get(fi, "21.1"),
+        ))
+
+    # Split into contiguous facade runs for the optimizer
+    facade_groups: list[list[Waypoint]] = []
+    if all_wps:
+        current_group = [all_wps[0]]
+        for wp in all_wps[1:]:
+            if wp.facade_index == current_group[-1].facade_index:
+                current_group.append(wp)
+            else:
+                facade_groups.append(current_group)
+                current_group = [wp]
+        facade_groups.append(current_group)
+
+    stats = {
+        "strategy": "surface_sampling",
+        "samples_requested": algo.surface_sample_count,
+        "samples_after_filter": n_before_dedup,
+        "filtered_total": n_filtered,
+        "deduped": n_deduped,
+        "los_removed": n_los_removed,
+        "waypoints_generated": len(all_wps),
+    }
+    return facade_groups, stats
+
+
 def generate_mission_waypoints(
     building: Building,
     config: MissionConfig,
     algo: AlgorithmConfig | None = None,
     mesh: object | None = None,
+    waypoint_strategy: str = "facade_grid",
 ) -> tuple[list[Waypoint], dict]:
     """Generate all waypoints for a building inspection mission.
 
-    Generates inspection waypoint grids per facade, reorders by nearest-neighbor
-    to minimize transit distance, and lets the DJI flight controller handle
-    obstacle avoidance between waypoints (APAS).
+    Supports two strategies:
+    - "facade_grid": per-facade boustrophedon grid (default, works for all buildings)
+    - "surface_sampling": uniform mesh surface sampling (mesh buildings only)
 
     Returns (waypoints, stats) where stats contains generation metrics.
     """
     if algo is None:
         algo = AlgorithmConfig()
 
-    facade_groups: list[list[Waypoint]] = []
+    surface_stats = None
     total_before_dedup = 0
     per_facade_stats: list[dict] = []
 
-    for facade in building.facades:
-        facade_wps = generate_waypoints_for_facade(facade, config, algo, mesh=mesh)
-        before = len(facade_wps)
-        total_before_dedup += before
-        if facade_wps:
-            facade_groups.append(facade_wps)
-            per_facade_stats.append({
-                "facade_index": facade.index,
-                "label": facade.label,
-                "waypoints": len(facade_wps),
-                "before_dedup": before,
-            })
+    # --- Surface sampling strategy ---
+    if waypoint_strategy == "surface_sampling" and mesh is not None:
+        facade_groups, surface_stats = _generate_surface_sample_waypoints(
+            mesh, building, config, algo,
+        )
+    else:
+        # --- Facade grid strategy (default) ---
+        facade_groups = []
+
+        for facade in building.facades:
+            facade_wps = generate_waypoints_for_facade(facade, config, algo, mesh=mesh)
+            before = len(facade_wps)
+            total_before_dedup += before
+            if facade_wps:
+                facade_groups.append(facade_wps)
+                per_facade_stats.append({
+                    "facade_index": facade.index,
+                    "label": facade.label,
+                    "waypoints": len(facade_wps),
+                    "before_dedup": before,
+                })
 
     facades_with_wps = len(facade_groups)
 
     # Optimize flight path: dedup + TSP ordering + sweep direction reversal
-    # Replaces the old greedy nearest-neighbor with proper 2-opt TSP.
-    # Respects PSDK constraints: preserves per-waypoint gimbal angles,
-    # only merges waypoints with similar gimbal targets (< 20 deg diff).
     facade_groups, opt_result = optimize_flight_path(
         facade_groups,
         merge_radius_m=config.min_photo_distance_m,
@@ -586,15 +803,15 @@ def generate_mission_waypoints(
         enable_tsp=algo.enable_path_tsp,
         enable_sweep_reversal=algo.enable_sweep_reversal,
         max_gimbal_angle_diff_deg=algo.dedup_max_gimbal_diff_deg,
+        tsp_method=algo.tsp_method,
     )
 
-    # Concatenate all inspection waypoints — no artificial transition waypoints.
-    # The drone flies straight between facades; its obstacle avoidance handles clearance.
+    # Concatenate all inspection waypoints
     all_waypoints: list[Waypoint] = []
     for group in facade_groups:
         all_waypoints.extend(group)
 
-    total_after_dedup = len(all_waypoints)
+    total_after = len(all_waypoints)
 
     # Assign global indices
     for i, wp in enumerate(all_waypoints):
@@ -603,13 +820,11 @@ def generate_mission_waypoints(
     # Convert local ENU to WGS84
     convert_enu_to_wgs84(all_waypoints, building.lat, building.lon, building.ground_altitude)
 
-    stats = {
+    stats: dict = {
+        "strategy": waypoint_strategy,
         "facades_total": len(building.facades),
         "facades_with_waypoints": facades_with_wps,
-        "waypoints_before_dedup": total_before_dedup,
-        "waypoints_after_dedup": total_after_dedup,
-        "waypoints_deduped": total_before_dedup - total_after_dedup,
-        "per_facade": per_facade_stats,
+        "waypoints_after_dedup": total_after,
         "optimization": {
             "waypoints_merged": opt_result.waypoints_merged,
             "facade_order": opt_result.facade_order_after,
@@ -622,6 +837,11 @@ def generate_mission_waypoints(
             "two_opt_improvements": opt_result.two_opt_improvements,
         },
     }
+    if surface_stats:
+        stats["surface_sampling"] = surface_stats
+    else:
+        stats["waypoints_before_dedup"] = total_before_dedup
+        stats["per_facade"] = per_facade_stats
 
     return all_waypoints, stats
 

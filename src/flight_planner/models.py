@@ -302,6 +302,11 @@ class AlgorithmConfig:
     auto_scale_target_height_m: float = 8.0  # rescale target when auto-scaling
     region_growing_angle_deg: float = 15.0  # coplanarity threshold for region growing
 
+    # -- Surface sampling (geometry.py) --
+    surface_sample_count: int = 2000  # target Poisson-disk sample points on mesh
+    surface_dedup_radius_m: float = 0.5  # merge cameras closer than this
+    surface_dedup_max_angle_deg: float = 30.0  # max heading diff for merge
+
     # -- Waypoint LOS occlusion (geometry.py) --
     enable_waypoint_los: bool = True  # ray-cast LOS check per waypoint against mesh
     los_tolerance_m: float = 0.5  # hit closer than (target_dist - tolerance) = occluded
@@ -309,9 +314,10 @@ class AlgorithmConfig:
 
     # -- Path optimization (optimize.py) --
     enable_path_dedup: bool = True  # merge near-coincident cross-facade waypoints
-    enable_path_tsp: bool = True  # 2-opt TSP facade ordering (vs greedy nearest-neighbor)
+    enable_path_tsp: bool = True  # TSP facade ordering
     enable_sweep_reversal: bool = True  # flip sweep direction per facade for shorter transitions
     dedup_max_gimbal_diff_deg: float = 20.0  # max gimbal angle diff for merge eligibility
+    tsp_method: str = "auto"  # "auto" | "nearest_neighbor" | "greedy" | "simulated_annealing" | "threshold_accepting"
 
     # -- KMZ export (kmz_builder.py) --
     min_waypoint_height_m: float = 2.0  # clamp waypoint Z in KMZ output

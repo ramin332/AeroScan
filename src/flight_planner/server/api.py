@@ -102,10 +102,20 @@ class AlgorithmParams(BaseModel):
     auto_scale_height_threshold_m: float = Field(50.0, ge=10.0, le=500.0)
     auto_scale_target_height_m: float = Field(8.0, ge=1.0, le=100.0)
     region_growing_angle_deg: float = Field(15.0, ge=1.0, le=45.0)
+    # Surface sampling
+    surface_sample_count: int = Field(2000, ge=100, le=50000)
+    surface_dedup_radius_m: float = Field(0.5, ge=0.1, le=5.0)
+    surface_dedup_max_angle_deg: float = Field(30.0, ge=5.0, le=90.0)
     # Waypoint LOS occlusion
     enable_waypoint_los: bool = True
     los_tolerance_m: float = Field(0.5, ge=0.1, le=2.0)
     los_min_visible_ratio: float = Field(0.4, ge=0.1, le=1.0)
+    # Path optimization
+    enable_path_dedup: bool = True
+    enable_path_tsp: bool = True
+    enable_sweep_reversal: bool = True
+    dedup_max_gimbal_diff_deg: float = Field(20.0, ge=5.0, le=90.0)
+    tsp_method: Literal["auto", "nearest_neighbor", "greedy", "simulated_annealing", "threshold_accepting"] = "auto"
     # KMZ export
     min_waypoint_height_m: float = Field(2.0, ge=0.5, le=10.0)
 
@@ -123,6 +133,7 @@ class GenerateRequest(BaseModel):
     algorithm: AlgorithmParams = AlgorithmParams()
     min_facade_area: float = Field(1.0, ge=0.1, le=50.0)
     extraction_method: str = "region_growing"
+    waypoint_strategy: str = "facade_grid"  # "facade_grid" or "surface_sampling"
 
 
 class BuildingUploadRequest(BaseModel):
@@ -493,8 +504,11 @@ def generate(request: GenerateRequest):
 
     t_building = time.perf_counter()
 
-    # Generate waypoints (pass mesh for LOS occlusion checks on mesh buildings)
-    waypoints, generation_stats = generate_mission_waypoints(building, config, algo, mesh=mesh_obj)
+    # Generate waypoints (pass mesh for LOS checks / surface sampling on mesh buildings)
+    waypoints, generation_stats = generate_mission_waypoints(
+        building, config, algo, mesh=mesh_obj,
+        waypoint_strategy=request.waypoint_strategy,
+    )
 
     t_waypoints = time.perf_counter()
 

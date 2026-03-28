@@ -1,6 +1,7 @@
 import { useEffect, useRef } from 'react';
 import { useStore, PRESETS, DEFAULT_ALGORITHM, DEFAULT_MISSION } from '../store';
 import { kmzDownloadUrl } from '../api/client';
+import type { AlgorithmParams } from '../api/types';
 import { DroneInfo } from './DroneInfo';
 import { VersionList } from './VersionList';
 
@@ -19,9 +20,9 @@ const CAMERA_LABELS: Record<string, string> = {
 
 export function Sidebar() {
   const {
-    buildingSource, selectedBuildingId, buildings, uploading, minFacadeArea, extractionMethod,
+    buildingSource, selectedBuildingId, buildings, uploading, minFacadeArea, extractionMethod, waypointStrategy,
     preset, building, mission, algorithm, result,
-    setBuildingSource, setPreset, setBuilding, setMission, setAlgorithm, resetAlgorithm, setMinFacadeArea, setExtractionMethod,
+    setBuildingSource, setPreset, setBuilding, setMission, setAlgorithm, resetAlgorithm, setMinFacadeArea, setExtractionMethod, setWaypointStrategy,
     uploadBuilding, selectBuilding, deleteBuilding,
   } = useStore();
 
@@ -192,6 +193,14 @@ export function Sidebar() {
       {isUploadMode && (
         <Section title="Facade Detection" defaultOpen>
           <div className="field">
+            <label>Waypoint Strategy</label>
+            <select value={waypointStrategy}
+              onChange={(e) => { setWaypointStrategy(e.target.value); autoGen(); }}>
+              <option value="facade_grid">Facade Grid</option>
+              <option value="surface_sampling">Surface Sampling</option>
+            </select>
+          </div>
+          <div className="field">
             <label>Method</label>
             <select value={extractionMethod}
               onChange={(e) => { setExtractionMethod(e.target.value); autoGen(); }}>
@@ -204,6 +213,31 @@ export function Sidebar() {
             min={0.5} max={10} step={0.5}
             format={(v) => `${v} m\u00B2`}
             onChange={(v) => setMinFacadeArea(v)} onCommit={autoGen} />
+          {waypointStrategy === 'surface_sampling' && (
+            <>
+              <SliderField label="Sample density" value={algorithm.surface_sample_count}
+                min={500} max={10000} step={500}
+                format={(v) => `${v}`}
+                tooltip="Target number of Poisson-disk sample points on the mesh surface. Higher = denser coverage."
+                defaultValue={DEFAULT_ALGORITHM.surface_sample_count}
+                onReset={() => setAlgorithm({ surface_sample_count: DEFAULT_ALGORITHM.surface_sample_count })}
+                onChange={(v) => setAlgorithm({ surface_sample_count: v })} onCommit={autoGen} />
+              <SliderField label="Dedup radius" value={algorithm.surface_dedup_radius_m}
+                min={0.1} max={3} step={0.1}
+                format={(v) => `${v}m`}
+                tooltip="Merge cameras closer than this distance with similar headings."
+                defaultValue={DEFAULT_ALGORITHM.surface_dedup_radius_m}
+                onReset={() => setAlgorithm({ surface_dedup_radius_m: DEFAULT_ALGORITHM.surface_dedup_radius_m })}
+                onChange={(v) => setAlgorithm({ surface_dedup_radius_m: v })} onCommit={autoGen} />
+              <SliderField label="Dedup angle" value={algorithm.surface_dedup_max_angle_deg}
+                min={5} max={90} step={5}
+                format={(v) => `${v}\u00B0`}
+                tooltip="Max heading difference for two nearby cameras to be merged."
+                defaultValue={DEFAULT_ALGORITHM.surface_dedup_max_angle_deg}
+                onReset={() => setAlgorithm({ surface_dedup_max_angle_deg: DEFAULT_ALGORITHM.surface_dedup_max_angle_deg })}
+                onChange={(v) => setAlgorithm({ surface_dedup_max_angle_deg: v })} onCommit={autoGen} />
+            </>
+          )}
         </Section>
       )}
 
@@ -253,10 +287,23 @@ export function Sidebar() {
 
       {/* ======== PATH OPTIMIZATION ======== */}
       <Section title="Path Optimization" defaultOpen>
-        <ToggleField label="2-opt TSP ordering"
+        <ToggleField label="TSP ordering"
           value={algorithm.enable_path_tsp}
-          tooltip="Use 2-opt local search to find optimal facade visit order. Better than greedy nearest-neighbor — typically saves 20-30% transit distance."
+          tooltip="Optimize facade visit order to minimize transit distance between facades."
           onChange={(v) => { setAlgorithm({ enable_path_tsp: v }); autoGen(); }} />
+        {algorithm.enable_path_tsp && (
+          <div className="field">
+            <label>TSP method</label>
+            <select value={algorithm.tsp_method}
+              onChange={(e) => { setAlgorithm({ tsp_method: e.target.value as AlgorithmParams['tsp_method'] }); autoGen(); }}>
+              <option value="auto">Auto (best of all)</option>
+              <option value="nearest_neighbor">Nearest Neighbor</option>
+              <option value="greedy">Greedy</option>
+              <option value="simulated_annealing">Simulated Annealing</option>
+              <option value="threshold_accepting">Threshold Accepting</option>
+            </select>
+          </div>
+        )}
         <ToggleField label="Sweep reversal"
           value={algorithm.enable_sweep_reversal}
           tooltip="For each facade, choose forward or reversed boustrophedon direction to minimize entry distance from previous facade's exit."

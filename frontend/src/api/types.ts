@@ -57,6 +57,10 @@ export interface AlgorithmParams {
   auto_scale_height_threshold_m: number;
   auto_scale_target_height_m: number;
   region_growing_angle_deg: number;
+  // Surface sampling
+  surface_sample_count: number;
+  surface_dedup_radius_m: number;
+  surface_dedup_max_angle_deg: number;
   // Waypoint LOS occlusion
   enable_waypoint_los: boolean;
   los_tolerance_m: number;
@@ -66,6 +70,7 @@ export interface AlgorithmParams {
   enable_path_tsp: boolean;
   enable_sweep_reversal: boolean;
   dedup_max_gimbal_diff_deg: number;
+  tsp_method: 'auto' | 'nearest_neighbor' | 'greedy' | 'simulated_annealing' | 'threshold_accepting';
   // KMZ export
   min_waypoint_height_m: number;
 }
@@ -78,6 +83,7 @@ export interface GenerateRequest {
   algorithm: AlgorithmParams;
   min_facade_area?: number;
   extraction_method?: string;
+  waypoint_strategy?: string;
 }
 
 export interface UploadedBuilding {
