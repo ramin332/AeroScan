@@ -130,15 +130,32 @@ body {
 
 .upload-hint-msg { font-size: 11px; color: var(--fg3); text-align: center; margin-top: 6px; }
 
+/* Building details (uploaded) */
+.building-details { margin-top: 8px; }
+.building-dims {
+  font-size: 14px; font-weight: 600; color: var(--accent2);
+  padding: 4px 0; letter-spacing: 0.3px;
+}
+.building-source { font-size: 10px; color: var(--fg3); margin-bottom: 6px; text-transform: uppercase; letter-spacing: 0.5px; }
+
 /* Main area */
 .main { flex: 1; display: flex; flex-direction: column; }
-.tabs { display: flex; background: var(--bg2); border-bottom: 1px solid var(--border); }
+.topbar {
+  display: flex; align-items: center; justify-content: space-between;
+  background: var(--bg2); border-bottom: 1px solid var(--border);
+  padding-right: 16px;
+}
+.tabs { display: flex; }
 .tab {
   padding: 10px 20px; font-size: 13px; color: var(--fg3); cursor: pointer;
   border: none; border-bottom: 2px solid transparent; background: none;
 }
 .tab:hover { color: var(--fg); }
 .tab.active { color: var(--accent2); border-bottom-color: var(--accent); }
+.topbar-stats { display: flex; align-items: center; gap: 6px; }
+.topbar-stat { font-size: 11px; color: var(--fg3); white-space: nowrap; }
+.topbar-stat b { color: var(--fg2); font-weight: 600; }
+.topbar-divider { width: 1px; height: 12px; background: var(--border); }
 
 .view-container { flex: 1; position: relative; }
 .view { position: absolute; top: 0; left: 0; right: 0; bottom: 0; display: none; }

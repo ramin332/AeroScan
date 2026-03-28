@@ -36,6 +36,8 @@ export interface UploadedBuilding {
   lat: number;
   lon: number;
   height: number;
+  width: number;
+  depth: number;
   num_stories: number;
   roof_type: string;
   roof_pitch_deg: number;

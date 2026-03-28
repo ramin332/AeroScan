@@ -131,7 +131,10 @@ def create_building(req: BuildingUploadRequest):
         roof_type=req.roof_type,
         roof_pitch_deg=req.roof_pitch_deg,
         heading_deg=0.0,
-        properties_json=json.dumps({}),
+        properties_json=json.dumps({
+            "width": building.width,
+            "depth": building.depth,
+        }),
     )
 
     db = get_db()
@@ -222,6 +225,8 @@ async def upload_building_file(
         roof_pitch_deg=roof_pitch_deg,
         heading_deg=0.0,
         properties_json=json.dumps({
+            "width": building.width,
+            "depth": building.depth,
             "mesh_format": ext,
             "auto_height": building.height,
             "mesh_viewer": getattr(building, "_mesh_viewer_data", None),

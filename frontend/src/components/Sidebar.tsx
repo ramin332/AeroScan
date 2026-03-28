@@ -2,7 +2,6 @@ import { useRef } from 'react';
 import { useStore, PRESETS } from '../store';
 import { kmzDownloadUrl } from '../api/client';
 import { DroneInfo } from './DroneInfo';
-import { Stats } from './Stats';
 import { VersionList } from './VersionList';
 
 const PRESET_LABELS: Record<string, string> = {
@@ -134,26 +133,19 @@ export function Sidebar() {
             </div>
           )}
 
-          {/* Editable overrides for uploaded building */}
+          {/* Building info + editable location */}
           {selectedBuilding && (
-            <div style={{ marginTop: 8 }}>
-              <Field label="Height (m)" value={building.height} min={1} max={100} step={0.5}
-                onChange={(v) => setBuilding({ height: v })} />
-              <Field label="Stories" value={building.num_stories} min={1} max={20} step={1}
-                onChange={(v) => setBuilding({ num_stories: v })} />
-              <div className="field">
-                <label>Roof</label>
-                <select value={building.roof_type}
-                  onChange={(e) => setBuilding({ roof_type: e.target.value as 'flat' | 'pitched' })}>
-                  <option value="flat">Flat</option>
-                  <option value="pitched">Pitched</option>
-                </select>
+            <div className="building-details">
+              <div className="building-dims">
+                {selectedBuilding.width > 0
+                  ? `${selectedBuilding.width} \u00D7 ${selectedBuilding.depth} \u00D7 ${selectedBuilding.height} m`
+                  : `${selectedBuilding.height} m tall`}
               </div>
-              {building.roof_type === 'pitched' && (
-                <SliderField label="Pitch" value={building.roof_pitch_deg} min={5} max={60} step={5}
-                  format={(v) => `${v}\u00B0`}
-                  onChange={(v) => setBuilding({ roof_pitch_deg: v })} />
-              )}
+              <div className="building-source">{selectedBuilding.source_type}</div>
+              <Field label="Lat" value={building.lat} step={0.0001}
+                onChange={(v) => setBuilding({ lat: v })} />
+              <Field label="Lon" value={building.lon} step={0.0001}
+                onChange={(v) => setBuilding({ lon: v })} />
             </div>
           )}
         </div>
@@ -258,7 +250,6 @@ export function Sidebar() {
             Download KMZ
           </a>
         )}
-        {result && <Stats summary={result.summary} />}
       </div>
 
       <div className="section">

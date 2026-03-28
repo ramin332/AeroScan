@@ -59,6 +59,8 @@ class BuildingRecord(Base):
             "lat": self.lat,
             "lon": self.lon,
             "height": self.height,
+            "width": props.get("width", 0),
+            "depth": props.get("depth", 0),
             "num_stories": self.num_stories,
             "roof_type": self.roof_type,
             "roof_pitch_deg": self.roof_pitch_deg,
