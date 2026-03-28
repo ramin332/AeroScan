@@ -270,13 +270,35 @@ export function Viewer3D({ data, cameraFov }: { data: ThreeJSData | null; camera
     setProgress(0);
   }, [data]);
 
+  // Compute physics-based timeline: segment times from distances + speeds + dwell
+  const timeline = useMemo(() => {
+    if (!data || data.waypoints.length < 2) return { totalTime: 1, cumTimes: [0, 1] };
+    const wps = data.waypoints;
+    const DWELL_S = 1.0;       // hover time at each inspection WP for photo
+    const INSPECT_SPEED = 3.0; // m/s
+    const TRANSIT_SPEED = 9.0; // m/s
+
+    const segTimes: number[] = [0]; // cumulative time at each WP
+    let t = 0;
+    for (let i = 1; i < wps.length; i++) {
+      const dx = wps[i].x - wps[i - 1].x;
+      const dy = wps[i].y - wps[i - 1].y;
+      const dz = wps[i].z - wps[i - 1].z;
+      const dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
+      const spd = wps[i].is_transition ? TRANSIT_SPEED : INSPECT_SPEED;
+      t += dist / spd;
+      // Dwell at inspection waypoints
+      if (!wps[i].is_transition) t += DWELL_S;
+      segTimes.push(t);
+    }
+    return { totalTime: t, cumTimes: segTimes };
+  }, [data]);
+
   // Animation loop
   useEffect(() => {
     if (!playing || !data) return;
 
-    // Scale with waypoint count so speed stays consistent (~0.15s per WP at 1x)
-    const baseSec = Math.max(10, data.waypoints.length * 0.15);
-    const duration = (baseSec / speed) * 1000;
+    const duration = (timeline.totalTime / speed) * 1000;
 
     lastTimeRef.current = performance.now();
 
@@ -348,7 +370,7 @@ export function Viewer3D({ data, cameraFov }: { data: ThreeJSData | null; camera
         />
         <Scene data={data} onWaypointClick={setSelectedWp} visitedIndex={playing || progress > 0 ? getVisitedIndex(progress, data.waypoints.length) : -1} showRawMesh={showRawMesh} />
         {(playing || progress > 0) && (
-          <DroneMarker waypoints={data.waypoints} progress={progress} cameraFov={cameraFov} />
+          <DroneMarker waypoints={data.waypoints} progress={progress} cameraFov={cameraFov} timeline={timeline} />
         )}
       </Canvas>
 

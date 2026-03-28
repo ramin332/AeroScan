@@ -486,40 +486,24 @@ def generate_mission_waypoints(
 ) -> list[Waypoint]:
     """Generate all waypoints for a building inspection mission.
 
-    Iterates over all facades, generates waypoint grids, and inserts
-    transition waypoints between facades to avoid flying through the building.
+    Generates inspection waypoint grids per facade, reorders by nearest-neighbor
+    to minimize transit distance, and lets the DJI flight controller handle
+    obstacle avoidance between waypoints (APAS).
     """
-    # Generate inspection waypoints per facade
     facade_groups: list[list[Waypoint]] = []
     for facade in building.facades:
         facade_wps = generate_waypoints_for_facade(facade, config)
         if facade_wps:
             facade_groups.append(facade_wps)
 
-    # Reorder facades by nearest-neighbor to minimize transit distance.
-    # Use facade centroid (average of first/last waypoint) as the location.
+    # Reorder facades by nearest-neighbor to minimize transit distance
     if len(facade_groups) > 2:
         facade_groups = _nearest_neighbor_order(facade_groups)
 
-    # Assemble with transition waypoints between facades
+    # Concatenate all inspection waypoints — no artificial transition waypoints.
+    # The drone flies straight between facades; its obstacle avoidance handles clearance.
     all_waypoints: list[Waypoint] = []
-    transit_speed = min(config.flight_speed_ms * 3, MAX_SPEED_MS)
-
-    for i, group in enumerate(facade_groups):
-        if i > 0 and all_waypoints:
-            # Insert transition waypoints between facades
-            prev_wp = all_waypoints[-1]
-            next_wp = group[0]
-            prev_facade = building.facades[prev_wp.facade_index]
-            next_facade = building.facades[next_wp.facade_index]
-
-            transitions = _generate_transition_waypoints(
-                prev_wp, next_wp, prev_facade, next_facade,
-                clearance=config.obstacle_clearance_m,
-                speed=transit_speed,
-            )
-            all_waypoints.extend(transitions)
-
+    for group in facade_groups:
         all_waypoints.extend(group)
 
     # Assign global indices

@@ -30,13 +30,19 @@ interface CameraFOV {
   distance_m: number;
 }
 
+interface Timeline {
+  totalTime: number;
+  cumTimes: number[];
+}
+
 interface Props {
   waypoints: WaypointData[];
   progress: number;
   cameraFov?: CameraFOV;
+  timeline?: Timeline;
 }
 
-export function DroneMarker({ waypoints, progress, cameraFov }: Props) {
+export function DroneMarker({ waypoints, progress, cameraFov, timeline }: Props) {
   const groupRef = useRef<THREE.Group>(null);
   const gimbalRef = useRef<THREE.Group>(null);
   const footprintRef = useRef<THREE.Mesh>(null);
@@ -89,16 +95,37 @@ export function DroneMarker({ waypoints, progress, cameraFov }: Props) {
   useFrame(() => {
     if (!groupRef.current || positions.length < 2) return;
 
-    const n = positions.length - 1;
-    const rawIdx = progress * n;
-    const idx = Math.min(Math.floor(rawIdx), n - 1);
-    const t = rawIdx - idx;
+    // Map progress (0-1) to the physics-based timeline
+    let idx: number, t: number;
+    if (timeline && timeline.cumTimes.length === positions.length) {
+      const currentTime = progress * timeline.totalTime;
+      // Find segment: binary search in cumTimes
+      idx = 0;
+      for (let i = 1; i < timeline.cumTimes.length; i++) {
+        if (timeline.cumTimes[i] >= currentTime) break;
+        idx = i;
+      }
+      idx = Math.min(idx, positions.length - 2);
+      const segStart = timeline.cumTimes[idx];
+      const segEnd = timeline.cumTimes[idx + 1];
+      const segDuration = segEnd - segStart;
+      t = segDuration > 0 ? Math.min((currentTime - segStart) / segDuration, 1) : 0;
+    } else {
+      // Fallback: uniform interpolation
+      const n = positions.length - 1;
+      const rawIdx = progress * n;
+      idx = Math.min(Math.floor(rawIdx), n - 1);
+      t = rawIdx - idx;
+    }
 
-    // Position
-    const pos = new THREE.Vector3().lerpVectors(positions[idx], positions[idx + 1], t);
-    groupRef.current.position.copy(pos);
-
+    // Smooth ease for transit, linear for inspection (stop-and-shoot)
     const wp = waypoints[Math.min(idx + 1, waypoints.length - 1)];
+    const eased = wp.is_transition
+      ? t * t * (3 - 2 * t)  // smoothstep ease-in-out for transit
+      : t;                    // linear for inspection (physically: constant speed)
+
+    const pos = new THREE.Vector3().lerpVectors(positions[idx], positions[idx + 1], eased);
+    groupRef.current.position.copy(pos);
 
     // Heading rotation around Y (up in Three.js)
     // DJI heading: 0°=North, CW positive. In Three.js, North = -Z.
