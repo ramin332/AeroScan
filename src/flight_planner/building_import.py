@@ -20,6 +20,9 @@ from .models import AlgorithmConfig, Building, Facade, meters_per_deg, RoofType
 # Module-level extraction stats populated by extract_facades / build_building_from_mesh.
 # Read by the API after calling these functions. Reset on each call.
 last_extraction_stats: dict = {}
+# Rejected facade candidates from the last extraction — regions that were filtered out
+# but could be manually enabled by the user.
+last_rejected_candidates: list[Facade] = []
 
 
 def _convex_hull_2d(points: list[tuple[float, float]]) -> list[tuple[float, float]]:
@@ -267,8 +270,39 @@ def _extract_region_growing(
 
     building_center = mesh.centroid.copy()
     max_extent = float(max(mesh.bounding_box.extents))
+
+    # --- Exterior vertex detection via Open3D Hidden Point Removal ---
+    # Simulates viewing the mesh from multiple positions around the building.
+    # Vertices never visible from any external viewpoint are interior.
+    _exterior_verts = None
+    try:
+        import open3d as o3d
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(mesh.vertices)
+        diameter = np.linalg.norm(
+            np.asarray(pcd.get_max_bound()) - np.asarray(pcd.get_min_bound())
+        )
+        radius = diameter * 100
+        visible = set()
+        # Camera positions on a sphere around the building
+        center_pt = mesh.centroid
+        for theta in np.linspace(0, 2 * np.pi, 12, endpoint=False):
+            for phi in [0.4, 0.8, 1.2, 1.5]:
+                cam = center_pt + np.array([
+                    diameter * np.cos(theta) * np.sin(phi),
+                    diameter * np.sin(theta) * np.sin(phi),
+                    diameter * np.cos(phi),
+                ])
+                _, pt_map = pcd.hidden_point_removal(cam.tolist(), radius)
+                visible.update(pt_map)
+        _exterior_verts = np.zeros(len(mesh.vertices), dtype=bool)
+        _exterior_verts[list(visible)] = True
+    except ImportError:
+        pass  # Open3D not available — skip HPR, fall back to occlusion check
     facades: list[Facade] = []
+    rejected: list[Facade] = []
     idx = 0
+    reject_idx = 0
 
     # Stats tracking
     _stats = {
@@ -288,17 +322,14 @@ def _extract_region_growing(
         face_mask = labels == comp_id
         comp_area = float(mesh.area_faces[face_mask].sum())
 
-        if comp_area < min_area_m2:
-            _stats["filtered_by_area"] += 1
-            continue
-
         # Area-weighted average normal
         comp_normals = mesh.face_normals[face_mask]
         comp_areas = mesh.area_faces[face_mask]
         avg_normal = (comp_normals * comp_areas[:, np.newaxis]).sum(axis=0)
         norm_len = np.linalg.norm(avg_normal)
         if norm_len < 1e-9:
-            _stats["filtered_by_normal"] += 1
+            if comp_area >= min_area_m2:
+                _stats["filtered_by_normal"] += 1
             continue
         avg_normal /= norm_len
 
@@ -314,27 +345,25 @@ def _extract_region_growing(
 
         nz = abs(avg_normal[2])
 
-        # Skip downward-facing (floors/ceilings) and ground-level surfaces
-        if avg_normal[2] < algo.downward_face_threshold:
+        # Determine rejection reason (if any)
+        reject_reason = None
+        if comp_area < min_area_m2:
+            reject_reason = "area"
+            _stats["filtered_by_area"] += 1
+        elif avg_normal[2] < algo.downward_face_threshold:
+            reject_reason = "normal"
             _stats["filtered_by_normal"] += 1
-            continue
-        if center[2] < algo.ground_level_threshold_m:
+        elif center[2] < algo.ground_level_threshold_m:
+            reject_reason = "ground"
             _stats["filtered_by_ground"] += 1
-            continue
-
-        # Occlusion check (trimesh ray casting): cast ray from facade center
-        # along outward normal. If it hits the mesh, a drone can't photograph
-        # this surface from that direction (wall in the way).
-        ray_origin = center + avg_normal * algo.occlusion_ray_offset_m
-        hits = mesh.ray.intersects_location(
-            ray_origins=[ray_origin],
-            ray_directions=[avg_normal],
-        )
-        if len(hits[0]) > 0:
-            hit_dist = float(np.linalg.norm(hits[0][0] - ray_origin))
-            if hit_dist < max_extent * algo.occlusion_hit_fraction:
-                _stats["filtered_by_occlusion"] += 1
-                continue
+        else:
+            # HPR-based interior check: if most vertices of this facade region
+            # were never visible from any external viewpoint, it's interior.
+            if _exterior_verts is not None:
+                exterior_ratio = float(_exterior_verts[vert_indices].sum()) / max(len(vert_indices), 1)
+                if exterior_ratio < 0.3:
+                    reject_reason = "occlusion"
+                    _stats["filtered_by_occlusion"] += 1
 
         # Classify surface type
         if nz < algo.wall_normal_threshold:
@@ -381,22 +410,34 @@ def _extract_region_growing(
             for u, v in hull_2d
         ])
 
-        facades.append(Facade(
+        facade = Facade(
             vertices=hull_3d,
             normal=avg_normal,
             component_tag=component,
-            label=f"{direction}_{idx}",
-            index=idx,
-        ))
-        idx += 1
-        if component == "21.1":
-            _stats["walls"] += 1
+            label=f"{direction}_{idx}" if reject_reason is None else f"candidate_{direction}_{reject_idx}",
+            index=idx if reject_reason is None else reject_idx,
+        )
+
+        if reject_reason is None:
+            facades.append(facade)
+            idx += 1
+            if component == "21.1":
+                _stats["walls"] += 1
+            else:
+                _stats["roofs"] += 1
         else:
-            _stats["roofs"] += 1
+            # Skip very tiny regions that aren't useful even as candidates
+            if comp_area >= 0.3:
+                facade.label = f"candidate_{direction}_{reject_idx} ({reject_reason}, {comp_area:.1f}m\u00b2)"
+                facade.index = reject_idx
+                rejected.append(facade)
+                reject_idx += 1
 
     _stats["facades_extracted"] = len(facades)
-    global last_extraction_stats
+    _stats["candidates_rejected"] = len(rejected)
+    global last_extraction_stats, last_rejected_candidates
     last_extraction_stats = _stats
+    last_rejected_candidates = rejected
     return facades if facades else None
 
 
@@ -673,6 +714,10 @@ def build_building_from_mesh(
         mesh.vertices[:, 0] = verts[:, 0]   # x stays
         mesh.vertices[:, 1] = -verts[:, 2]  # y_new = -z_old (forward)
         mesh.vertices[:, 2] = verts[:, 1]   # z_new = y_old (up)
+
+    # Fix mesh normals using trimesh's built-in repair (ensures consistent
+    # outward-facing normals on watertight or near-watertight meshes).
+    trimesh.repair.fix_normals(mesh)
 
     # Center the mesh at origin
     centroid = mesh.centroid.copy()

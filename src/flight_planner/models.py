@@ -43,10 +43,14 @@ class CameraSpec:
 
 
 # Matrice 4E camera definitions
+# NOTE: DJI lists 35mm-equivalent focal lengths (24/70/168 mm) in their specs.
+# The values below are the actual (physical) focal lengths, derived from the
+# stated diagonal FOV and sensor dimensions:  actual_fl = diag / (2*tan(fov/2)).
+# Using equivalent FLs with physical sensor sizes would produce wrong GSD/distance.
 CAMERAS: dict[CameraName, CameraSpec] = {
     CameraName.WIDE: CameraSpec(
         name=CameraName.WIDE,
-        focal_length_mm=24,
+        focal_length_mm=12.0,  # 24mm equiv ÷ 2.0 crop (4/3")
         sensor_width_mm=17.3,
         sensor_height_mm=13.0,
         image_width_px=5280,
@@ -56,7 +60,7 @@ CAMERAS: dict[CameraName, CameraSpec] = {
     ),
     CameraName.MEDIUM_TELE: CameraSpec(
         name=CameraName.MEDIUM_TELE,
-        focal_length_mm=70,
+        focal_length_mm=19.0,  # 70mm equiv ÷ 3.6 crop (1/1.3")
         sensor_width_mm=9.6,
         sensor_height_mm=7.2,
         image_width_px=8064,
@@ -66,7 +70,7 @@ CAMERAS: dict[CameraName, CameraSpec] = {
     ),
     CameraName.TELEPHOTO: CameraSpec(
         name=CameraName.TELEPHOTO,
-        focal_length_mm=168,
+        focal_length_mm=41.8,  # 168mm equiv ÷ 3.9 crop (1/1.5")
         sensor_width_mm=8.8,
         sensor_height_mm=6.6,
         image_width_px=8192,
@@ -84,7 +88,7 @@ GIMBAL_PAN_MAX_DEG = 60  # right
 
 # Flight constraints
 MAX_SPEED_MS = 21
-INSPECTION_SPEED_MS = 3
+INSPECTION_SPEED_MS = 2
 MIN_ALTITUDE_M = 2
 MAX_ALTITUDE_M = 6000
 MAX_WAYPOINTS_PER_MISSION = 65535
@@ -269,6 +273,79 @@ class Building:
 
 
 @dataclass
+class ExclusionZone:
+    """A zone that modifies which waypoints are kept.
+
+    zone_type controls behavior:
+      - "no_fly": Waypoints AND transition paths must avoid this volume.
+      - "no_inspect": Inspection waypoints are removed but transitions may pass through.
+      - "inclusion": Only waypoints INSIDE this zone are kept (geofence — fly within).
+
+    Shape: either an axis-aligned box (default) or an arbitrary polygon (polygon_vertices set).
+    For polygons, center_z and size_z still define the altitude bounds.
+    """
+
+    id: str
+    label: str = ""
+
+    # Box center in local ENU coordinates (meters) — also used for polygon altitude bounds
+    center_x: float = 0.0
+    center_y: float = 0.0
+    center_z: float = 0.0
+
+    # Box dimensions (meters)
+    size_x: float = 5.0
+    size_y: float = 5.0
+    size_z: float = 10.0
+
+    zone_type: str = "no_fly"  # "no_fly" | "no_inspect" | "inclusion"
+
+    # Polygon vertices in ENU XY plane: [[x, y], ...]. If set, overrides box XY.
+    polygon_vertices: list[tuple[float, float]] | None = None
+
+    @property
+    def min_corner(self) -> tuple[float, float, float]:
+        return (
+            self.center_x - self.size_x / 2,
+            self.center_y - self.size_y / 2,
+            self.center_z - self.size_z / 2,
+        )
+
+    @property
+    def max_corner(self) -> tuple[float, float, float]:
+        return (
+            self.center_x + self.size_x / 2,
+            self.center_y + self.size_y / 2,
+            self.center_z + self.size_z / 2,
+        )
+
+    def contains_point(self, x: float, y: float, z: float) -> bool:
+        z_min = self.center_z - self.size_z / 2
+        z_max = self.center_z + self.size_z / 2
+        if not (z_min <= z <= z_max):
+            return False
+        if self.polygon_vertices:
+            return _point_in_polygon_2d(x, y, self.polygon_vertices)
+        mn = self.min_corner
+        mx = self.max_corner
+        return mn[0] <= x <= mx[0] and mn[1] <= y <= mx[1]
+
+
+def _point_in_polygon_2d(x: float, y: float, vertices: list[tuple[float, float]]) -> bool:
+    """Ray casting algorithm for 2D point-in-polygon test."""
+    n = len(vertices)
+    inside = False
+    j = n - 1
+    for i in range(n):
+        xi, yi = vertices[i]
+        xj, yj = vertices[j]
+        if ((yi > y) != (yj > y)) and (x < (xj - xi) * (y - yi) / (yj - yi) + xi):
+            inside = not inside
+        j = i
+    return inside
+
+
+@dataclass
 class AlgorithmConfig:
     """Tunable algorithm parameters that are not backed by hardware specs.
 
@@ -311,6 +388,9 @@ class AlgorithmConfig:
     enable_waypoint_los: bool = True  # ray-cast LOS check per waypoint against mesh
     los_tolerance_m: float = 0.5  # hit closer than (target_dist - tolerance) = occluded
     los_min_visible_ratio: float = 0.4  # min fraction of sample rays that must reach facade
+
+    # -- Grid pattern (geometry.py) --
+    grid_density: float = 1.0  # multiplier for grid point density (0.5 = half, 2.0 = double)
 
     # -- Path optimization (optimize.py) --
     enable_path_dedup: bool = True  # merge near-coincident cross-facade waypoints
@@ -357,6 +437,10 @@ class MissionConfig:
     gimbal_pitch_margin_deg: float = 5.0  # safety margin from hardware pitch limits
     min_photo_distance_m: float = 1.5  # min distance between photo waypoints (dedup)
     yaw_rate_deg_per_s: float = 60.0  # assumed drone yaw rate for time estimates
+
+    # Flight mode: False = fly-through (curve_and_pass, faster, M4E mech shutter handles it)
+    # True = stop at each waypoint (curve_and_stop, slower but guaranteed sharp)
+    stop_at_waypoint: bool = False
 
     # DJI Pilot 2 safety defaults (pre-populate the operator's UI)
     rc_lost_action: str = "go_home"  # "go_home" | "hover" | "land" — what drone does on signal loss

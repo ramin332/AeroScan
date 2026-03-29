@@ -23,6 +23,7 @@ export interface MissionParams {
   gimbal_pitch_margin_deg: number;
   min_photo_distance_m: number;
   yaw_rate_deg_per_s: number;
+  stop_at_waypoint: boolean;
 }
 
 export interface ValidationIssue {
@@ -66,6 +67,7 @@ export interface AlgorithmParams {
   los_tolerance_m: number;
   los_min_visible_ratio: number;
   // Path optimization
+  grid_density: number;
   enable_path_dedup: boolean;
   enable_path_tsp: boolean;
   enable_sweep_reversal: boolean;
@@ -73,6 +75,20 @@ export interface AlgorithmParams {
   tsp_method: 'auto' | 'nearest_neighbor' | 'greedy' | 'simulated_annealing' | 'threshold_accepting';
   // KMZ export
   min_waypoint_height_m: number;
+}
+
+export interface ExclusionZone {
+  id: string;
+  label: string;
+  center_x: number;
+  center_y: number;
+  center_z: number;
+  size_x: number;
+  size_y: number;
+  size_z: number;
+  zone_type: 'no_fly' | 'no_inspect' | 'inclusion';
+  /** ENU [x, y] vertex pairs for polygon zones. If absent, zone is an axis-aligned box. */
+  polygon_vertices?: [number, number][];
 }
 
 export interface GenerateRequest {
@@ -84,6 +100,9 @@ export interface GenerateRequest {
   min_facade_area?: number;
   extraction_method?: string;
   waypoint_strategy?: string;
+  disabled_facades?: number[];
+  enabled_candidates?: number[];
+  exclusion_zones?: ExclusionZone[];
 }
 
 export interface UploadedBuilding {
@@ -169,6 +188,7 @@ export interface RawMeshData {
 
 export interface ThreeJSData {
   facades: FacadeData[];
+  candidateFacades?: FacadeData[];
   waypoints: WaypointData[];
   buildingLabel: string;
   buildingDims: string;
@@ -277,6 +297,9 @@ export interface GenerateResponse {
     building: BuildingParams;
     mission: MissionParams;
     algorithm?: AlgorithmParams;
+    disabled_facades?: number[];
+    enabled_candidates?: number[];
+    exclusion_zones?: ExclusionZone[];
   };
 }
 
@@ -321,4 +344,63 @@ export interface DroneSpec {
     max_waypoints: number;
     max_flight_time_manifold_min: number;
   };
+}
+
+// Simulation / Reconstruction types
+
+export interface SimulationComparison {
+  original: {
+    facade_count: number;
+    dimensions: [number, number, number];
+    inspection_waypoints: number;
+  };
+  reconstructed: {
+    facade_count: number;
+    dimensions: [number, number, number];
+    inspection_waypoints: number;
+  };
+  diff: {
+    facade_count: number;
+    width_m: number;
+    depth_m: number;
+    height_m: number;
+    waypoint_diff: number;
+  };
+  method: string;
+  render_scale: number;
+  voxel_size_m: number;
+  num_photos: number;
+}
+
+export interface SimulationPhoto {
+  index: number;
+  path: string;
+  facade_index: number;
+  position: [number, number, number];
+  heading: number;
+  gimbal_pitch: number;
+}
+
+export interface SimulationResult {
+  viewer_data: ViewerData;
+  summary: {
+    waypoint_count: number;
+    inspection_waypoints: number;
+    facade_count: number;
+    building_dims: string;
+  };
+  comparison: SimulationComparison;
+  photos: SimulationPhoto[];
+  photos_total: number;
+  output_dir: string;
+  mesh_path: string;
+}
+
+export interface SimulationStatus {
+  task_id: string;
+  status: 'pending' | 'rendering' | 'reconstructing' | 'importing' | 'generating' | 'complete' | 'error';
+  progress: number;
+  message: string;
+  result?: SimulationResult;
+  error?: string;
 }

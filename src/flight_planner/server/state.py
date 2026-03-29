@@ -24,6 +24,7 @@ class MissionVersion:
     algo: AlgorithmConfig
     summary: dict
     viewer_data: dict  # threejs + leaflet data
+    selection: dict | None = None  # disabled_facades, enabled_candidates, exclusion_zones
 
 
 def _make_version_id() -> str:
@@ -49,6 +50,7 @@ class SessionState:
         summary: dict,
         viewer_data: dict,
         algo: AlgorithmConfig | None = None,
+        selection: dict | None = None,
     ) -> MissionVersion:
         version_id = _make_version_id()
         version = MissionVersion(
@@ -62,6 +64,7 @@ class SessionState:
             algo=algo or AlgorithmConfig(),
             summary=summary,
             viewer_data=viewer_data,
+            selection=selection,
         )
         self._versions[version_id] = version
         self._order.insert(0, version_id)

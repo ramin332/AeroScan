@@ -23,6 +23,9 @@ server = [
 mesh = [
     "open3d>=0.17",
     "trimesh>=3.21",
+    "scipy>=1.10",
+    "pyrender>=0.1.45",
+    "fast-simplification>=0.1",
 ]
 
 [build-system]

@@ -91,8 +91,9 @@ def _build_mission(
             wb.turn_mode("curve_and_pass")
             continue
 
-        # Inspection: stop at waypoint, set gimbal, take photo
-        wb.turn_mode("curve_and_stop")
+        # Inspection: set gimbal, take photo
+        # M4E mechanical shutter allows fly-through capture at slow speeds
+        wb.turn_mode("curve_and_stop" if config.stop_at_waypoint else "curve_and_pass")
         wb.gimbal_rotate(
             pitch=_clamp_pitch(wp.gimbal_pitch_deg),
             yaw=wp.gimbal_yaw_deg,

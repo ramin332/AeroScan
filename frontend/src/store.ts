@@ -1,5 +1,6 @@
 import { create } from 'zustand';
-import type { AlgorithmParams, BuildingParams, GenerateResponse, MissionParams, UploadedBuilding, VersionSummary } from './api/types';
+import { persist } from 'zustand/middleware';
+import type { AlgorithmParams, BuildingParams, ExclusionZone, GenerateResponse, MissionParams, SimulationResult, UploadedBuilding, VersionSummary } from './api/types';
 import * as api from './api/client';
 
 export const DEFAULT_BUILDING: BuildingParams = {
@@ -19,12 +20,13 @@ export const DEFAULT_MISSION: MissionParams = {
   camera: 'wide',
   front_overlap: 0.80,
   side_overlap: 0.70,
-  flight_speed_ms: 3.0,
+  flight_speed_ms: 2.0,
   obstacle_clearance_m: 2.0,
   mission_name: 'AeroScan Inspection',
   gimbal_pitch_margin_deg: 5.0,
   min_photo_distance_m: 1.5,
   yaw_rate_deg_per_s: 60.0,
+  stop_at_waypoint: false,
 };
 
 export const DEFAULT_ALGORITHM: AlgorithmParams = {
@@ -60,6 +62,7 @@ export const DEFAULT_ALGORITHM: AlgorithmParams = {
   los_tolerance_m: 0.5,
   los_min_visible_ratio: 0.4,
   // Path optimization
+  grid_density: 1.0,
   enable_path_dedup: true,
   enable_path_tsp: true,
   enable_sweep_reversal: true,
@@ -76,7 +79,7 @@ export const PRESETS: Record<string, Partial<BuildingParams>> = {
   large_apartment_block: { width: 60, depth: 12, height: 18, heading_deg: 15, roof_type: 'flat', roof_pitch_deg: 0, num_stories: 6 },
 };
 
-type Tab = '3d' | 'map';
+type Tab = '3d' | 'map' | 'sim';
 type BuildingSource = 'upload' | 'preset';
 
 interface AppState {
@@ -96,6 +99,12 @@ interface AppState {
   extractionMethod: string;
   waypointStrategy: string;
 
+  // Exclusion zones & facade toggling
+  disabledFacades: Set<number>;
+  enabledCandidates: Set<number>;
+  exclusionZones: ExclusionZone[];
+  zoneDrawMode: boolean;
+
   // Result
   result: GenerateResponse | null;
   versions: VersionSummary[];
@@ -105,6 +114,7 @@ interface AppState {
 
   // Actions
   setMinFacadeArea: (v: number) => void;
+  setExtractionMethod: (v: string) => void;
   setWaypointStrategy: (v: string) => void;
   setBuildingSource: (source: BuildingSource) => void;
   setPreset: (name: string | null) => void;
@@ -113,26 +123,57 @@ interface AppState {
   setAlgorithm: (patch: Partial<AlgorithmParams>) => void;
   resetAlgorithm: () => void;
   setActiveTab: (tab: Tab) => void;
+  toggleFacade: (index: number) => void;
+  toggleCandidate: (index: number) => void;
+  addExclusionZone: (zone: ExclusionZone) => void;
+  removeExclusionZone: (id: string) => void;
+  updateExclusionZone: (id: string, patch: Partial<ExclusionZone>) => void;
+  setZoneDrawMode: (v: boolean) => void;
   generate: () => Promise<void>;
   loadVersion: (id: string) => Promise<void>;
   deleteVersion: (id: string) => Promise<void>;
   deleteAllVersions: () => Promise<void>;
   refreshVersions: () => Promise<void>;
 
+  // Theme
+  lightMode: boolean;
+  setLightMode: (v: boolean) => void;
+
+  // Section open/close state
+  sectionState: Record<string, boolean>;
+  setSectionOpen: (key: string, open: boolean) => void;
+
   // Building upload actions
   uploadBuilding: (file: File) => Promise<void>;
   selectBuilding: (id: string) => void;
   deleteBuilding: (id: string) => Promise<void>;
   refreshBuildings: () => Promise<void>;
+
+  // Simulation / reconstruction
+  simTaskId: string | null;
+  simStatus: string | null;
+  simProgress: number;
+  simMessage: string;
+  simStartTime: number | null;
+  simResult: SimulationResult | null;
+  simViewerData: import('./api/types').ViewerData | null;
+  startSimulation: (renderScale?: number, voxelSize?: number) => Promise<void>;
+  viewSimulationResult: () => void;
+  deleteSimulation: () => Promise<void>;
+  loadSimFromUrl: () => Promise<void>;
 }
 
-export const useStore = create<AppState>((set, get) => ({
+export const useStore = create<AppState>()(persist((set, get) => ({
   buildingSource: 'preset',
   selectedBuildingId: null,
   buildings: [],
   minFacadeArea: 1.0,
   extractionMethod: 'region_growing',
   waypointStrategy: 'facade_grid',
+  disabledFacades: new Set<number>(),
+  enabledCandidates: new Set<number>(),
+  exclusionZones: [],
+  zoneDrawMode: false,
 
   preset: 'simple_box',
   building: { ...DEFAULT_BUILDING },
@@ -143,6 +184,10 @@ export const useStore = create<AppState>((set, get) => ({
   loading: false,
   uploading: false,
   activeTab: '3d',
+  lightMode: false,
+  setLightMode: (v) => set({ lightMode: v }),
+  sectionState: {},
+  setSectionOpen: (key, open) => set((s) => ({ sectionState: { ...s.sectionState, [key]: open } })),
 
   setMinFacadeArea: (v) => set({ minFacadeArea: v }),
   setExtractionMethod: (v: string) => set({ extractionMethod: v }),
@@ -183,8 +228,29 @@ export const useStore = create<AppState>((set, get) => ({
 
   setActiveTab: (tab) => set({ activeTab: tab }),
 
+  toggleFacade: (index) => {
+    const next = new Set(get().disabledFacades);
+    if (next.has(index)) next.delete(index);
+    else next.add(index);
+    set({ disabledFacades: next });
+    get().generate();
+  },
+  toggleCandidate: (index) => {
+    const next = new Set(get().enabledCandidates);
+    if (next.has(index)) next.delete(index);
+    else next.add(index);
+    set({ enabledCandidates: next });
+    get().generate();
+  },
+  addExclusionZone: (zone) => set({ exclusionZones: [...get().exclusionZones, zone] }),
+  removeExclusionZone: (id) => set({ exclusionZones: get().exclusionZones.filter(z => z.id !== id) }),
+  updateExclusionZone: (id, patch) => set({
+    exclusionZones: get().exclusionZones.map(z => z.id === id ? { ...z, ...patch } : z),
+  }),
+  setZoneDrawMode: (v) => set({ zoneDrawMode: v }),
+
   generate: async () => {
-    const { preset, selectedBuildingId, buildingSource, building, mission, algorithm, minFacadeArea, extractionMethod, waypointStrategy } = get();
+    const { preset, selectedBuildingId, buildingSource, building, mission, algorithm, minFacadeArea, extractionMethod, waypointStrategy, disabledFacades, enabledCandidates, exclusionZones } = get();
     set({ loading: true });
     try {
       const result = await api.generate({
@@ -196,6 +262,9 @@ export const useStore = create<AppState>((set, get) => ({
         min_facade_area: buildingSource === 'upload' ? minFacadeArea : undefined,
         extraction_method: buildingSource === 'upload' ? extractionMethod : undefined,
         waypoint_strategy: buildingSource === 'upload' ? waypointStrategy : undefined,
+        disabled_facades: disabledFacades.size > 0 ? [...disabledFacades] : undefined,
+        enabled_candidates: enabledCandidates.size > 0 ? [...enabledCandidates] : undefined,
+        exclusion_zones: exclusionZones.length > 0 ? exclusionZones : undefined,
       });
       set({ result, loading: false });
       get().refreshVersions();
@@ -214,6 +283,9 @@ export const useStore = create<AppState>((set, get) => ({
         building: result.config_snapshot.building,
         mission: result.config_snapshot.mission,
         algorithm: result.config_snapshot.algorithm || { ...DEFAULT_ALGORITHM },
+        disabledFacades: new Set(result.config_snapshot.disabled_facades ?? []),
+        enabledCandidates: new Set(result.config_snapshot.enabled_candidates ?? []),
+        exclusionZones: result.config_snapshot.exclusion_zones ?? [],
         loading: false,
       });
     } catch (e) {
@@ -366,4 +438,83 @@ export const useStore = create<AppState>((set, get) => ({
       console.error('Refresh buildings failed:', e);
     }
   },
+
+  // --- Simulation / reconstruction ---
+  simTaskId: null,
+  simStatus: null,
+  simProgress: 0,
+  simMessage: '',
+  simStartTime: null,
+  simResult: null,
+  simViewerData: null,
+
+  startSimulation: async (renderScale?: number, voxelSize?: number) => {
+    const { result } = get();
+    if (!result) return;
+
+    set({ simStatus: 'starting', simProgress: 0, simMessage: 'Starting simulation…', simResult: null, simStartTime: Date.now() });
+    try {
+      const { task_id } = await api.startSimulation(result.version_id, renderScale, voxelSize);
+      set({ simTaskId: task_id, simStatus: 'rendering', simMessage: 'Rendering synthetic photos…' });
+
+      const poll = async () => {
+        const status = await api.getSimulationStatus(task_id);
+        set({ simStatus: status.status, simProgress: status.progress, simMessage: status.message });
+
+        if (status.status === 'complete' && status.result) {
+          set({ simResult: status.result });
+        } else if (status.status === 'error') {
+          console.error('Simulation error:', status.error);
+        } else {
+          setTimeout(poll, 2000);
+        }
+      };
+      poll();
+    } catch (e) {
+      console.error('Start simulation failed:', e);
+      set({ simStatus: 'error', simMessage: String(e) });
+    }
+  },
+
+  viewSimulationResult: () => {
+    set({ activeTab: 'sim' });
+  },
+
+  deleteSimulation: async () => {
+    const { simTaskId } = get();
+    if (!simTaskId) return;
+    try {
+      await api.deleteSimulation(simTaskId);
+    } catch { /* task may already be gone */ }
+    set({ simTaskId: null, simStatus: null, simProgress: 0, simMessage: '', simStartTime: null, simResult: null, simViewerData: null });
+  },
+
+  loadSimFromUrl: async () => {
+    const params = new URLSearchParams(window.location.search);
+    const taskId = params.get('sim_task');
+    if (!taskId) return;
+    try {
+      const status = await api.getSimulationStatus(taskId);
+      if (status.status === 'complete' && status.result) {
+        set({ simViewerData: status.result.viewer_data, simResult: status.result, simTaskId: taskId });
+      }
+    } catch (e) {
+      console.error('Failed to load simulation:', e);
+    }
+  },
+}), {
+  name: 'aeroscan-settings',
+  partialize: (state) => ({
+    lightMode: state.lightMode,
+    activeTab: state.activeTab,
+    buildingSource: state.buildingSource,
+    preset: state.preset,
+    building: state.building,
+    mission: state.mission,
+    algorithm: state.algorithm,
+    minFacadeArea: state.minFacadeArea,
+    extractionMethod: state.extractionMethod,
+    waypointStrategy: state.waypointStrategy,
+    sectionState: state.sectionState,
+  }),
 }));

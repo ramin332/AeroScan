@@ -1,7 +1,7 @@
 import { useEffect, useRef } from 'react';
 import { useStore, PRESETS, DEFAULT_ALGORITHM, DEFAULT_MISSION } from '../store';
 import { kmzDownloadUrl } from '../api/client';
-import type { AlgorithmParams } from '../api/types';
+import type { AlgorithmParams, ExclusionZone } from '../api/types';
 import { DroneInfo } from './DroneInfo';
 import { VersionList } from './VersionList';
 
@@ -21,9 +21,11 @@ const CAMERA_LABELS: Record<string, string> = {
 export function Sidebar() {
   const {
     buildingSource, selectedBuildingId, buildings, uploading, minFacadeArea, extractionMethod, waypointStrategy,
-    preset, building, mission, algorithm, result,
+    preset, building, mission, algorithm, result, lightMode, setLightMode,
+    disabledFacades, exclusionZones, toggleFacade, removeExclusionZone, updateExclusionZone,
     setBuildingSource, setPreset, setBuilding, setMission, setAlgorithm, resetAlgorithm, setMinFacadeArea, setExtractionMethod, setWaypointStrategy,
     uploadBuilding, selectBuilding, deleteBuilding,
+    simStatus, simProgress, simMessage, simStartTime, simResult, startSimulation, viewSimulationResult, deleteSimulation,
   } = useStore();
 
   const fileRef = useRef<HTMLInputElement>(null);
@@ -79,7 +81,29 @@ export function Sidebar() {
 
   return (
     <aside className="sidebar">
-      <h1>AeroScan Flight Planner</h1>
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', paddingRight: 12, borderBottom: '1px solid var(--border)' }}>
+        <h1>AeroScan Flight Planner</h1>
+        <div style={{ display: 'flex', gap: 4 }}>
+          <button
+            className="theme-toggle"
+            onClick={() => {
+              setPreset('simple_box');
+              setMission(DEFAULT_MISSION);
+              resetAlgorithm();
+            }}
+            title="Reset all values to defaults"
+          >
+            {'\u21BA'}
+          </button>
+          <button
+            className="theme-toggle"
+            onClick={() => setLightMode(!lightMode)}
+            title={lightMode ? 'Switch to dark mode' : 'Switch to light mode'}
+          >
+            {lightMode ? '\u263E' : '\u2600'}
+          </button>
+        </div>
+      </div>
       <DroneInfo />
 
       {/* ======== BUILDING ======== */}
@@ -256,11 +280,11 @@ export function Sidebar() {
           </select>
         </div>
         <SliderField label="Front overlap" value={mission.front_overlap}
-          min={0.6} max={0.9} step={0.05}
+          min={0.6} max={0.95} step={0.05}
           format={(v) => `${Math.round(v * 100)}%`}
           onChange={(v) => setMission({ front_overlap: v })} onCommit={autoGen} />
         <SliderField label="Side overlap" value={mission.side_overlap}
-          min={0.5} max={0.8} step={0.05}
+          min={0.5} max={0.9} step={0.05}
           format={(v) => `${Math.round(v * 100)}%`}
           onChange={(v) => setMission({ side_overlap: v })} onCommit={autoGen} />
       </Section>
@@ -268,9 +292,13 @@ export function Sidebar() {
       {/* ======== FLIGHT ======== */}
       <Section title="Flight" defaultOpen>
         <SliderField label="Inspect speed" value={mission.flight_speed_ms}
-          min={1} max={8} step={0.5}
+          min={0.5} max={5} step={0.5}
           format={(v) => `${v} m/s`}
           onChange={(v) => setMission({ flight_speed_ms: v })} onCommit={autoGen} />
+        <ToggleField label="Stop at waypoints"
+          value={mission.stop_at_waypoint}
+          tooltip="Off = fly-through (faster, M4E mech shutter prevents blur). On = stop at each waypoint (slower but guaranteed sharp)."
+          onChange={(v) => { setMission({ stop_at_waypoint: v }); autoGen(); }} />
         <SliderField label="Clearance" value={mission.obstacle_clearance_m}
           min={1} max={10} step={0.5}
           format={(v) => `${v} m`}
@@ -287,6 +315,13 @@ export function Sidebar() {
 
       {/* ======== PATH OPTIMIZATION ======== */}
       <Section title="Path Optimization" defaultOpen>
+        <SliderField label="Grid density" value={algorithm.grid_density}
+          min={0.25} max={4} step={0.25}
+          format={(v) => `${v}x`}
+          tooltip="Photo point density multiplier. 1x = standard from GSD/overlap. 2x = double points. 0.5x = half points (faster flight)."
+          defaultValue={DEFAULT_ALGORITHM.grid_density}
+          onReset={() => setAlgorithm({ grid_density: DEFAULT_ALGORITHM.grid_density })}
+          onChange={(v) => setAlgorithm({ grid_density: v })} onCommit={autoGen} />
         <ToggleField label="TSP ordering"
           value={algorithm.enable_path_tsp}
           tooltip="Optimize facade visit order to minimize transit distance between facades."
@@ -546,6 +581,167 @@ export function Sidebar() {
         )}
       </div>
 
+      {/* ======== SIMULATE RECONSTRUCTION ======== */}
+      {result && result.can_export && (
+        <Section title="Simulate Reconstruction" defaultOpen={false}>
+          <div className="field-hint" style={{ marginBottom: 8 }}>
+            Render synthetic photos from each waypoint, reconstruct the building via TSDF fusion, and reimport.
+          </div>
+          {!simStatus || simStatus === 'error' ? (
+            <div style={{ display: 'flex', gap: 4 }}>
+              {([
+                ['Super Fast', 0.05, 0.08],
+                ['Fast',       0.08, 0.05],
+                ['Medium',     0.12, 0.03],
+                ['High',       0.20, 0.02],
+              ] as const).map(([label, scale, voxel]) => (
+                <button key={label} className="btn-primary"
+                  style={{ flex: 1, fontSize: 10, padding: '5px 2px' }}
+                  onClick={() => startSimulation(scale, voxel)}>
+                  {label}
+                </button>
+              ))}
+            </div>
+          ) : simStatus === 'complete' && simResult ? (
+            <div>
+              <div style={{ fontSize: 11, marginBottom: 8, color: 'var(--text-secondary)' }}>
+                {simResult.comparison.num_photos} photos rendered via {simResult.comparison.method}
+              </div>
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '2px 12px', fontSize: 11, marginBottom: 8 }}>
+                <span style={{ color: 'var(--text-secondary)' }}>Facades</span>
+                <span>{simResult.comparison.original.facade_count} → {simResult.comparison.reconstructed.facade_count}
+                  {simResult.comparison.diff.facade_count !== 0 && (
+                    <span style={{ color: simResult.comparison.diff.facade_count > 0 ? 'var(--accent2)' : '#f66', marginLeft: 4 }}>
+                      ({simResult.comparison.diff.facade_count > 0 ? '+' : ''}{simResult.comparison.diff.facade_count})
+                    </span>
+                  )}
+                </span>
+                <span style={{ color: 'var(--text-secondary)' }}>Waypoints</span>
+                <span>{simResult.comparison.original.inspection_waypoints} → {simResult.comparison.reconstructed.inspection_waypoints}
+                  {simResult.comparison.diff.waypoint_diff !== 0 && (
+                    <span style={{ color: 'var(--text-secondary)', marginLeft: 4 }}>
+                      ({simResult.comparison.diff.waypoint_diff > 0 ? '+' : ''}{simResult.comparison.diff.waypoint_diff})
+                    </span>
+                  )}
+                </span>
+                <span style={{ color: 'var(--text-secondary)' }}>Size diff</span>
+                <span>{simResult.comparison.diff.width_m}w / {simResult.comparison.diff.depth_m}d / {simResult.comparison.diff.height_m}h m</span>
+              </div>
+              <div style={{ display: 'flex', gap: 6 }}>
+                <button className="btn-primary" onClick={viewSimulationResult}
+                  style={{ flex: 1 }}>
+                  View Result
+                </button>
+                <button className="btn-secondary" onClick={() => startSimulation()}
+                  style={{ fontSize: 11, padding: '4px 8px' }}>
+                  Re-run
+                </button>
+                <button className="btn-secondary" onClick={deleteSimulation}
+                  style={{ fontSize: 11, padding: '4px 8px', opacity: 0.7 }}
+                  title="Delete simulation and output files">
+                  &times;
+                </button>
+              </div>
+            </div>
+          ) : (
+            <div>
+              {(() => {
+                const steps = [
+                  { key: 'rendering', label: 'Rendering photos + TSDF fusion' },
+                  { key: 'importing', label: 'Decimating & importing mesh' },
+                  { key: 'generating', label: 'Generating new mission' },
+                ];
+                const currentIdx = steps.findIndex(s => s.key === simStatus);
+                return (
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 3, fontSize: 11 }}>
+                    {steps.map((step, i) => {
+                      const done = i < currentIdx;
+                      const active = i === currentIdx;
+                      return (
+                        <div key={step.key} style={{ display: 'flex', alignItems: 'center', gap: 6, color: done ? 'var(--accent2)' : active ? 'var(--text-primary)' : 'var(--text-secondary)', opacity: done || active ? 1 : 0.4 }}>
+                          <span style={{ width: 14, textAlign: 'center', fontSize: 10 }}>
+                            {done ? '\u2713' : active ? '\u25CF' : '\u25CB'}
+                          </span>
+                          <span>{step.label}{active && simStatus === 'rendering' && simProgress > 0.1 ? ` (${Math.round((simProgress - 0.1) / 0.6 * 100)}%)` : ''}</span>
+                        </div>
+                      );
+                    })}
+                  </div>
+                );
+              })()}
+              <div style={{ height: 3, background: 'var(--bg-secondary)', borderRadius: 2, overflow: 'hidden', marginTop: 8 }}>
+                <div style={{
+                  height: '100%',
+                  width: `${Math.round(simProgress * 100)}%`,
+                  background: 'var(--accent)',
+                  transition: 'width 0.3s ease',
+                }} />
+              </div>
+            </div>
+          )}
+          {simStatus === 'error' && (
+            <div className="validation-error" style={{ marginTop: 6 }}>{simMessage}</div>
+          )}
+        </Section>
+      )}
+
+      {/* ======== FACADE TOGGLE ======== */}
+      {result && result.viewer_data.threejs.facades.length > 0 && (
+        <Section title="Facades" defaultOpen>
+          <div className="field-hint" style={{ marginBottom: 6 }}>
+            Click facades in the 3D view or toggle here
+          </div>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+            {result.viewer_data.threejs.facades.map((f) => {
+              const disabled = disabledFacades.has(f.index);
+              return (
+                <label key={f.index} style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 11, cursor: 'pointer', opacity: disabled ? 0.5 : 1 }}>
+                  <input type="checkbox" checked={!disabled}
+                    onChange={() => toggleFacade(f.index)} />
+                  <span style={{ width: 10, height: 10, borderRadius: 2, background: f.color, flexShrink: 0 }} />
+                  <span>{f.label}</span>
+                </label>
+              );
+            })}
+          </div>
+          {disabledFacades.size > 0 && (
+            <div className="field-hint" style={{ marginTop: 6, color: 'var(--accent2)' }}>
+              {disabledFacades.size} facade(s) disabled — regenerate to apply
+            </div>
+          )}
+        </Section>
+      )}
+
+      {/* ======== ZONES ======== */}
+      {exclusionZones.length > 0 && (
+        <Section title={`Zones (${exclusionZones.length})`} defaultOpen>
+          <div className="field-hint" style={{ marginBottom: 6 }}>
+            Draw on map tab
+          </div>
+          {exclusionZones.map((zone) => {
+            const dotColor = zone.zone_type === 'no_fly' ? '#f44'
+              : zone.zone_type === 'no_inspect' ? '#fa3'
+              : '#22cc55';
+            return (
+              <div key={zone.id} style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 11, marginBottom: 3 }}>
+                <span style={{ width: 8, height: 8, borderRadius: 2, flexShrink: 0, background: dotColor }} />
+                <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                  {zone.label}
+                </span>
+                <select value={zone.zone_type} style={{ fontSize: 10, padding: '1px 2px', width: 76 }}
+                  onChange={(e) => updateExclusionZone(zone.id, { zone_type: e.target.value as ExclusionZone['zone_type'] })}>
+                  <option value="inclusion">Geofence</option>
+                  <option value="no_fly">No-Fly</option>
+                  <option value="no_inspect">No-Insp</option>
+                </select>
+                <button style={{ fontSize: 10, padding: '1px 4px', cursor: 'pointer', opacity: 0.6 }}
+                  onClick={() => removeExclusionZone(zone.id)}>&times;</button>
+              </div>
+            );
+          })}
+        </Section>
+      )}
+
       <div className="section">
         <h3>History</h3>
         <VersionList />
@@ -559,8 +755,12 @@ export function Sidebar() {
 function Section({ title, defaultOpen, children }: {
   title: string; defaultOpen?: boolean; children: React.ReactNode;
 }) {
+  const key = `section:${title}`;
+  const { sectionState, setSectionOpen } = useStore();
+  const isOpen = sectionState[key] ?? (defaultOpen !== false);
   return (
-    <details className="section" open={defaultOpen}>
+    <details className="section" open={isOpen}
+      onToggle={(e) => setSectionOpen(key, (e.target as HTMLDetailsElement).open)}>
       <summary><h3 style={{ display: 'inline', cursor: 'pointer' }}>{title}</h3></summary>
       <div style={{ marginTop: 8 }}>{children}</div>
     </details>

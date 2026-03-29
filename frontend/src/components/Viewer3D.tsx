@@ -1,19 +1,33 @@
 import { useRef, useMemo, useState, useCallback, useEffect } from 'react';
 import { Canvas, useThree, useFrame, type ThreeEvent } from '@react-three/fiber';
-import { OrbitControls, Line } from '@react-three/drei';
+import { OrbitControls, Line, PivotControls } from '@react-three/drei';
 import * as THREE from 'three';
 import type { RawMeshData, ThreeJSData, WaypointData } from '../api/types';
 import { DroneMarker, getVisitedIndex, DRONE_LAYER } from './DroneAnimation';
+import { useStore } from '../store';
 
 // Layers: 0 = base scene + ghost mesh, 1 = drone (hidden from PIP), 3 = solid mesh (PIP only)
 const MESH_SOLID_LAYER = 3;
+
+/** Component that enables MESH_SOLID_LAYER on all scene lights so the PIP camera can see lit surfaces */
+function EnableLightLayers() {
+  const { scene } = useThree();
+  useEffect(() => {
+    scene.traverse((obj) => {
+      if ((obj as THREE.Light).isLight) {
+        obj.layers.enable(MESH_SOLID_LAYER);
+      }
+    });
+  });
+  return null;
+}
 
 // Convert ENU (x=East, y=North, z=Up) to Three.js (x=right, y=up, z=toward camera)
 function enu(x: number, y: number, z: number): [number, number, number] {
   return [x, z, -y];
 }
 
-function FacadeMesh({ vertices, color, hidden, highlighted }: { vertices: number[][]; color: string; hidden?: boolean; highlighted?: boolean }) {
+function FacadeMesh({ vertices, color, hidden, highlighted, dimmed, disabled, onClick }: { vertices: number[][]; color: string; hidden?: boolean; highlighted?: boolean; dimmed?: boolean; disabled?: boolean; onClick?: (e: ThreeEvent<MouseEvent>) => void }) {
   const geometry = useMemo(() => {
     const geo = new THREE.BufferGeometry();
     const positions: number[] = [];
@@ -38,29 +52,40 @@ function FacadeMesh({ vertices, color, hidden, highlighted }: { vertices: number
 
   if (hidden) return null;
 
+  const displayColor = disabled ? '#555' : dimmed ? '#667' : color;
+  const opacity = disabled ? 0.12 : dimmed ? 0.3 : highlighted ? 0.85 : 0.35;
+  const occlude = !disabled; // depth-only pass blocks things behind the facade
+
   return (
-    <group>
-      <mesh geometry={geometry} renderOrder={highlighted ? 10 : 0}>
+    <group onClick={onClick}>
+      {/* Pass 1: invisible depth-only — writes to z-buffer so waypoints behind are occluded */}
+      {occlude && (
+        <mesh geometry={geometry} renderOrder={-1}>
+          <meshBasicMaterial colorWrite={false} depthWrite side={THREE.DoubleSide} />
+        </mesh>
+      )}
+      {/* Pass 2: visible transparent — does NOT write depth, avoids sorting artifacts */}
+      <mesh geometry={geometry} renderOrder={highlighted ? 10 : 1}>
         <meshStandardMaterial
-          color={color} transparent
-          opacity={highlighted ? 0.85 : 0.35}
+          color={displayColor} transparent
+          opacity={opacity}
           side={THREE.DoubleSide} roughness={0.8}
-          depthWrite={highlighted ? true : false}
-          depthTest={true}
+          depthWrite={false}
+          depthTest
           emissive={highlighted ? color : '#000000'}
           emissiveIntensity={highlighted ? 0.3 : 0}
         />
       </mesh>
-      <Line points={edgePoints} color={color} lineWidth={highlighted ? 2.5 : 1.5} />
+      <Line points={edgePoints} color={displayColor} lineWidth={highlighted ? 2.5 : disabled ? 0.5 : dimmed ? 0.8 : 1.5} opacity={disabled ? 0.3 : dimmed ? 0.5 : 1} transparent={disabled || dimmed} />
     </group>
   );
 }
 
 // Adaptive sphere detail: fewer polys when there are many waypoints
 function sphereArgs(count: number): [number, number, number] {
-  if (count > 2000) return [0.06, 3, 2];
-  if (count > 500)  return [0.08, 4, 3];
-  return [0.1, 6, 4];
+  if (count > 2000) return [0.08, 3, 2];
+  if (count > 500)  return [0.1, 4, 3];
+  return [0.13, 6, 4];
 }
 
 const BATCH_SIZE = 500; // matrices per frame
@@ -99,32 +124,73 @@ function WaypointSpheres({ waypoints, color, bright }: { waypoints: WaypointData
   return (
     <instancedMesh ref={meshRef} args={[undefined, undefined, waypoints.length]} frustumCulled={false}>
       <sphereGeometry args={[bright ? radius * 1.3 : radius, wSeg, hSeg]} />
-      <meshStandardMaterial color={color} transparent opacity={bright ? 0.85 : 0.45} roughness={0.4} metalness={bright ? 0.2 : 0.1} emissive={bright ? color : '#000000'} emissiveIntensity={bright ? 0.3 : 0} />
+      <meshStandardMaterial color={color} transparent opacity={bright ? 0.95 : 0.65} roughness={0.4} metalness={bright ? 0.2 : 0.1} emissive={bright ? color : '#000000'} emissiveIntensity={bright ? 0.3 : 0} />
     </instancedMesh>
   );
 }
 
-function CameraArrows({ waypoints, color, bright }: { waypoints: WaypointData[]; color: string; bright?: boolean }) {
+interface CameraFOV {
+  fov_h_deg: number;
+  fov_v_deg: number;
+  distance_m: number;
+}
+
+function CameraArrows({ waypoints, color, bright, cameraFov }: { waypoints: WaypointData[]; color: string; bright?: boolean; cameraFov?: CameraFOV }) {
   // For large sets, only draw every Nth arrow
   const stride = waypoints.length > 2000 ? 4 : waypoints.length > 500 ? 2 : 1;
+  // Full frustum wireframe on sparse subset only to avoid visual noise
+  const frustumStride = Math.max(stride, waypoints.length > 200 ? 12 : waypoints.length > 50 ? 8 : 4);
 
   const geometry = useMemo(() => {
     const positions: number[] = [];
+    const arrowLen = cameraFov ? Math.min(cameraFov.distance_m * 0.4, 3) : 2;
+    const frustumDist = cameraFov ? Math.min(cameraFov.distance_m, 8) : 2;
+    const tanH = cameraFov ? Math.tan((cameraFov.fov_h_deg / 2) * Math.PI / 180) : 0;
+    const tanV = cameraFov ? Math.tan((cameraFov.fov_v_deg / 2) * Math.PI / 180) : 0;
+    const hasFov = tanH > 0 && tanV > 0;
+
     for (let j = 0; j < waypoints.length; j += stride) {
       const wp = waypoints[j];
       const [ox, oy, oz] = enu(wp.x, wp.y, wp.z);
       const hr = (wp.heading * Math.PI) / 180;
       const pr = (wp.gimbal_pitch * Math.PI) / 180;
-      const dx = Math.sin(hr) * Math.cos(pr);
-      const dy = Math.cos(hr) * Math.cos(pr);
-      const dz = Math.sin(pr);
-      const [ex, ey, ez] = enu(wp.x + dx * 2, wp.y + dy * 2, wp.z + dz * 2);
+
+      // Forward direction in ENU
+      const fwd_x = Math.sin(hr) * Math.cos(pr);
+      const fwd_y = Math.cos(hr) * Math.cos(pr);
+      const fwd_z = Math.sin(pr);
+
+      // Short direction line for every sampled waypoint
+      const [ex, ey, ez] = enu(wp.x + fwd_x * arrowLen, wp.y + fwd_y * arrowLen, wp.z + fwd_z * arrowLen);
       positions.push(ox, oy, oz, ex, ey, ez);
+
+      // Full frustum wireframe on sparse subset only
+      if (!hasFov || j % frustumStride !== 0) continue;
+
+      const r_x = Math.cos(hr);
+      const r_y = -Math.sin(hr);
+      const u_x = r_y * fwd_z;
+      const u_y = -r_x * fwd_z;
+      const u_z = r_x * fwd_y - r_y * fwd_x;
+
+      const corners: [number, number, number][] = [];
+      for (const [sh, sv] of [[-1, -1], [1, -1], [1, 1], [-1, 1]] as const) {
+        const cx = wp.x + (fwd_x + r_x * tanH * sh + u_x * tanV * sv) * frustumDist;
+        const cy = wp.y + (fwd_y + r_y * tanH * sh + u_y * tanV * sv) * frustumDist;
+        const cz = wp.z + (fwd_z + u_z * tanV * sv) * frustumDist;
+        const [tx, ty, tz] = enu(cx, cy, cz);
+        corners.push([tx, ty, tz]);
+        positions.push(ox, oy, oz, tx, ty, tz);
+      }
+      for (let i = 0; i < 4; i++) {
+        const a = corners[i], b = corners[(i + 1) % 4];
+        positions.push(a[0], a[1], a[2], b[0], b[1], b[2]);
+      }
     }
     const geo = new THREE.BufferGeometry();
     geo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
     return geo;
-  }, [waypoints, stride]);
+  }, [waypoints, stride, frustumStride, cameraFov]);
 
   return (
     <lineSegments geometry={geometry}>
@@ -248,8 +314,16 @@ function VisitedOverlay({ waypoints, visitedUpTo }: { waypoints: WaypointData[];
   );
 }
 
-function Scene({ data, onWaypointClick, visitedIndex, showRawMesh, captureView, activeFacades }: { data: ThreeJSData; onWaypointClick: (wp: WaypointData | null) => void; visitedIndex: number; showRawMesh: boolean; captureView: boolean; activeFacades: Set<number> | null }) {
+type ViewMode = 'selection' | 'plan' | 'flight';
+
+function Scene({ data, onWaypointClick, visitedIndex, viewMode, activeFacades, lightMode, cameraFov }: { data: ThreeJSData; onWaypointClick: (wp: WaypointData | null) => void; visitedIndex: number; viewMode: ViewMode; activeFacades: Set<number> | null; lightMode: boolean; cameraFov?: CameraFOV }) {
   const { raycaster } = useThree();
+  const disabledFacades = useStore((s) => s.disabledFacades);
+  const toggleFacade = useStore((s) => s.toggleFacade);
+  const enabledCandidates = useStore((s) => s.enabledCandidates);
+  const toggleCandidate = useStore((s) => s.toggleCandidate);
+  const exclusionZones = useStore((s) => s.exclusionZones);
+  const updateExclusionZone = useStore((s) => s.updateExclusionZone);
 
   // Separate inspection and transition waypoints
   const { facadeWaypoints, transitionWaypoints } = useMemo(() => {
@@ -289,48 +363,122 @@ function Scene({ data, onWaypointClick, visitedIndex, showRawMesh, captureView, 
   return (
     <group onClick={handleClick}>
       {/* Ground */}
-      <gridHelper args={[100, 50, '#333355', '#222244']} />
+      <gridHelper args={[100, 50, lightMode ? '#b0b4c0' : '#333355', lightMode ? '#ccd0da' : '#222244']} />
       <mesh rotation={[-Math.PI / 2, 0, 0]} position={[0, -0.01, 0]}>
         <planeGeometry args={[100, 100]} />
-        <meshStandardMaterial color="#0f1117" roughness={1} />
+        <meshStandardMaterial color={lightMode ? '#dde0e8' : '#0f1117'} roughness={1} />
       </mesh>
 
       {/* Facades */}
       {data.facades.map((f) => {
-        if (captureView && activeFacades) {
+        const isDisabled = disabledFacades.has(f.index);
+        const handleFacadeClick = (e: ThreeEvent<MouseEvent>) => { e.stopPropagation(); toggleFacade(f.index); };
+        if (viewMode === 'selection') {
+          return (
+            <FacadeMesh key={f.index} vertices={f.vertices} color={f.color}
+              hidden={isDisabled}
+              highlighted={!isDisabled}
+              onClick={handleFacadeClick} />
+          );
+        }
+        if (viewMode === 'flight' && activeFacades) {
           const isActive = activeFacades.has(f.index);
           return (
             <FacadeMesh key={f.index} vertices={f.vertices} color={f.color}
-              hidden={!isActive} highlighted={isActive} />
+              highlighted={isActive} dimmed={!isActive} disabled={isDisabled}
+              onClick={handleFacadeClick} />
           );
         }
-        // Capture view with nothing selected: hide all facades (grey mesh only)
-        if (captureView) return <FacadeMesh key={f.index} vertices={f.vertices} color={f.color} hidden />;
-        return <FacadeMesh key={f.index} vertices={f.vertices} color={f.color} />;
+        if (viewMode === 'flight') {
+          return (
+            <FacadeMesh key={f.index} vertices={f.vertices} color={f.color}
+              dimmed disabled={isDisabled}
+              onClick={handleFacadeClick} />
+          );
+        }
+        return (
+          <FacadeMesh key={f.index} vertices={f.vertices} color={f.color}
+            disabled={isDisabled}
+            onClick={handleFacadeClick} />
+        );
       })}
 
-      {/* Waypoints + arrows */}
-      {Object.entries(facadeWaypoints).map(([fi, wps]) => {
+      {/* Candidate facades — rejected regions the user can click to include */}
+      {viewMode === 'selection' && data.candidateFacades?.map((f) => {
+        const isEnabled = enabledCandidates.has(f.index);
+        return (
+          <FacadeMesh key={`cand-${f.index}`} vertices={f.vertices}
+            color={isEnabled ? '#44dd66' : '#444455'}
+            highlighted={isEnabled}
+            onClick={(e) => { e.stopPropagation(); toggleCandidate(f.index); }} />
+        );
+      })}
+
+      {/* Exclusion zones — draggable via PivotControls */}
+      {exclusionZones.map((zone) => {
+        const color = zone.zone_type === 'no_fly' ? '#ff2222' : '#ff8800';
+        const wireColor = zone.zone_type === 'no_fly' ? '#ff4444' : '#ffaa33';
+        return (
+          <PivotControls
+            key={zone.id}
+            scale={0.6}
+            depthTest={false}
+            disableRotations
+            disableScaling
+            activeAxes={[true, true, true]}
+            anchor={[0, 0, 0]}
+            offset={enu(zone.center_x, zone.center_y, zone.center_z)}
+            onDragEnd={() => {
+              // PivotControls applies transform to children — read from matrix
+            }}
+            onDrag={(localMatrix) => {
+              const pos = new THREE.Vector3();
+              localMatrix.decompose(pos, new THREE.Quaternion(), new THREE.Vector3());
+              // PivotControls offset is in Three.js coords, delta is also Three.js
+              // Three.js (x, y, z) -> ENU (x, -z, y) but PivotControls gives delta from offset
+              updateExclusionZone(zone.id, {
+                center_x: zone.center_x + pos.x,
+                center_y: zone.center_y + (-pos.z),
+                center_z: zone.center_z + pos.y,
+              });
+            }}
+          >
+            <group>
+              <mesh>
+                <boxGeometry args={[zone.size_x, zone.size_z, zone.size_y]} />
+                <meshStandardMaterial color={color} transparent opacity={0.15} side={THREE.DoubleSide} depthWrite={false} />
+              </mesh>
+              <lineSegments>
+                <edgesGeometry args={[new THREE.BoxGeometry(zone.size_x, zone.size_z, zone.size_y)]} />
+                <lineBasicMaterial color={wireColor} transparent opacity={0.6} />
+              </lineSegments>
+            </group>
+          </PivotControls>
+        );
+      })}
+
+      {/* Waypoints + arrows — hidden in selection mode */}
+      {viewMode !== 'selection' && Object.entries(facadeWaypoints).map(([fi, wps]) => {
         const facadeIdx = parseInt(fi);
         const facade = data.facades.find((f) => f.index === facadeIdx);
         const color = facade?.color || '#888';
-        if (captureView && activeFacades) {
+        if (viewMode === 'flight' && activeFacades) {
           const isActive = activeFacades.has(facadeIdx);
           return (
             <group key={fi}>
               <WaypointSpheres waypoints={wps} color={isActive ? color : '#1a1a2a'} bright={isActive} />
-              {isActive && <CameraArrows waypoints={wps} color={color} bright />}
+              {isActive && <CameraArrows waypoints={wps} color={color} bright cameraFov={cameraFov} />}
             </group>
           );
         }
-        if (captureView) {
-          // Nothing selected: dim everything
+        if (viewMode === 'flight') {
           return (
             <group key={fi}>
               <WaypointSpheres waypoints={wps} color="#333" />
             </group>
           );
         }
+        // Plan mode: waypoint dots + simple direction lines (no frustum clutter)
         return (
           <group key={fi}>
             <WaypointSpheres waypoints={wps} color={color} />
@@ -340,30 +488,24 @@ function Scene({ data, onWaypointClick, visitedIndex, showRawMesh, captureView, 
       })}
 
       {/* Transition waypoints */}
-      {transitionWaypoints.length > 0 && (
-        <WaypointSpheres waypoints={transitionWaypoints} color={captureView ? '#111122' : '#555'} />
+      {viewMode !== 'selection' && transitionWaypoints.length > 0 && (
+        <WaypointSpheres waypoints={transitionWaypoints} color={viewMode === 'flight' ? '#111122' : '#555'} />
       )}
 
       {/* Flight path */}
-      <FlightPath waypoints={data.waypoints} />
+      {viewMode !== 'selection' && <FlightPath waypoints={data.waypoints} />}
 
       {/* Grey overlay on visited waypoints during playback */}
-      {visitedIndex >= 0 && (
+      {viewMode !== 'selection' && visitedIndex >= 0 && (
         <VisitedOverlay waypoints={data.waypoints} visitedUpTo={visitedIndex} />
       )}
 
       {/* Raw 3D mesh from uploaded file */}
-      {showRawMesh && data.rawMesh && (
-        <RawMeshView mesh={data.rawMesh} dimmed={captureView && activeFacades != null} />
+      {data.rawMesh && (
+        <RawMeshView mesh={data.rawMesh} dimmed={viewMode === 'flight' && activeFacades != null} />
       )}
     </group>
   );
-}
-
-interface CameraFOV {
-  fov_h_deg: number;
-  fov_v_deg: number;
-  distance_m: number;
 }
 
 interface Timeline {
@@ -377,6 +519,14 @@ const PIP_X = 12;
 const PIP_TOP = 12; // CSS px from top of canvas
 const SNAP_W = 200;
 const SNAP_H = 150;
+
+function SceneBackground({ lightMode }: { lightMode: boolean }) {
+  const { scene } = useThree();
+  useEffect(() => {
+    scene.background = new THREE.Color(lightMode ? '#e8eaef' : '#0f1117');
+  }, [lightMode, scene]);
+  return null;
+}
 
 function CameraPreview({ waypoints, progress, cameraFov, timeline, onSnapshot }: {
   waypoints: WaypointData[];
@@ -452,8 +602,7 @@ function CameraPreview({ waypoints, progress, cameraFov, timeline, onSnapshot }:
     // PIP camera:  layer 0 (base + ghost mesh) + 3 (solid mesh), no drone
     // The solid opaque mesh on layer 3 renders over the transparent ghost mesh on layer 0
     camera.layers.enable(DRONE_LAYER);
-    pipCameraRef.current.layers.set(0);
-    pipCameraRef.current.layers.enable(MESH_SOLID_LAYER);
+    pipCameraRef.current.layers.set(MESH_SOLID_LAYER);
 
     // 1. Render main scene (full viewport, auto-clear)
     gl.setViewport(0, 0, size.width, size.height);
@@ -513,16 +662,16 @@ function CameraPreview({ waypoints, progress, cameraFov, timeline, onSnapshot }:
   );
 }
 
-export function Viewer3D({ data, cameraFov }: { data: ThreeJSData | null; cameraFov?: CameraFOV }) {
+export function Viewer3D({ data, cameraFov, defaultViewMode = 'plan' }: { data: ThreeJSData | null; cameraFov?: CameraFOV; defaultViewMode?: ViewMode }) {
   const [selectedWp, setSelectedWp] = useState<WaypointData | null>(null);
   const [playing, setPlaying] = useState(false);
   const [progress, setProgress] = useState(0);
   const [speed, setSpeed] = useState(1);
   const [snapshot, setSnapshot] = useState<{ url: string; wpIdx: number; photoNum: number } | null>(null);
   const [usePhysics, setUsePhysics] = useState(true);
-  const [showRawMesh, setShowRawMesh] = useState(true);
-  const [captureView, setCaptureView] = useState(false);
+  const [viewMode, setViewMode] = useState<ViewMode>(defaultViewMode);
   const [captureDir, setCaptureDir] = useState<string | null>(null);
+  const { lightMode, disabledFacades, enabledCandidates } = useStore();
   const showPip = playing || progress > 0;
   const animRef = useRef<number | null>(null);
   const lastTimeRef = useRef(0);
@@ -618,9 +767,9 @@ export function Viewer3D({ data, cameraFov }: { data: ThreeJSData | null; camera
     : 0;
   const currentWp = data?.waypoints[currentWpIdx] ?? null;
 
-  // Active facade set for capture view
+  // Active facade set for flight view
   const activeFacadeSet = useMemo(() => {
-    if (!captureView || !data) return null;
+    if (viewMode !== 'flight' || !data) return null;
     if (selectedWp) return new Set([selectedWp.facade_index]);
     if (progress > 0 && currentWp && !currentWp.is_transition) return new Set([currentWp.facade_index]);
     if (captureDir) {
@@ -631,7 +780,7 @@ export function Viewer3D({ data, cameraFov }: { data: ThreeJSData | null; camera
       return indices.size > 0 ? indices : null;
     }
     return null;
-  }, [captureView, selectedWp, progress, currentWp, captureDir, data]);
+  }, [viewMode, selectedWp, progress, currentWp, captureDir, data]);
 
   if (!data) {
     return <div className="empty-state">Ariana Engineering &times; AeroScan</div>;
@@ -641,20 +790,22 @@ export function Viewer3D({ data, cameraFov }: { data: ThreeJSData | null; camera
     <div style={{ width: '100%', height: '100%', position: 'relative' }}>
       <Canvas
         camera={{ position: [35, 25, 35], fov: 50, near: 0.1, far: 500 }}
-        style={{ background: '#0f1117' }}
+        style={{ background: lightMode ? '#e8eaef' : '#0f1117' }}
         frameloop={playing ? 'always' : 'demand'}
         onClick={() => setSelectedWp(null)}
       >
-        <ambientLight intensity={0.5} />
-        <directionalLight position={[20, 40, 30]} intensity={0.8} />
-        <hemisphereLight args={['#4488cc', '#332211', 0.3]} />
-        <fog attach="fog" args={['#0f1117', 80, 200]} />
+        <SceneBackground lightMode={lightMode} />
+        <ambientLight intensity={lightMode ? 0.8 : 0.5} />
+        <directionalLight position={[20, 40, 30]} intensity={lightMode ? 1.0 : 0.8} />
+        <hemisphereLight args={[lightMode ? '#88aadd' : '#4488cc', lightMode ? '#ccbb99' : '#332211', lightMode ? 0.5 : 0.3]} />
+        <EnableLightLayers />
+        <fog attach="fog" args={[lightMode ? '#e8eaef' : '#0f1117', 80, 200]} />
         <OrbitControls
           target={[0, data.buildingHeight / 2, 0]}
           enableDamping
           dampingFactor={0.08}
         />
-        <Scene data={data} onWaypointClick={setSelectedWp} visitedIndex={playing || progress > 0 ? getVisitedIndex(progress, data.waypoints.length) : -1} showRawMesh={showRawMesh} captureView={captureView} activeFacades={activeFacadeSet} />
+        <Scene data={data} onWaypointClick={setSelectedWp} visitedIndex={playing || progress > 0 ? getVisitedIndex(progress, data.waypoints.length) : -1} viewMode={viewMode} activeFacades={activeFacadeSet} lightMode={lightMode} cameraFov={cameraFov} />
         {(playing || progress > 0) && (
           <DroneMarker waypoints={data.waypoints} progress={progress} cameraFov={cameraFov} timeline={usePhysics ? timeline : undefined} />
         )}
@@ -682,45 +833,60 @@ export function Viewer3D({ data, cameraFov }: { data: ThreeJSData | null; camera
         </div>
       )}
 
-      {/* Legend */}
+      {/* View mode selector + legend */}
       <div className="legend-3d">
-        <label className="legend-item" style={{ cursor: 'pointer', marginBottom: 4 }}>
-          <input
-            type="checkbox"
-            checked={captureView}
-            onChange={(e) => setCaptureView(e.target.checked)}
-            style={{ marginRight: 6 }}
-          />
-          <span>Capture view</span>
-        </label>
-        {data.rawMesh && (
-          <label className="legend-item" style={{ cursor: 'pointer', marginBottom: 4 }}>
-            <input
-              type="checkbox"
-              checked={showRawMesh}
-              onChange={(e) => setShowRawMesh(e.target.checked)}
-              style={{ marginRight: 6 }}
-            />
-            <span>Raw mesh</span>
-          </label>
-        )}
+        <div style={{ display: 'flex', gap: 2, marginBottom: 6, background: 'rgba(0,0,0,0.3)', borderRadius: 5, padding: 2 }}>
+          {(['selection', 'plan', 'flight'] as ViewMode[]).map((mode) => (
+            <button
+              key={mode}
+              onClick={() => setViewMode(mode)}
+              style={{
+                flex: 1, fontSize: 10, padding: '3px 6px', border: 'none', borderRadius: 4, cursor: 'pointer',
+                background: viewMode === mode ? 'var(--accent)' : 'transparent',
+                color: viewMode === mode ? '#fff' : 'var(--fg3)',
+                fontWeight: viewMode === mode ? 600 : 400,
+              }}
+            >
+              {mode.charAt(0).toUpperCase() + mode.slice(1)}
+            </button>
+          ))}
+        </div>
         {Object.entries(directionGroups).map(([dir, g]) => {
-          const isActive = captureView && captureDir === dir;
+          const isActive = viewMode === 'flight' && captureDir === dir;
           return (
-            <div key={dir} className={`legend-item${captureView ? ' clickable' : ''}`}
-              onClick={captureView ? () => setCaptureDir(captureDir === dir ? null : dir) : undefined}
-              style={captureView ? { cursor: 'pointer' } : undefined}>
+            <div key={dir} className={`legend-item${viewMode === 'flight' ? ' clickable' : ''}`}
+              onClick={viewMode === 'flight' ? () => setCaptureDir(captureDir === dir ? null : dir) : undefined}
+              style={viewMode === 'flight' ? { cursor: 'pointer' } : undefined}>
               <span className="legend-dot" style={{
-                backgroundColor: isActive ? g.color : captureView ? '#333344' : g.color,
+                backgroundColor: isActive ? g.color : viewMode === 'flight' ? '#333344' : g.color,
                 boxShadow: isActive ? `0 0 6px ${g.color}` : undefined,
               }} />
-              <span style={{ color: isActive ? 'var(--fg)' : captureView ? 'var(--fg3)' : undefined }}>
+              <span style={{ color: isActive ? 'var(--fg)' : viewMode === 'flight' ? 'var(--fg3)' : undefined }}>
                 {dir} ({g.facades}f / {g.waypoints}wp)
               </span>
             </div>
           );
         })}
       </div>
+
+      {/* Selection mode HUD */}
+      {viewMode === 'selection' && (
+        <div style={{
+          position: 'absolute', bottom: 52, left: '50%', transform: 'translateX(-50%)',
+          background: 'rgba(15,23,42,0.9)', borderRadius: 8, padding: '6px 16px',
+          backdropFilter: 'blur(6px)', border: '1px solid rgba(255,255,255,0.1)',
+          fontSize: 12, color: '#94a3b8', whiteSpace: 'nowrap', zIndex: 10,
+        }}>
+          <span style={{ color: '#e2e8f0' }}>
+            {data.facades.filter((f) => !disabledFacades.has(f.index)).length}
+          </span>
+          {' / '}{data.facades.length} facades selected
+          {data.candidateFacades && data.candidateFacades.length > 0 && (
+            <span> · <span style={{ color: '#4ade80' }}>{enabledCandidates.size}</span> candidates added</span>
+          )}
+          <span style={{ marginLeft: 12, color: '#64748b' }}>Click to include/exclude</span>
+        </div>
+      )}
 
       {/* Playback controls */}
       <div className="playback-bar">

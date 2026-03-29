@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import math
 import time
+from pathlib import Path
 from typing import Literal, Optional
 
 from fastapi import APIRouter, Form, HTTPException, UploadFile
@@ -12,6 +13,7 @@ from fastapi.responses import Response
 from pydantic import BaseModel, Field
 
 from ..building_import import build_building_from_geojson, build_building_from_mesh
+from ..reconstruct import delete_task as delete_sim_task, get_task as get_sim_task, get_task_result as get_sim_result, list_tasks as list_sim_tasks, start_simulation_async
 from ..building_presets import (
     l_shaped_block,
     large_apartment_block,
@@ -25,6 +27,7 @@ from ..models import (
     AlgorithmConfig,
     CAMERAS,
     CameraName,
+    ExclusionZone,
     GIMBAL_PAN_MAX_DEG,
     GIMBAL_PAN_MIN_DEG,
     GIMBAL_TILT_MAX_DEG,
@@ -64,13 +67,15 @@ class MissionParams(BaseModel):
     camera: Literal["wide", "medium_tele", "telephoto"] = "wide"
     front_overlap: float = Field(0.80, ge=0.0, le=0.95)
     side_overlap: float = Field(0.70, ge=0.0, le=0.95)
-    flight_speed_ms: float = Field(3.0, ge=0.5, le=21.0)
+    flight_speed_ms: float = Field(2.0, ge=0.5, le=5.0)
     obstacle_clearance_m: float = Field(2.0, ge=1.0, le=20.0)
     mission_name: str = "AeroScan Inspection"
     # Advanced tunable constraints
     gimbal_pitch_margin_deg: float = Field(5.0, ge=0.0, le=15.0)
     min_photo_distance_m: float = Field(1.5, ge=0.5, le=5.0)
     yaw_rate_deg_per_s: float = Field(60.0, ge=30.0, le=120.0)
+    # Flight mode
+    stop_at_waypoint: bool = False  # False = fly-through (faster, M4E mech shutter)
     # DJI Pilot 2 safety defaults (operator can adjust before flying)
     rc_lost_action: str = "go_home"
     finish_action: str = "return_home"
@@ -110,6 +115,8 @@ class AlgorithmParams(BaseModel):
     enable_waypoint_los: bool = True
     los_tolerance_m: float = Field(0.5, ge=0.1, le=2.0)
     los_min_visible_ratio: float = Field(0.4, ge=0.1, le=1.0)
+    # Grid density
+    grid_density: float = Field(1.0, ge=0.25, le=4.0)
     # Path optimization
     enable_path_dedup: bool = True
     enable_path_tsp: bool = True
@@ -123,6 +130,20 @@ class AlgorithmParams(BaseModel):
         return AlgorithmConfig(**self.model_dump())
 
 
+class ExclusionZoneParam(BaseModel):
+    """A zone in ENU coordinates — box or arbitrary polygon."""
+    id: str = ""
+    label: str = ""
+    center_x: float = 0.0
+    center_y: float = 0.0
+    center_z: float = 0.0
+    size_x: float = Field(5.0, ge=0.1, le=500.0)
+    size_y: float = Field(5.0, ge=0.1, le=500.0)
+    size_z: float = Field(10.0, ge=0.1, le=500.0)
+    zone_type: Literal["no_fly", "no_inspect", "inclusion"] = "no_fly"
+    polygon_vertices: Optional[list[tuple[float, float]]] = None
+
+
 class GenerateRequest(BaseModel):
     preset: Optional[Literal[
         "simple_box", "pitched_roof_house", "l_shaped_block", "large_apartment_block"
@@ -134,6 +155,9 @@ class GenerateRequest(BaseModel):
     min_facade_area: float = Field(1.0, ge=0.1, le=50.0)
     extraction_method: str = "region_growing"
     waypoint_strategy: str = "facade_grid"  # "facade_grid" or "surface_sampling"
+    disabled_facades: list[int] = []
+    enabled_candidates: list[int] = []  # indices of rejected candidates to force-include
+    exclusion_zones: list[ExclusionZoneParam] = []
 
 
 class BuildingUploadRequest(BaseModel):
@@ -586,6 +610,7 @@ def generate(request: GenerateRequest):
         gimbal_pitch_margin_deg=request.mission.gimbal_pitch_margin_deg,
         min_photo_distance_m=request.mission.min_photo_distance_m,
         yaw_rate_deg_per_s=request.mission.yaw_rate_deg_per_s,
+        stop_at_waypoint=request.mission.stop_at_waypoint,
         rc_lost_action=request.mission.rc_lost_action,
         finish_action=request.mission.finish_action,
         takeoff_security_height_m=request.mission.takeoff_security_height_m,
@@ -593,10 +618,38 @@ def generate(request: GenerateRequest):
 
     t_building = time.perf_counter()
 
+    # Append enabled candidate facades (rejected during extraction but force-included by user)
+    if request.enabled_candidates:
+        from ..building_import import last_rejected_candidates
+        enabled_set = set(request.enabled_candidates)
+        next_idx = max((f.index for f in building.facades), default=-1) + 1
+        for candidate in last_rejected_candidates:
+            if candidate.index in enabled_set:
+                from copy import deepcopy
+                added = deepcopy(candidate)
+                added.index = next_idx
+                added.label = added.label.replace("candidate_", "added_")
+                building.facades.append(added)
+                next_idx += 1
+
+    # Convert exclusion zone params to domain objects
+    zones = [
+        ExclusionZone(
+            id=z.id, label=z.label,
+            center_x=z.center_x, center_y=z.center_y, center_z=z.center_z,
+            size_x=z.size_x, size_y=z.size_y, size_z=z.size_z,
+            zone_type=z.zone_type,
+            polygon_vertices=z.polygon_vertices,
+        )
+        for z in request.exclusion_zones
+    ]
+
     # Generate waypoints (pass mesh for LOS checks / surface sampling on mesh buildings)
     waypoints, generation_stats = generate_mission_waypoints(
         building, config, algo, mesh=mesh_obj,
         waypoint_strategy=request.waypoint_strategy,
+        disabled_facades=request.disabled_facades,
+        exclusion_zones=zones,
     )
 
     t_waypoints = time.perf_counter()
@@ -683,7 +736,10 @@ def generate(request: GenerateRequest):
     t_summary = time.perf_counter()
 
     # Validate mission against hardware constraints
-    validation = validate_mission(waypoints, config, building, algo)
+    validation = validate_mission(
+        waypoints, config, building, algo,
+        exclusion_zones=zones, generation_stats=generation_stats,
+    )
     validation_data = [
         {"severity": v.severity, "code": v.code, "message": v.message,
          "waypoint_indices": v.waypoint_indices, "facade_index": v.facade_index}
@@ -691,8 +747,9 @@ def generate(request: GenerateRequest):
     ]
     has_errors = any(v.severity == "error" for v in validation)
 
-    # Prepare viewer data
-    threejs_data = prepare_threejs_data(building, waypoints)
+    # Prepare viewer data (include rejected facade candidates for manual enabling)
+    from ..building_import import last_rejected_candidates
+    threejs_data = prepare_threejs_data(building, waypoints, candidate_facades=last_rejected_candidates)
     if raw_mesh:
         threejs_data["rawMesh"] = raw_mesh
 
@@ -711,6 +768,12 @@ def generate(request: GenerateRequest):
         summary=summary,
         viewer_data=viewer_data,
         algo=algo,
+        selection={
+            "building_id": request.building_id,
+            "disabled_facades": request.disabled_facades,
+            "enabled_candidates": request.enabled_candidates,
+            "exclusion_zones": [z.model_dump() for z in request.exclusion_zones],
+        },
     )
 
     t_end = time.perf_counter()
@@ -746,6 +809,11 @@ def generate(request: GenerateRequest):
             "building": request.building.model_dump(),
             "mission": request.mission.model_dump(),
             "algorithm": request.algorithm.model_dump(),
+            "building_id": request.building_id,
+            "preset": request.preset,
+            "disabled_facades": request.disabled_facades,
+            "enabled_candidates": request.enabled_candidates,
+            "exclusion_zones": [z.model_dump() for z in request.exclusion_zones],
         },
     }
 
@@ -768,6 +836,7 @@ def get_version(version_id: str):
         "config_snapshot": {
             "building": version.building_params,
             "mission": version.mission_params,
+            **(version.selection or {}),
         },
     }
 
@@ -799,3 +868,337 @@ def delete_version(version_id: str):
 def delete_all_versions():
     count = session.clear()
     return {"deleted": count}
+
+
+@router.get("/analyze/{version_id}")
+def analyze_version(version_id: str):
+    """Analyze a generated mission for quality issues.
+
+    Returns structured diagnostics about waypoint quality, path efficiency,
+    coverage gaps, and potential improvements. Designed for dev tooling.
+    """
+    version = session.get(version_id)
+    if not version:
+        raise HTTPException(status_code=404, detail="Version not found")
+
+    waypoints = version.waypoints
+    building = version.building
+    config = version.config
+
+    issues: list[dict] = []
+    stats: dict = {}
+
+    # --- 1. Duplicate / near-duplicate waypoints ---
+    near_dupes = []
+    for i in range(len(waypoints)):
+        for j in range(i + 1, min(i + 5, len(waypoints))):  # check nearby in sequence
+            a, b = waypoints[i], waypoints[j]
+            if a.is_transition or b.is_transition:
+                continue
+            dist = math.sqrt((a.x - b.x) ** 2 + (a.y - b.y) ** 2 + (a.z - b.z) ** 2)
+            if dist < 0.5:
+                near_dupes.append({
+                    "wp_a": i, "wp_b": j, "distance_m": round(dist, 2),
+                    "same_facade": a.facade_index == b.facade_index,
+                    "heading_diff": round(abs(a.heading_deg - b.heading_deg) % 360, 1),
+                })
+    if near_dupes:
+        issues.append({
+            "type": "near_duplicate_waypoints",
+            "severity": "warning",
+            "count": len(near_dupes),
+            "message": f"{len(near_dupes)} waypoint pairs within 0.5m of each other",
+            "details": near_dupes[:10],
+        })
+
+    # --- 2. Heading vs gimbal misalignment ---
+    # The camera arrow should point toward the facade. If heading and gimbal
+    # direction don't align with the facade normal, the photo won't be perpendicular.
+    misaligned = []
+    for wp in waypoints:
+        if wp.is_transition or wp.facade_index < 0:
+            continue
+        if wp.facade_index >= len(building.facades):
+            continue
+        facade = building.facades[wp.facade_index]
+        # Expected heading: opposite of facade normal
+        expected_heading = math.degrees(math.atan2(facade.normal[0], facade.normal[1])) % 360
+        expected_heading = (expected_heading + 180) % 360
+        heading_diff = abs(wp.heading_deg - expected_heading)
+        if heading_diff > 180:
+            heading_diff = 360 - heading_diff
+        if heading_diff > 30:
+            misaligned.append({
+                "wp": wp.index, "facade": wp.facade_index,
+                "actual_heading": round(wp.heading_deg, 1),
+                "expected_heading": round(expected_heading, 1),
+                "diff_deg": round(heading_diff, 1),
+            })
+    if misaligned:
+        issues.append({
+            "type": "heading_misalignment",
+            "severity": "warning",
+            "count": len(misaligned),
+            "message": f"{len(misaligned)} waypoints with heading >30° off from facade normal",
+            "details": misaligned[:10],
+        })
+
+    # --- 3. Back-and-forth detection ---
+    # Find sequences where the drone reverses direction (angle > 150°)
+    reversals = []
+    for i in range(2, len(waypoints)):
+        a, b, c = waypoints[i - 2], waypoints[i - 1], waypoints[i]
+        if a.is_transition or b.is_transition or c.is_transition:
+            continue
+        dx1, dy1 = b.x - a.x, b.y - a.y
+        dx2, dy2 = c.x - b.x, c.y - b.y
+        len1 = math.sqrt(dx1 * dx1 + dy1 * dy1)
+        len2 = math.sqrt(dx2 * dx2 + dy2 * dy2)
+        if len1 < 0.1 or len2 < 0.1:
+            continue
+        cos_angle = (dx1 * dx2 + dy1 * dy2) / (len1 * len2)
+        cos_angle = max(-1.0, min(1.0, cos_angle))
+        angle = math.degrees(math.acos(cos_angle))
+        if angle > 150:
+            reversals.append({
+                "wp": i - 1, "angle_deg": round(angle, 1),
+                "facade": b.facade_index,
+            })
+    if reversals:
+        issues.append({
+            "type": "path_reversal",
+            "severity": "info",
+            "count": len(reversals),
+            "message": f"{len(reversals)} sharp reversals (>150°) in flight path",
+            "details": reversals[:10],
+        })
+
+    # --- 4. Facade coverage analysis ---
+    facade_coverage = {}
+    for f in building.facades:
+        wps_on_facade = [wp for wp in waypoints if wp.facade_index == f.index and not wp.is_transition]
+        facade_coverage[f.index] = {
+            "label": f.label,
+            "component": f.component_tag,
+            "area_m2": round(f.width * f.height, 1),
+            "waypoint_count": len(wps_on_facade),
+            "covered": len(wps_on_facade) > 0,
+        }
+    uncovered = [fc for fc in facade_coverage.values() if not fc["covered"]]
+    if uncovered:
+        issues.append({
+            "type": "uncovered_facades",
+            "severity": "warning",
+            "count": len(uncovered),
+            "message": f"{len(uncovered)} facades have no waypoints (not inspected)",
+            "details": uncovered,
+        })
+
+    # --- 5. Flight efficiency ---
+    inspection_wps = [wp for wp in waypoints if not wp.is_transition]
+    transition_wps = [wp for wp in waypoints if wp.is_transition]
+    total_dist = sum(
+        math.sqrt(
+            (waypoints[i].x - waypoints[i - 1].x) ** 2 +
+            (waypoints[i].y - waypoints[i - 1].y) ** 2 +
+            (waypoints[i].z - waypoints[i - 1].z) ** 2
+        )
+        for i in range(1, len(waypoints))
+    )
+    inspect_dist = 0.0
+    transit_dist = 0.0
+    for i in range(1, len(waypoints)):
+        d = math.sqrt(
+            (waypoints[i].x - waypoints[i - 1].x) ** 2 +
+            (waypoints[i].y - waypoints[i - 1].y) ** 2 +
+            (waypoints[i].z - waypoints[i - 1].z) ** 2
+        )
+        if waypoints[i].is_transition or waypoints[i - 1].is_transition:
+            transit_dist += d
+        else:
+            inspect_dist += d
+
+    stats = {
+        "total_waypoints": len(waypoints),
+        "inspection_waypoints": len(inspection_wps),
+        "transition_waypoints": len(transition_wps),
+        "total_path_m": round(total_dist, 1),
+        "inspection_path_m": round(inspect_dist, 1),
+        "transit_path_m": round(transit_dist, 1),
+        "efficiency_pct": round(inspect_dist / total_dist * 100, 1) if total_dist > 0 else 0,
+        "facades_total": len(building.facades),
+        "facades_covered": sum(1 for fc in facade_coverage.values() if fc["covered"]),
+        "facades_uncovered": len(uncovered),
+        "facade_coverage": facade_coverage,
+    }
+
+    return {
+        "version_id": version_id,
+        "issues": issues,
+        "issue_count": {"warning": sum(1 for i in issues if i["severity"] == "warning"),
+                        "info": sum(1 for i in issues if i["severity"] == "info")},
+        "stats": stats,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Simulate reconstruction
+# ---------------------------------------------------------------------------
+
+class SimulateRequest(BaseModel):
+    version_id: Optional[str] = None  # uses latest if omitted
+    render_scale: float = Field(0.1, ge=0.02, le=0.5)
+    voxel_size: float = Field(0.03, ge=0.005, le=0.2)
+
+
+@router.get("/simulate-reconstruct")
+def list_simulations():
+    """List all simulation tasks."""
+    return {"tasks": list_sim_tasks()}
+
+
+@router.post("/simulate-reconstruct")
+def simulate_reconstruct(request: SimulateRequest):
+    """Start a simulated reconstruction from a generated mission.
+
+    Renders synthetic photos from each waypoint, reconstructs via TSDF,
+    and reimports the mesh. Runs in background — poll via GET.
+    """
+    import secrets
+
+    # Resolve version
+    vid = request.version_id
+    if not vid:
+        versions = session.list_versions()
+        if not versions:
+            raise HTTPException(status_code=400, detail="No mission versions — generate a mission first")
+        vid = versions[0]["version_id"]
+
+    version = session.get(vid)
+    if not version:
+        raise HTTPException(status_code=404, detail="Version not found")
+
+    task_id = f"sim_{secrets.token_hex(4)}"
+
+    # Get the raw mesh — the ACTUAL building geometry the drone camera would see.
+    # Try three sources in order: viewer_data, config_snapshot building_id → DB, building object.
+    import logging
+    _log = logging.getLogger(__name__)
+
+    raw_mesh = version.viewer_data.get("threejs", {}).get("rawMesh")
+
+    if not raw_mesh:
+        # Viewer data didn't have it — look up the original mesh from the database
+        building_id = None
+        if hasattr(version, "building_params"):
+            building_id = version.building_params.get("building_id")
+        # Also check config_snapshot (newer versions store it there)
+        cs = getattr(version, "selection", None) or {}
+        if not building_id and isinstance(cs, dict):
+            building_id = cs.get("building_id")
+
+        if building_id:
+            db = get_db()
+            try:
+                record = db.query(BuildingRecord).filter_by(id=building_id).first()
+                if record and record.properties_json:
+                    props = json.loads(record.properties_json)
+                    raw_mesh = props.get("mesh_viewer")
+            finally:
+                db.close()
+
+    if not raw_mesh:
+        # Last resort: check building._mesh_viewer_data (set during build_building_from_mesh)
+        raw_mesh = getattr(version.building, "_mesh_viewer_data", None)
+
+    if raw_mesh:
+        n_verts = len(raw_mesh.get("positions", [])) // 3
+        n_faces = len(raw_mesh.get("indices", [])) // 3
+        _log.info(f"Simulation: using raw mesh ({n_verts} verts, {n_faces} faces)")
+    else:
+        _log.info("Simulation: no raw mesh — using facade slab fallback")
+
+    start_simulation_async(
+        building=version.building,
+        waypoints=version.waypoints,
+        config=version.config,
+        algo=version.algo,
+        task_id=task_id,
+        version_id=vid,
+        render_scale=request.render_scale,
+        voxel_size=request.voxel_size,
+        raw_mesh=raw_mesh,
+    )
+
+    return {"task_id": task_id, "status": "started", "source_version": vid}
+
+
+@router.get("/simulate-reconstruct/{task_id}")
+def get_simulation(task_id: str):
+    """Poll simulation progress / get results. Checks memory first, then DB."""
+    task = get_sim_task(task_id)
+    if task:
+        resp = {
+            "task_id": task.task_id,
+            "status": task.status,
+            "progress": round(task.progress, 3),
+            "message": task.message,
+        }
+        if task.status == "complete" and task.result:
+            resp["result"] = task.result
+        elif task.status == "error":
+            resp["error"] = task.error
+        return resp
+
+    # Not in memory — try database (completed task from a previous session)
+    db_result = get_sim_result(task_id)
+    if db_result:
+        return {
+            "task_id": task_id,
+            "status": "complete",
+            "progress": 1.0,
+            "message": "Loaded from database",
+            "result": db_result,
+        }
+
+    raise HTTPException(status_code=404, detail="Simulation task not found")
+
+
+@router.get("/simulate-reconstruct/{task_id}/photos")
+def get_simulation_photos(task_id: str):
+    """Serve the list of rendered photo paths for a simulation."""
+    task = get_sim_task(task_id)
+    if not task or task.status != "complete" or not task.result:
+        raise HTTPException(status_code=404, detail="No completed simulation found")
+    return {
+        "photos": task.result.get("photos", []),
+        "total": task.result.get("photos_total", 0),
+        "output_dir": task.result.get("output_dir", ""),
+    }
+
+
+@router.get("/simulate-reconstruct/{task_id}/photo/{wp_index}")
+def get_simulation_photo(task_id: str, wp_index: int):
+    """Serve a specific rendered photo as PNG."""
+    task = get_sim_task(task_id)
+    if not task or task.status != "complete" or not task.result:
+        raise HTTPException(status_code=404, detail="No completed simulation found")
+
+    output_dir = task.result.get("output_dir", "")
+    img_path = Path(output_dir) / "images" / f"wp_{wp_index:04d}.png"
+    if not img_path.exists():
+        raise HTTPException(status_code=404, detail=f"Photo wp_{wp_index:04d}.png not found")
+
+    return Response(
+        content=img_path.read_bytes(),
+        media_type="image/png",
+        headers={"Content-Disposition": f'inline; filename="wp_{wp_index:04d}.png"'},
+    )
+
+
+@router.delete("/simulate-reconstruct/{task_id}")
+def delete_simulation(task_id: str):
+    """Delete a simulation task and all its output files."""
+    if not delete_sim_task(task_id):
+        raise HTTPException(status_code=404, detail="Simulation task not found")
+    return {"deleted": task_id}

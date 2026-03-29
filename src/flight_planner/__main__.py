@@ -9,6 +9,7 @@ def main():
         host="0.0.0.0",
         port=8111,
         reload=True,
+        reload_excludes=["sim_output/*", "*.ply", "*.png"],
     )
 
 

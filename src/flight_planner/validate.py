@@ -11,6 +11,7 @@ from enum import Enum
 
 from .models import (
     AlgorithmConfig,
+    ExclusionZone,
     GIMBAL_PAN_MAX_DEG,
     GIMBAL_PAN_MIN_DEG,
     GIMBAL_TILT_MAX_DEG,
@@ -46,6 +47,8 @@ def validate_mission(
     config: MissionConfig,
     building: Building | None = None,
     algo: AlgorithmConfig | None = None,
+    exclusion_zones: list[ExclusionZone] | None = None,
+    generation_stats: dict | None = None,
 ) -> list[ValidationIssue]:
     """Validate a generated mission against hardware and quality constraints.
 
@@ -201,6 +204,35 @@ def validate_mission(
                         facade_index=wp.facade_index,
                     ))
                     break  # don't repeat
+
+    # Exclusion zone info
+    zones = exclusion_zones or []
+    stats = generation_stats or {}
+    zone_removed = stats.get("waypoints_removed_by_zones", 0)
+    if zone_removed > 0:
+        no_fly_count = sum(1 for z in zones if z.zone_type == "no_fly")
+        no_inspect_count = sum(1 for z in zones if z.zone_type == "no_inspect")
+        inclusion_count = sum(1 for z in zones if z.zone_type == "inclusion")
+        zone_desc = []
+        if no_fly_count:
+            zone_desc.append(f"{no_fly_count} no-fly")
+        if no_inspect_count:
+            zone_desc.append(f"{no_inspect_count} no-inspect")
+        if inclusion_count:
+            zone_desc.append(f"{inclusion_count} geofence")
+        issues.append(ValidationIssue(
+            severity=Severity.INFO,
+            code="exclusion_zone_filtered",
+            message=f"{zone_removed} waypoints removed by {', '.join(zone_desc)} zone(s)",
+        ))
+
+    disabled = stats.get("disabled_facades", [])
+    if disabled:
+        issues.append(ValidationIssue(
+            severity=Severity.INFO,
+            code="facades_disabled",
+            message=f"{len(disabled)} facade(s) disabled by user — no waypoints generated for them",
+        ))
 
     # Sort: errors first, then warnings, then info
     issues.sort(key=lambda i: {"error": 0, "warning": 1, "info": 2}[i.severity])

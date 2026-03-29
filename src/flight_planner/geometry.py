@@ -21,6 +21,7 @@ from .models import (
     Building,
     CameraAction,
     CameraName,
+    ExclusionZone,
     Facade,
     GIMBAL_TILT_MAX_DEG,
     GIMBAL_TILT_MIN_DEG,
@@ -204,6 +205,48 @@ def build_rectangular_building(
     return building
 
 
+def _generate_boustrophedon_grid(
+    u_start: float, v_start: float,
+    h_step: float, v_step: float,
+    n_cols: int, n_rows: int,
+    center: np.ndarray, u_axis: np.ndarray, v_axis: np.ndarray,
+    offset: np.ndarray, min_altitude: float,
+) -> list[tuple[float, float]]:
+    """Generate (u, v) photo positions on a facade in boustrophedon order.
+
+    Industry-standard lawnmower S-pattern used by Pix4D, DJI, Hammer Missions.
+    Grid density is controlled by GSD/overlap and grid_density multiplier.
+
+    Skips rows that collapse to the same camera altitude (min_altitude clamp).
+    """
+    # Pre-compute which rows produce unique camera altitudes.
+    # For horizontal surfaces (roofs), all rows share the same altitude
+    # by design — skip dedup so we get full 2D grid coverage.
+    is_horizontal = abs(offset[2]) > np.linalg.norm(offset) * 0.99
+    valid_rows: list[float] = []
+    prev_z = None
+    for row in range(n_rows):
+        v_pos = v_start + row * v_step
+        if is_horizontal:
+            valid_rows.append(v_pos)
+            continue
+        sample = center + u_start * u_axis + v_pos * v_axis
+        cam_z = max(float((sample + offset)[2]), min_altitude)
+        if prev_z is None or abs(cam_z - prev_z) >= 0.01:
+            valid_rows.append(v_pos)
+            prev_z = cam_z
+
+    cols = [u_start + c * h_step for c in range(n_cols)]
+
+    # Rectangular grid, boustrophedon traversal (S-pattern)
+    points = []
+    for i, v_pos in enumerate(valid_rows):
+        col_range = range(n_cols) if i % 2 == 0 else range(n_cols - 1, -1, -1)
+        for col in col_range:
+            points.append((cols[col], v_pos))
+    return points
+
+
 def generate_waypoints_for_facade(
     facade: Facade,
     config: MissionConfig,
@@ -227,6 +270,11 @@ def generate_waypoints_for_facade(
 
     footprint = compute_footprint(camera, distance)
     h_step, v_step = compute_grid_spacing(footprint, config.front_overlap, config.side_overlap)
+
+    # Apply density multiplier (>1 = more points, tighter grid; <1 = fewer points)
+    if algo.grid_density > 0 and algo.grid_density != 1.0:
+        h_step /= algo.grid_density
+        v_step /= algo.grid_density
 
     # Build a local coordinate frame on the facade surface
     # u_axis: horizontal direction along the facade
@@ -289,6 +337,13 @@ def generate_waypoints_for_facade(
     u_start = (u_min + u_max) / 2 - u_total / 2
     v_start = (v_min + v_max) / 2 - v_total / 2
 
+    # Generate (u, v) grid positions in boustrophedon order
+    uv_points = _generate_boustrophedon_grid(
+        u_start, v_start,
+        h_step, v_step, n_cols, n_rows,
+        center, u_axis, v_axis, normal * distance, algo.min_altitude_m,
+    )
+
     # Compute camera orientation
     # Aircraft heading: face the surface normal (nose toward facade)
     heading_deg = float(math.degrees(math.atan2(normal[0], normal[1])) % 360)
@@ -302,6 +357,9 @@ def generate_waypoints_for_facade(
     # Offset vector from facade surface to camera position
     offset = normal * distance
 
+    # Normal orientation is handled during facade extraction (centroid check +
+    # fix_normals on mesh load). No additional check needed here.
+
     # LOS sample offsets for multi-ray visibility check
     _los_samples = None
     if mesh is not None and algo.enable_waypoint_los:
@@ -314,101 +372,98 @@ def generate_waypoints_for_facade(
         ]
 
     waypoints = []
-    for row in range(n_rows):
-        v_pos = v_start + row * v_step
+    for u_pos, v_pos in uv_points:
+        # Target point on the facade surface
+        target_pos = center + u_pos * u_axis + v_pos * v_axis
+        # Camera position (offset from surface along normal)
+        cam_pos = target_pos + offset
 
-        # Boustrophedon: reverse column order on odd rows
-        col_range = range(n_cols) if row % 2 == 0 else range(n_cols - 1, -1, -1)
+        # Ensure minimum altitude
+        if cam_pos[2] < algo.min_altitude_m:
+            cam_pos[2] = algo.min_altitude_m
 
-        for col in col_range:
-            u_pos = u_start + col * h_step
+        # Line-of-sight check: cast rays from camera to facade sample
+        # points and skip waypoints where the mesh blocks the view.
+        if _los_samples is not None:
+            origins = []
+            directions = []
+            ray_lengths = []
+            for s_off in _los_samples:
+                sample_target = target_pos + s_off
+                ray_vec = sample_target - cam_pos
+                ray_len = float(np.linalg.norm(ray_vec))
+                if ray_len < 1e-6:
+                    continue
+                origins.append(cam_pos.copy())
+                directions.append(ray_vec / ray_len)
+                ray_lengths.append(ray_len)
 
-            # Target point on the facade surface
-            target_pos = center + u_pos * u_axis + v_pos * v_axis
-            # Camera position (offset from surface along normal)
-            cam_pos = target_pos + offset
+            if origins:
+                hits, idx_ray, _ = mesh.ray.intersects_location(
+                    ray_origins=np.array(origins),
+                    ray_directions=np.array(directions),
+                )
+                n_visible = len(origins)
+                tol = algo.los_tolerance_m
+                for ri in range(len(origins)):
+                    mask = idx_ray == ri
+                    if mask.any():
+                        hit_dists = np.linalg.norm(
+                            hits[mask] - origins[ri], axis=1
+                        )
+                        if float(hit_dists.min()) < ray_lengths[ri] - tol:
+                            n_visible -= 1
 
-            # Ensure minimum altitude
-            if cam_pos[2] < algo.min_altitude_m:
-                cam_pos[2] = algo.min_altitude_m
+                if n_visible < len(origins) * algo.los_min_visible_ratio:
+                    continue  # too much of the view is blocked
 
-            # Line-of-sight check: cast rays from camera to facade sample
-            # points and skip waypoints where the mesh blocks the view.
-            if _los_samples is not None:
-                origins = []
-                directions = []
-                ray_lengths = []
-                for s_off in _los_samples:
-                    sample_target = target_pos + s_off
-                    ray_vec = sample_target - cam_pos
-                    ray_len = float(np.linalg.norm(ray_vec))
-                    if ray_len < 1e-6:
-                        continue
-                    origins.append(cam_pos.copy())
-                    directions.append(ray_vec / ray_len)
-                    ray_lengths.append(ray_len)
+        # Per-waypoint look-at vector: from camera to target surface point
+        look = target_pos - cam_pos
+        horiz_mag = math.sqrt(look[0] ** 2 + look[1] ** 2)
 
-                if origins:
-                    hits, idx_ray, _ = mesh.ray.intersects_location(
-                        ray_origins=np.array(origins),
-                        ray_directions=np.array(directions),
-                    )
-                    n_visible = len(origins)
-                    tol = algo.los_tolerance_m
-                    for ri in range(len(origins)):
-                        mask = idx_ray == ri
-                        if mask.any():
-                            hit_dists = np.linalg.norm(
-                                hits[mask] - origins[ri], axis=1
-                            )
-                            if float(hit_dists.min()) < ray_lengths[ri] - tol:
-                                n_visible -= 1
+        # Heading: face toward the target point
+        wp_heading = float(math.degrees(math.atan2(look[0], look[1])) % 360)
 
-                    if n_visible < len(origins) * algo.los_min_visible_ratio:
-                        continue  # too much of the view is blocked
+        # Gimbal pitch: angle from horizontal to look direction
+        wp_pitch = math.degrees(math.atan2(look[2], horiz_mag)) if horiz_mag > 1e-6 else -90.0
+        wp_pitch = max(pitch_min, min(pitch_max, wp_pitch))
 
-            # Per-waypoint look-at vector: from camera to target surface point
-            look = target_pos - cam_pos
-            horiz_mag = math.sqrt(look[0] ** 2 + look[1] ** 2)
+        actions = [
+            CameraAction(
+                action_type=ActionType.TAKE_PHOTO,
+                camera=config.camera,
+            ),
+        ]
 
-            # Heading: face toward the target point
-            wp_heading = float(math.degrees(math.atan2(look[0], look[1])) % 360)
+        wp = Waypoint(
+            x=float(cam_pos[0]),
+            y=float(cam_pos[1]),
+            z=float(cam_pos[2]),
+            heading_deg=wp_heading,
+            gimbal_pitch_deg=wp_pitch,
+            speed_ms=config.flight_speed_ms,
+            actions=actions,
+            facade_index=facade.index,
+            component_tag=facade.component_tag,
+        )
+        waypoints.append(wp)
 
-            # Gimbal pitch: angle from horizontal to look direction
-            wp_pitch = math.degrees(math.atan2(look[2], horiz_mag)) if horiz_mag > 1e-6 else -90.0
-            wp_pitch = max(pitch_min, min(pitch_max, wp_pitch))
-
-            actions = [
-                CameraAction(
-                    action_type=ActionType.TAKE_PHOTO,
-                    camera=config.camera,
-                ),
-            ]
-
-            wp = Waypoint(
-                x=float(cam_pos[0]),
-                y=float(cam_pos[1]),
-                z=float(cam_pos[2]),
-                heading_deg=wp_heading,
-                gimbal_pitch_deg=wp_pitch,
-                speed_ms=config.flight_speed_ms,
-                actions=actions,
-                facade_index=facade.index,
-                component_tag=facade.component_tag,
-            )
-            waypoints.append(wp)
-
-    # Deduplicate waypoints closer than min_photo_distance
-    if len(waypoints) > 1 and config.min_photo_distance_m > 0:
-        deduped = [waypoints[0]]
-        for wp in waypoints[1:]:
-            prev = deduped[-1]
-            dist = math.sqrt(
-                (wp.x - prev.x) ** 2 + (wp.y - prev.y) ** 2 + (wp.z - prev.z) ** 2
-            )
-            if dist >= config.min_photo_distance_m:
-                deduped.append(wp)
-        waypoints = deduped
+    # Spatial dedup using scipy KDTree — removes exact overlaps efficiently
+    if len(waypoints) > 1:
+        from scipy.spatial import KDTree
+        positions = np.array([[wp.x, wp.y, wp.z] for wp in waypoints])
+        tree = KDTree(positions)
+        groups = tree.query_ball_point(positions, r=0.01)  # 1cm threshold
+        keep: set[int] = set()
+        removed: set[int] = set()
+        for i, g in enumerate(groups):
+            if i not in removed:
+                keep.add(i)
+                for j in g:
+                    if j != i:
+                        removed.add(j)
+        if removed:
+            waypoints = [waypoints[i] for i in sorted(keep)]
 
     return waypoints
 
@@ -571,24 +626,16 @@ def _generate_surface_sample_waypoints(
     points, face_indices = mesh.sample(algo.surface_sample_count, return_index=True)
     normals = mesh.face_normals[face_indices].copy()
 
-    # 2. Orient normals outward (away from mesh centroid)
+    # 2. Orient normals outward (away from mesh centroid, then ray-validate)
     centroid = mesh.centroid
     to_point = points - centroid
     flip_mask = np.einsum('ij,ij->i', normals, to_point) < 0
     normals[flip_mask] *= -1
 
-    # 3. Filter surfaces that can't produce useful photos
-    keep = (
-        (normals[:, 2] >= algo.downward_face_threshold)
-        & (points[:, 2] >= algo.ground_level_threshold_m)
-    )
-    points = points[keep]
-    normals = normals[keep]
-    n_filtered = int((~keep).sum())
+    n_filtered = 0
 
-    # 4. Filter interior faces: cast ray from surface along outward normal.
-    #    Exterior faces escape to open air; interior faces hit the outer
-    #    shell nearby. Same logic as facade extraction's occlusion check.
+    # Filter interior faces: cast ray from surface along outward normal.
+    # Exterior faces escape to open air; interior faces hit the building nearby.
     if len(points) > 0:
         offset = algo.occlusion_ray_offset_m
         ray_origins = points + normals * offset
@@ -609,10 +656,18 @@ def _generate_surface_sample_waypoints(
                     ).min())
                     if min_dist < hit_threshold:
                         exterior_mask[i] = False
-        n_interior = int((~exterior_mask).sum())
-        n_filtered += n_interior
+        n_filtered += int((~exterior_mask).sum())
         points = points[exterior_mask]
         normals = normals[exterior_mask]
+
+    # 3. Filter surfaces that can't produce useful photos
+    keep = (
+        (normals[:, 2] >= algo.downward_face_threshold)
+        & (points[:, 2] >= algo.ground_level_threshold_m)
+    )
+    points = points[keep]
+    normals = normals[keep]
+    n_filtered += int((~keep).sum())
 
     # 5. Compute camera positions
     cam_positions = points + normals * distance
@@ -764,12 +819,60 @@ def _generate_surface_sample_waypoints(
     return facade_groups, stats
 
 
+def _filter_waypoints_by_exclusion_zones(
+    waypoints: list[Waypoint],
+    zones: list[ExclusionZone],
+    filter_transitions: bool = True,
+) -> tuple[list[Waypoint], int]:
+    """Remove waypoints that fall inside exclusion zones.
+
+    Args:
+        waypoints: List of waypoints to filter.
+        zones: Exclusion zones to check against.
+        filter_transitions: If True, also filter transition waypoints (for no_fly zones).
+
+    Returns:
+        (filtered_waypoints, removed_count)
+    """
+    if not zones:
+        return waypoints, 0
+
+    exclusion_zones = [z for z in zones if z.zone_type != "inclusion"]
+    inclusion_zones = [z for z in zones if z.zone_type == "inclusion"]
+
+    filtered = []
+    removed = 0
+    for wp in waypoints:
+        # Inclusion zones: waypoint must be inside at least one (geofence)
+        if inclusion_zones and not any(z.contains_point(wp.x, wp.y, wp.z) for z in inclusion_zones):
+            removed += 1
+            continue
+
+        # Exclusion zones: remove waypoints inside forbidden volumes
+        inside = False
+        for zone in exclusion_zones:
+            if zone.contains_point(wp.x, wp.y, wp.z):
+                if zone.zone_type == "no_fly" and (filter_transitions or not wp.is_transition):
+                    inside = True
+                    break
+                elif zone.zone_type == "no_inspect" and not wp.is_transition:
+                    inside = True
+                    break
+        if inside:
+            removed += 1
+        else:
+            filtered.append(wp)
+    return filtered, removed
+
+
 def generate_mission_waypoints(
     building: Building,
     config: MissionConfig,
     algo: AlgorithmConfig | None = None,
     mesh: object | None = None,
     waypoint_strategy: str = "facade_grid",
+    disabled_facades: list[int] | None = None,
+    exclusion_zones: list[ExclusionZone] | None = None,
 ) -> tuple[list[Waypoint], dict]:
     """Generate all waypoints for a building inspection mission.
 
@@ -777,10 +880,17 @@ def generate_mission_waypoints(
     - "facade_grid": per-facade boustrophedon grid (default, works for all buildings)
     - "surface_sampling": uniform mesh surface sampling (mesh buildings only)
 
+    Args:
+        disabled_facades: Facade indices to skip (no waypoints generated).
+        exclusion_zones: 3D volumes where waypoints are removed.
+
     Returns (waypoints, stats) where stats contains generation metrics.
     """
     if algo is None:
         algo = AlgorithmConfig()
+
+    disabled_set = set(disabled_facades or [])
+    zones = exclusion_zones or []
 
     surface_stats = None
     total_before_dedup = 0
@@ -796,6 +906,8 @@ def generate_mission_waypoints(
         facade_groups = []
 
         for facade in building.facades:
+            if facade.index in disabled_set:
+                continue
             facade_wps = generate_waypoints_for_facade(facade, config, algo, mesh=mesh)
             before = len(facade_wps)
             total_before_dedup += before
@@ -825,6 +937,35 @@ def generate_mission_waypoints(
     all_waypoints: list[Waypoint] = []
     for group in facade_groups:
         all_waypoints.extend(group)
+
+    # Filter waypoints inside exclusion zones
+    zone_removed = 0
+    if zones:
+        all_waypoints, zone_removed = _filter_waypoints_by_exclusion_zones(
+            all_waypoints, zones,
+        )
+
+    # Filter waypoints inside the building envelope (convex hull is watertight)
+    mesh_removed = 0
+    if mesh is not None and hasattr(mesh, 'convex_hull') and len(all_waypoints) > 0:
+        positions = np.array([[wp.x, wp.y, wp.z] for wp in all_waypoints])
+        inside = mesh.convex_hull.contains(positions)
+        mesh_removed = int(inside.sum())
+        if mesh_removed > 0:
+            all_waypoints = [wp for wp, is_inside in zip(all_waypoints, inside) if not is_inside]
+
+    # Enforce minimum clearance from ALL mesh surfaces (not just own facade).
+    # OA is disabled during close-proximity inspection — the flight plan is
+    # the safety layer. Uses trimesh proximity to find nearest surface point.
+    clearance_removed = 0
+    min_clearance = config.obstacle_clearance_m
+    if mesh is not None and len(all_waypoints) > 0:
+        positions = np.array([[wp.x, wp.y, wp.z] for wp in all_waypoints])
+        closest_points, distances, _ = mesh.nearest.on_surface(positions)
+        too_close = distances < min_clearance
+        clearance_removed = int(too_close.sum())
+        if clearance_removed > 0:
+            all_waypoints = [wp for wp, close in zip(all_waypoints, too_close) if not close]
 
     total_after = len(all_waypoints)
 
@@ -857,6 +998,15 @@ def generate_mission_waypoints(
     else:
         stats["waypoints_before_dedup"] = total_before_dedup
         stats["per_facade"] = per_facade_stats
+
+    if disabled_set:
+        stats["disabled_facades"] = sorted(disabled_set)
+    if zone_removed > 0:
+        stats["waypoints_removed_by_zones"] = zone_removed
+    if mesh_removed > 0:
+        stats["waypoints_removed_inside_mesh"] = mesh_removed
+    if clearance_removed > 0:
+        stats["waypoints_removed_too_close"] = clearance_removed
 
     return all_waypoints, stats
 

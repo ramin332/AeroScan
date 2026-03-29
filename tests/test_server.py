@@ -139,7 +139,7 @@ class TestDrone:
     def test_drone_cameras_have_specs(self):
         r = client.get("/api/drone")
         cam = r.json()["cameras"]["wide"]
-        assert cam["focal_length_mm"] == 24
+        assert cam["focal_length_mm"] == 12.0
         assert cam["image_width_px"] == 5280
 
 

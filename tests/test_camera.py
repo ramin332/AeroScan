@@ -14,9 +14,9 @@ from flight_planner.models import CAMERAS, CameraName
 
 class TestGSD:
     def test_gsd_at_known_distance(self):
-        """At 14.6m, wide camera should give ~2 mm/px GSD."""
+        """At 7.3m, wide camera (actual FL=12mm) should give ~2 mm/px GSD."""
         camera = get_camera(CameraName.WIDE)
-        gsd = compute_gsd(camera, 14.6)
+        gsd = compute_gsd(camera, 7.3)
         assert abs(gsd - 2.0) < 0.1
 
     def test_gsd_increases_with_distance(self):
@@ -36,11 +36,11 @@ class TestGSD:
 
 class TestDistanceForGSD:
     def test_wide_2mm_gsd(self):
-        """Wide camera at 2mm/px GSD should need ~14.6m distance."""
+        """Wide camera at 2mm/px GSD should need ~7.3m distance."""
         camera = get_camera(CameraName.WIDE)
         distance = compute_distance_for_gsd(camera, 2.0)
-        # From the report: d = (24 * 0.002 * 5280) / 17.3 ≈ 14.6m
-        assert abs(distance - 14.6) < 0.5
+        # d = (12.0 * 0.002 * 5280) / 17.3 ≈ 7.3m
+        assert abs(distance - 7.3) < 0.5
 
     def test_roundtrip(self):
         """Computing distance then GSD should return the original target."""
@@ -53,21 +53,21 @@ class TestDistanceForGSD:
     def test_medium_tele_1mm_gsd(self):
         """Medium tele at 1mm/px GSD.
 
-        d = (70 * 0.001 * 8064) / 9.6 = 58.8m
+        d = (19.0 * 0.001 * 8064) / 9.6 ≈ 16.0m
         """
         camera = get_camera(CameraName.MEDIUM_TELE)
         distance = compute_distance_for_gsd(camera, 1.0)
-        assert abs(distance - 58.8) < 1.0
+        assert abs(distance - 16.0) < 1.0
 
 
 class TestFootprint:
-    def test_wide_footprint_at_14_6m(self):
-        """At 14.6m, wide camera footprint should be reasonable."""
+    def test_wide_footprint_at_7_3m(self):
+        """At 7.3m (2mm GSD distance), wide camera footprint."""
         camera = get_camera(CameraName.WIDE)
-        fp = compute_footprint(camera, 14.6)
-        # footprint_width = 14.6 * 17.3 / 24 ≈ 10.5m
+        fp = compute_footprint(camera, 7.3)
+        # footprint_width = 7.3 * 17.3 / 12.0 ≈ 10.5m
         assert abs(fp.width_m - 10.5) < 0.5
-        # footprint_height = 14.6 * 13.0 / 24 ≈ 7.9m
+        # footprint_height = 7.3 * 13.0 / 12.0 ≈ 7.9m
         assert abs(fp.height_m - 7.9) < 0.5
 
     def test_footprint_positive(self):
@@ -82,7 +82,7 @@ class TestGridSpacing:
     def test_default_overlap(self):
         """With 80% front overlap and 70% side overlap."""
         camera = get_camera(CameraName.WIDE)
-        fp = compute_footprint(camera, 14.6)
+        fp = compute_footprint(camera, 7.3)
         h_step, v_step = compute_grid_spacing(fp, front_overlap=0.80, side_overlap=0.70)
 
         # h_step = 10.5 * 0.3 ≈ 3.15m

@@ -70,6 +70,32 @@ class BuildingRecord(Base):
         }
 
 
+class SimulationRecord(Base):
+    __tablename__ = "simulations"
+
+    task_id = Column(String, primary_key=True)
+    status = Column(String, default="complete")
+    source_version = Column(String, nullable=True)
+    result_json = Column(Text, nullable=True)  # full result dict as JSON
+    output_dir = Column(String, nullable=True)
+    created_at = Column(String, default=lambda: datetime.now(timezone.utc).isoformat())
+
+    def to_summary(self) -> dict:
+        result = {}
+        if self.result_json:
+            try:
+                result = json.loads(self.result_json)
+            except (json.JSONDecodeError, TypeError):
+                pass
+        return {
+            "task_id": self.task_id,
+            "status": self.status,
+            "comparison": result.get("comparison"),
+            "summary": result.get("summary"),
+            "created_at": self.created_at,
+        }
+
+
 def init_db() -> None:
     """Create all tables if they don't exist."""
     Base.metadata.create_all(engine)

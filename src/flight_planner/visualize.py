@@ -116,7 +116,11 @@ def prepare_leaflet_data(building: Building, waypoints: list[Waypoint]) -> dict:
     }
 
 
-def prepare_threejs_data(building: Building, waypoints: list[Waypoint]) -> dict:
+def prepare_threejs_data(
+    building: Building,
+    waypoints: list[Waypoint],
+    candidate_facades: list | None = None,
+) -> dict:
     """Prepare JSON-serializable data for the 3D Three.js viewer."""
     facade_data = []
     for f in building.facades:
@@ -145,8 +149,23 @@ def prepare_threejs_data(building: Building, waypoints: list[Waypoint]) -> dict:
             "is_transition": wp.is_transition,
         })
 
+    candidate_data = []
+    if candidate_facades:
+        for f in candidate_facades:
+            normal_list = f.normal.tolist()
+            candidate_data.append({
+                "vertices": f.vertices.tolist(),
+                "normal": normal_list,
+                "label": f.label,
+                "index": f.index,
+                "component": f.component_tag,
+                "color": "#666677",
+                "direction": _facade_direction(normal_list),
+            })
+
     return {
         "facades": facade_data,
+        "candidateFacades": candidate_data,
         "waypoints": wp_data,
         "buildingLabel": _escape_html(building.label or "Building"),
         "buildingDims": f"{building.width}m x {building.depth}m x {building.height}m",

@@ -5,6 +5,7 @@ import type {
   GenerateRequest,
   GenerateResponse,
   PresetsResponse,
+  SimulationStatus,
   UploadedBuilding,
   VersionSummary,
 } from './types';
@@ -99,4 +100,38 @@ export async function uploadMeshFile(
   form.append('num_stories', String(params.num_stories));
   form.append('min_facade_area', String(params.min_facade_area));
   return request('/buildings/upload-file', { method: 'POST', body: form });
+}
+
+// --- Simulation / Reconstruction ---
+
+export async function listSimulations(): Promise<{ tasks: SimulationStatus[] }> {
+  return request('/simulate-reconstruct');
+}
+
+export async function startSimulation(
+  versionId?: string,
+  renderScale = 0.1,
+  voxelSize = 0.04,
+): Promise<{ task_id: string; status: string; source_version: string }> {
+  return request('/simulate-reconstruct', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      version_id: versionId ?? null,
+      render_scale: renderScale,
+      voxel_size: voxelSize,
+    }),
+  });
+}
+
+export async function getSimulationStatus(taskId: string): Promise<SimulationStatus> {
+  return request(`/simulate-reconstruct/${taskId}`);
+}
+
+export async function deleteSimulation(taskId: string): Promise<void> {
+  await request(`/simulate-reconstruct/${taskId}`, { method: 'DELETE' });
+}
+
+export function simulationPhotoUrl(taskId: string, wpIndex: number): string {
+  return `${BASE}/simulate-reconstruct/${taskId}/photo/${wpIndex}`;
 }
