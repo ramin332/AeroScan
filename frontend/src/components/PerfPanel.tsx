@@ -1,15 +1,27 @@
-import { useRef } from 'react';
-import type { PerfStats } from '../api/types';
+import { useRef, useState } from 'react';
+import type { BenchmarkResult, PerfStats } from '../api/types';
+import { benchmarkTsp } from '../api/client';
 import { useStore } from '../store';
 
 export function PerfPanel({ perf }: { perf: PerfStats | null | undefined }) {
   const prevRef = useRef<PerfStats | null>(null);
   const minPhotoDist = useStore((s) => s.mission.min_photo_distance_m);
+  const [benchResults, setBenchResults] = useState<BenchmarkResult[] | null>(null);
+  const [benching, setBenching] = useState(false);
+
+  // Grab current request params for benchmark
+  const preset = useStore((s) => s.preset);
+  const buildingSource = useStore((s) => s.buildingSource);
+  const selectedBuildingId = useStore((s) => s.selectedBuildingId);
+  const building = useStore((s) => s.building);
+  const mission = useStore((s) => s.mission);
+  const algorithm = useStore((s) => s.algorithm);
+  const minFacadeArea = useStore((s) => s.minFacadeArea);
+  const extractionMethod = useStore((s) => s.extractionMethod);
 
   if (!perf) return null;
 
   const prev = prevRef.current;
-  // Update ref after reading prev — so next render has current as prev
   if (perf !== prev) prevRef.current = perf;
 
   const g = perf.generation;
@@ -19,6 +31,25 @@ export function PerfPanel({ perf }: { perf: PerfStats | null | undefined }) {
   const totalFiltered = e
     ? e.filtered_by_area + e.filtered_by_occlusion + e.filtered_by_ground + e.filtered_by_normal
     : 0;
+
+  const runBenchmark = async () => {
+    setBenching(true);
+    try {
+      const res = await benchmarkTsp({
+        preset: buildingSource === 'preset' ? preset : undefined,
+        building_id: buildingSource === 'upload' ? selectedBuildingId : undefined,
+        building,
+        mission,
+        algorithm,
+        min_facade_area: buildingSource === 'upload' ? minFacadeArea : undefined,
+        extraction_method: buildingSource === 'upload' ? extractionMethod : undefined,
+      });
+      setBenchResults(res.benchmark);
+    } catch {
+      setBenchResults(null);
+    }
+    setBenching(false);
+  };
 
   return (
     <div className="perf-panel">
@@ -53,7 +84,7 @@ export function PerfPanel({ perf }: { perf: PerfStats | null | undefined }) {
           <Row label="Transit distance" value={`${g.optimization.transit_distance_after_m.toFixed(1)}m`}
             delta={`-${g.optimization.transit_saved_m.toFixed(1)}m`} />
           {g.optimization.two_opt_improvements > 0 && (
-            <Row label="2-opt improvements" value={String(g.optimization.two_opt_improvements)} dim />
+            <Row label="TSP improvements" value={String(g.optimization.two_opt_improvements)} dim />
           )}
           {g.optimization.facades_reversed.length > 0 && (
             <Row label="Sweeps reversed" value={String(g.optimization.facades_reversed.length)} dim />
@@ -75,22 +106,22 @@ export function PerfPanel({ perf }: { perf: PerfStats | null | undefined }) {
           {totalFiltered > 0 && (
             <div className="perf-filters">
               {e.filtered_by_area > 0 && (
-                <span className="perf-tag" title={`min_facade_area: surfaces below area threshold removed`}>
+                <span className="perf-tag" title="min_facade_area: surfaces below area threshold removed">
                   area -{e.filtered_by_area}
                 </span>
               )}
               {e.filtered_by_occlusion > 0 && (
-                <span className="perf-tag" title={`occlusion_hit_fraction: interior walls blocked by other geometry`}>
+                <span className="perf-tag" title="occlusion_hit_fraction: interior walls blocked by other geometry">
                   occluded -{e.filtered_by_occlusion}
                 </span>
               )}
               {e.filtered_by_ground > 0 && (
-                <span className="perf-tag" title={`ground_level_threshold: surfaces near ground filtered`}>
+                <span className="perf-tag" title="ground_level_threshold: surfaces near ground filtered">
                   ground -{e.filtered_by_ground}
                 </span>
               )}
               {e.filtered_by_normal > 0 && (
-                <span className="perf-tag" title={`downward_face_threshold / degenerate normals`}>
+                <span className="perf-tag" title="downward_face_threshold / degenerate normals">
                   normal -{e.filtered_by_normal}
                 </span>
               )}
@@ -108,9 +139,35 @@ export function PerfPanel({ perf }: { perf: PerfStats | null | undefined }) {
           <span className="perf-badge ok">{v.info} info</span>
         </div>
       </div>
+
+      {/* TSP Benchmark */}
+      <div className="perf-section">
+        <button className="perf-bench-btn" onClick={runBenchmark} disabled={benching}>
+          {benching ? 'Running...' : 'Benchmark TSP'}
+        </button>
+        {benchResults && (
+          <div className="perf-bench">
+            {benchResults.map((r, i) => (
+              <div key={r.method} className={`perf-bench-row${i === 0 ? ' best' : ''}`}>
+                <span className="perf-bench-method">{METHOD_LABELS[r.method] ?? r.method}</span>
+                <span className="perf-bench-transit">{r.transit_after_m}m</span>
+                <span className="perf-bench-time">{r.time_ms}ms</span>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
     </div>
   );
 }
+
+const METHOD_LABELS: Record<string, string> = {
+  nearest_neighbor: 'NN',
+  greedy: 'Greedy',
+  simulated_annealing: 'SA',
+  threshold_accepting: 'TA',
+  auto: 'Auto',
+};
 
 // --- Helpers ---
 

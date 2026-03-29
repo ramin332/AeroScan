@@ -364,6 +364,95 @@ def get_config():
     return {"algorithm": algo_fields}
 
 
+@router.post("/benchmark-tsp")
+def benchmark_tsp(request: GenerateRequest):
+    """Run all TSP methods on the same building and return comparison."""
+    algo_base = request.algorithm.to_algorithm_config()
+
+    # Build the building (same logic as /generate)
+    if request.building_id:
+        db = get_db()
+        try:
+            record = db.query(BuildingRecord).filter_by(id=request.building_id).first()
+            if not record:
+                raise HTTPException(status_code=404, detail="Building not found")
+            props = json.loads(record.properties_json) if record.properties_json else {}
+            raw_mesh = props.get("mesh_viewer")
+            if raw_mesh:
+                from ..building_import import extract_facades
+                import trimesh
+                import numpy as np
+                positions = np.array(raw_mesh["positions"], dtype=np.float64).reshape(-1, 3)
+                indices = np.array(raw_mesh["indices"], dtype=np.int64).reshape(-1, 3)
+                mesh_obj = trimesh.Trimesh(vertices=positions, faces=indices)
+                facades = extract_facades(mesh_obj, method=request.extraction_method, min_area_m2=request.min_facade_area, algo=algo_base)
+                if facades:
+                    xs = [float(v[0]) for f in facades for v in f.vertices]
+                    ys = [float(v[1]) for f in facades for v in f.vertices]
+                    from ..models import Building as BuildingModel
+                    building = BuildingModel(
+                        lat=record.lat, lon=record.lon,
+                        width=round(max(xs) - min(xs), 1), depth=round(max(ys) - min(ys), 1),
+                        height=record.height, facades=facades, label=record.name,
+                    )
+                else:
+                    geojson = json.loads(record.geometry_data)
+                    building = build_building_from_geojson(geojson, height=record.height, name=record.name)
+            else:
+                geojson = json.loads(record.geometry_data)
+                building = build_building_from_geojson(geojson, height=request.building.height, name=record.name)
+        finally:
+            db.close()
+    elif request.preset and request.preset in PRESET_MAP:
+        building = PRESET_MAP[request.preset](lat=request.building.lat, lon=request.building.lon)
+    else:
+        building = build_rectangular_building(
+            lat=request.building.lat, lon=request.building.lon,
+            width=request.building.width, depth=request.building.depth,
+            height=request.building.height, heading_deg=request.building.heading_deg,
+            roof_type=RoofType(request.building.roof_type),
+            roof_pitch_deg=request.building.roof_pitch_deg, num_stories=request.building.num_stories,
+        )
+
+    camera_name = CameraName(request.mission.camera)
+    config = MissionConfig(
+        target_gsd_mm_per_px=request.mission.target_gsd_mm_per_px,
+        camera=camera_name,
+        front_overlap=request.mission.front_overlap,
+        side_overlap=request.mission.side_overlap,
+        flight_speed_ms=request.mission.flight_speed_ms,
+        obstacle_clearance_m=request.mission.obstacle_clearance_m,
+        gimbal_pitch_margin_deg=request.mission.gimbal_pitch_margin_deg,
+        min_photo_distance_m=request.mission.min_photo_distance_m,
+        yaw_rate_deg_per_s=request.mission.yaw_rate_deg_per_s,
+    )
+
+    methods = ["nearest_neighbor", "greedy", "simulated_annealing", "threshold_accepting", "auto"]
+    results = []
+
+    for method in methods:
+        algo = AlgorithmConfig(**{**algo_base.__dict__, "tsp_method": method})
+        t0 = time.perf_counter()
+        wps, stats = generate_mission_waypoints(building, config, algo)
+        t1 = time.perf_counter()
+        opt = stats.get("optimization", {})
+        results.append({
+            "method": method,
+            "time_ms": round((t1 - t0) * 1000, 1),
+            "waypoints": len(wps),
+            "transit_before_m": round(opt.get("transit_distance_before_m", 0), 1),
+            "transit_after_m": round(opt.get("transit_distance_after_m", 0), 1),
+            "transit_saved_m": round(opt.get("transit_saved_m", 0), 1),
+            "facades_reversed": len(opt.get("facades_reversed", [])),
+            "merged": opt.get("waypoints_merged", 0),
+        })
+
+    # Sort by transit_after_m ascending
+    results.sort(key=lambda r: r["transit_after_m"])
+
+    return {"benchmark": results, "facade_count": len(building.facades)}
+
+
 @router.get("/presets")
 def get_presets():
     return {"presets": PRESET_DEFAULTS}

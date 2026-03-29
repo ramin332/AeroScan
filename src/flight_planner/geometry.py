@@ -577,10 +577,7 @@ def _generate_surface_sample_waypoints(
     flip_mask = np.einsum('ij,ij->i', normals, to_point) < 0
     normals[flip_mask] *= -1
 
-    # 3. Filter surfaces that can't produce useful photos:
-    #    - downward-facing (floors/ceilings)
-    #    - at ground level (foundations)
-    #    - normals pointing downward after outward orientation (interior floors)
+    # 3. Filter surfaces that can't produce useful photos
     keep = (
         (normals[:, 2] >= algo.downward_face_threshold)
         & (points[:, 2] >= algo.ground_level_threshold_m)
@@ -589,11 +586,38 @@ def _generate_surface_sample_waypoints(
     normals = normals[keep]
     n_filtered = int((~keep).sum())
 
-    # 4. Compute camera positions
+    # 4. Filter interior faces: cast ray from surface along outward normal.
+    #    Exterior faces escape to open air; interior faces hit the outer
+    #    shell nearby. Same logic as facade extraction's occlusion check.
+    if len(points) > 0:
+        offset = algo.occlusion_ray_offset_m
+        ray_origins = points + normals * offset
+        max_extent = float(max(mesh.bounding_box.extents))
+        hit_threshold = max_extent * algo.occlusion_hit_fraction
+
+        hits, idx_ray, _ = mesh.ray.intersects_location(
+            ray_origins=ray_origins,
+            ray_directions=normals,
+        )
+        exterior_mask = np.ones(len(points), dtype=bool)
+        if len(hits) > 0:
+            for i in range(len(points)):
+                ray_hits = hits[idx_ray == i]
+                if len(ray_hits) > 0:
+                    min_dist = float(np.linalg.norm(
+                        ray_hits - ray_origins[i], axis=1
+                    ).min())
+                    if min_dist < hit_threshold:
+                        exterior_mask[i] = False
+        n_interior = int((~exterior_mask).sum())
+        n_filtered += n_interior
+        points = points[exterior_mask]
+        normals = normals[exterior_mask]
+
+    # 5. Compute camera positions
     cam_positions = points + normals * distance
 
-    # Filter out cameras that would be underground (below min_altitude)
-    # rather than clamping them (clamped cameras point in wrong directions)
+    # Filter out cameras that would be underground
     altitude_ok = cam_positions[:, 2] >= algo.min_altitude_m
     cam_positions = cam_positions[altitude_ok]
     points = points[altitude_ok]
@@ -708,8 +732,9 @@ def _generate_surface_sample_waypoints(
         pitches = pitches[order]
         facade_indices = facade_indices[order]
 
-    # 9. Build Waypoint objects — single ordered list, split into
-    #    contiguous runs of the same facade_index for coloring.
+    # 9. Build Waypoint objects in NN order.
+    #    Return as a single group — the NN ordering IS the flight path.
+    #    facade_index on each waypoint is for viewer coloring only.
     all_wps: list[Waypoint] = []
     for i in range(len(cam_positions)):
         fi = int(facade_indices[i])
@@ -725,17 +750,7 @@ def _generate_surface_sample_waypoints(
             component_tag=facade_tags.get(fi, "21.1"),
         ))
 
-    # Split into contiguous facade runs for the optimizer
-    facade_groups: list[list[Waypoint]] = []
-    if all_wps:
-        current_group = [all_wps[0]]
-        for wp in all_wps[1:]:
-            if wp.facade_index == current_group[-1].facade_index:
-                current_group.append(wp)
-            else:
-                facade_groups.append(current_group)
-                current_group = [wp]
-        facade_groups.append(current_group)
+    facade_groups = [all_wps] if all_wps else []
 
     stats = {
         "strategy": "surface_sampling",

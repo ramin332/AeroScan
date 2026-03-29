@@ -433,6 +433,23 @@ body {
 .perf-badge.ok { background: rgba(255,255,255,0.05); color: var(--fg3); }
 .perf-badge.error { background: rgba(220,38,38,0.2); color: #fca5a5; }
 .perf-badge.warn { background: rgba(234,179,8,0.15); color: #fde68a; }
+/* Benchmark */
+.perf-bench-btn {
+  width: 100%; padding: 4px 0; font-size: 10px; font-weight: 600;
+  background: var(--bg3); border: 1px solid var(--border); border-radius: 3px;
+  color: var(--fg2); cursor: pointer; margin-top: 2px;
+}
+.perf-bench-btn:hover { background: var(--accent); color: var(--bg); }
+.perf-bench-btn:disabled { opacity: 0.5; cursor: wait; }
+.perf-bench { margin-top: 6px; }
+.perf-bench-row {
+  display: flex; gap: 4px; align-items: center;
+  font-size: 10px; padding: 2px 0; color: var(--fg3);
+}
+.perf-bench-row.best { color: var(--fg); font-weight: 600; }
+.perf-bench-method { width: 50px; }
+.perf-bench-transit { flex: 1; text-align: right; }
+.perf-bench-time { width: 50px; text-align: right; color: var(--fg3); font-size: 9px; }
 
 /* Leaflet overrides */
 .leaflet-container { background: var(--bg) !important; }

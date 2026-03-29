@@ -254,6 +254,17 @@ export interface PerfStats {
   };
 }
 
+export interface BenchmarkResult {
+  method: string;
+  time_ms: number;
+  waypoints: number;
+  transit_before_m: number;
+  transit_after_m: number;
+  transit_saved_m: number;
+  facades_reversed: number;
+  merged: number;
+}
+
 export interface GenerateResponse {
   version_id: string;
   timestamp: string;

@@ -1,4 +1,5 @@
 import type {
+  BenchmarkResult,
   BuildingUploadRequest,
   DroneSpec,
   GenerateRequest,
@@ -29,6 +30,14 @@ export async function getDrone(): Promise<DroneSpec> {
 
 export async function generate(req: GenerateRequest): Promise<GenerateResponse> {
   return request('/generate', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(req),
+  });
+}
+
+export async function benchmarkTsp(req: GenerateRequest): Promise<{ benchmark: BenchmarkResult[]; facade_count: number }> {
+  return request('/benchmark-tsp', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(req),
