@@ -57,10 +57,11 @@ pip install -e ".[dev,server,mesh]" # Also include mesh import (open3d, trimesh)
 - **`building_import.py`** — Parses GeoJSON footprints and 3D mesh files (OBJ/PLY/STL/GLB/GLTF via trimesh) into Building objects. Facade extraction uses region growing on the face adjacency graph. Interior faces are filtered via visibility ray casting (ray from outside the bounding box toward facade center — if another face blocks it, the facade is interior). `trimesh.repair.fix_normals()` is called on mesh load to ensure consistent winding.
 - **`validate.py`** — Checks mission constraints (max waypoints, altitude limits, gimbal bounds, flight time). Returns typed `ValidationIssue` objects with error/warning/info severity.
 - **`visualize.py`** — Serializes facades + waypoints to JSON for Three.js and Leaflet viewers.
+- **`reconstruct.py`** — Simulated photogrammetric reconstruction pipeline. Renders synthetic photos from mission waypoints using pyrender (subprocess for macOS GPU thread safety), fuses depth maps via Open3D TSDF with realistic noise (depth σ=5mm, pose σ=1cm/0.15° simulating MVS+SfM error), then reimports the reconstructed mesh through `build_building_from_mesh()`. Uses the raw uploaded mesh for rendering (not extracted facade planes). Results are persisted to SQLite (`SimulationRecord` table). Also exports COLMAP-compatible format (`cameras.txt`/`images.txt`/`points3D.txt`) for offline full reconstruction with COLMAP/ODM. Quality presets control render_scale (5-20%) and voxel_size (2-8cm).
 
 **Server** (`server/`):
-- **`api.py`** — FastAPI router under `/api`. Key endpoints: `POST /generate` (mission generation), building CRUD, version history, KMZ download.
-- **`database.py`** — SQLAlchemy with SQLite (`aeroscan.db`). Single table: `BuildingRecord`.
+- **`api.py`** — FastAPI router under `/api`. Key endpoints: `POST /generate` (mission generation), building CRUD, version history, KMZ download, simulation CRUD (`POST /simulate-reconstruct`, `GET /simulate-reconstruct/{id}`, `DELETE /simulate-reconstruct/{id}`).
+- **`database.py`** — SQLAlchemy with SQLite (`aeroscan.db`). Tables: `BuildingRecord` (uploaded buildings), `SimulationRecord` (reconstruction results — persists across restarts).
 - **`state.py`** — In-memory `MissionVersion` store (cleared on restart, max 100 versions). Stores selection state (disabled facades, enabled candidates, exclusion zones) per version.
 
 ### Frontend (`frontend/src/`)
@@ -85,7 +86,21 @@ pip install -e ".[dev,server,mesh]" # Also include mesh import (open3d, trimesh)
 2. Frontend POSTs to `/api/generate` with `BuildingParams` + `MissionParams` + `disabled_facades` + `exclusion_zones`
 3. Backend: builds facades → filters interior faces (visibility ray test) → generates waypoint grids → path optimization → exclusion zone filtering → interior waypoint filtering → validates → serializes viewer data
 4. Response includes: waypoints, summary metrics, validation issues, Three.js/Leaflet data, version ID, config snapshot (including selection state)
-5. Frontend renders 3D view (Selection/Plan/Flight modes) + map; user can download KMZ via `/api/versions/{id}/kmz`
+5. Frontend renders 3D view (Selection/Plan/Flight modes) + map + simulation tab; user can download KMZ via `/api/versions/{id}/kmz`
+
+### Simulation Pipeline
+
+1. User clicks quality preset (Super Fast/Fast/Medium/High) in Sidebar → `POST /api/simulate-reconstruct`
+2. Backend spawns subprocess: exports raw mesh as PLY → renders RGB+depth from each waypoint via pyrender → adds realistic noise → fuses via TSDF → decimates → exports reconstructed PLY + COLMAP format
+3. Reimports reconstructed mesh through `build_building_from_mesh()` → facade extraction → new mission generation
+4. Result (viewer data, comparison metrics, photo metadata) saved to SQLite
+5. Frontend Simulation tab shows all runs with switcher, comparison stats, and 3D viewer in Flight mode
+
+**Key design decisions:**
+- **pyrender** for rendering (not Open3D) — Open3D's OffscreenRenderer requires EGL which doesn't work on macOS. Pyrender uses pyglet's native macOS OpenGL.
+- **Subprocess** for GPU rendering — macOS requires GPU contexts on the main thread; uvicorn handlers run on worker threads. Subprocess gets its own main thread.
+- **OpenGL→OpenCV matrix conversion** — pyrender uses OpenGL convention (Y-up, -Z-forward), TSDF uses OpenCV (Y-down, Z-forward). Conversion: `w2c_cv = flip @ inv(c2w)` where flip=diag(1,-1,-1,1). The flip must be **pre-multiplied** (applied to camera-space output).
+- **Raw mesh for rendering** — the drone camera sees the actual building, not extracted facade planes. Raw mesh is fetched from viewer_data or database.
 
 ## Key Domain Concepts
 

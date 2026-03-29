@@ -25,7 +25,7 @@ export function Sidebar() {
     disabledFacades, exclusionZones, toggleFacade, removeExclusionZone, updateExclusionZone,
     setBuildingSource, setPreset, setBuilding, setMission, setAlgorithm, resetAlgorithm, setMinFacadeArea, setExtractionMethod, setWaypointStrategy,
     uploadBuilding, selectBuilding, deleteBuilding,
-    simStatus, simProgress, simMessage, simStartTime, simResult, startSimulation, viewSimulationResult, deleteSimulation,
+    simStatus, simProgress, simMessage, startSimulation,
   } = useStore();
 
   const fileRef = useRef<HTMLInputElement>(null);
@@ -584,66 +584,8 @@ export function Sidebar() {
       {/* ======== SIMULATE RECONSTRUCTION ======== */}
       {result && result.can_export && (
         <Section title="Simulate Reconstruction" defaultOpen={false}>
-          <div className="field-hint" style={{ marginBottom: 8 }}>
-            Render synthetic photos from each waypoint, reconstruct the building via TSDF fusion, and reimport.
-          </div>
-          {!simStatus || simStatus === 'error' ? (
-            <div style={{ display: 'flex', gap: 4 }}>
-              {([
-                ['Super Fast', 0.05, 0.08],
-                ['Fast',       0.08, 0.05],
-                ['Medium',     0.12, 0.03],
-                ['High',       0.20, 0.02],
-              ] as const).map(([label, scale, voxel]) => (
-                <button key={label} className="btn-primary"
-                  style={{ flex: 1, fontSize: 10, padding: '5px 2px' }}
-                  onClick={() => startSimulation(scale, voxel)}>
-                  {label}
-                </button>
-              ))}
-            </div>
-          ) : simStatus === 'complete' && simResult ? (
-            <div>
-              <div style={{ fontSize: 11, marginBottom: 8, color: 'var(--text-secondary)' }}>
-                {simResult.comparison.num_photos} photos rendered via {simResult.comparison.method}
-              </div>
-              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '2px 12px', fontSize: 11, marginBottom: 8 }}>
-                <span style={{ color: 'var(--text-secondary)' }}>Facades</span>
-                <span>{simResult.comparison.original.facade_count} → {simResult.comparison.reconstructed.facade_count}
-                  {simResult.comparison.diff.facade_count !== 0 && (
-                    <span style={{ color: simResult.comparison.diff.facade_count > 0 ? 'var(--accent2)' : '#f66', marginLeft: 4 }}>
-                      ({simResult.comparison.diff.facade_count > 0 ? '+' : ''}{simResult.comparison.diff.facade_count})
-                    </span>
-                  )}
-                </span>
-                <span style={{ color: 'var(--text-secondary)' }}>Waypoints</span>
-                <span>{simResult.comparison.original.inspection_waypoints} → {simResult.comparison.reconstructed.inspection_waypoints}
-                  {simResult.comparison.diff.waypoint_diff !== 0 && (
-                    <span style={{ color: 'var(--text-secondary)', marginLeft: 4 }}>
-                      ({simResult.comparison.diff.waypoint_diff > 0 ? '+' : ''}{simResult.comparison.diff.waypoint_diff})
-                    </span>
-                  )}
-                </span>
-                <span style={{ color: 'var(--text-secondary)' }}>Size diff</span>
-                <span>{simResult.comparison.diff.width_m}w / {simResult.comparison.diff.depth_m}d / {simResult.comparison.diff.height_m}h m</span>
-              </div>
-              <div style={{ display: 'flex', gap: 6 }}>
-                <button className="btn-primary" onClick={viewSimulationResult}
-                  style={{ flex: 1 }}>
-                  View Result
-                </button>
-                <button className="btn-secondary" onClick={() => startSimulation()}
-                  style={{ fontSize: 11, padding: '4px 8px' }}>
-                  Re-run
-                </button>
-                <button className="btn-secondary" onClick={deleteSimulation}
-                  style={{ fontSize: 11, padding: '4px 8px', opacity: 0.7 }}
-                  title="Delete simulation and output files">
-                  &times;
-                </button>
-              </div>
-            </div>
-          ) : (
+          {simStatus && simStatus !== 'complete' && simStatus !== 'error' ? (
+            /* Active run — show progress stepper */
             <div>
               {(() => {
                 const steps = [
@@ -678,9 +620,30 @@ export function Sidebar() {
                 }} />
               </div>
             </div>
-          )}
-          {simStatus === 'error' && (
-            <div className="validation-error" style={{ marginTop: 6 }}>{simMessage}</div>
+          ) : (
+            /* Ready — show quality presets */
+            <div>
+              <div className="field-hint" style={{ marginBottom: 8 }}>
+                Render photos, reconstruct via TSDF, reimport. View results in Simulation tab.
+              </div>
+              {simStatus === 'error' && (
+                <div className="validation-error" style={{ marginBottom: 6 }}>{simMessage}</div>
+              )}
+              <div style={{ display: 'flex', gap: 4 }}>
+                {([
+                  ['Super Fast', 0.05, 0.08],
+                  ['Fast',       0.08, 0.05],
+                  ['Medium',     0.12, 0.03],
+                  ['High',       0.20, 0.02],
+                ] as const).map(([label, scale, voxel]) => (
+                  <button key={label} className="btn-primary"
+                    style={{ flex: 1, fontSize: 10, padding: '5px 2px' }}
+                    onClick={() => startSimulation(scale, voxel)}>
+                    {label}
+                  </button>
+                ))}
+              </div>
+            </div>
           )}
         </Section>
       )}

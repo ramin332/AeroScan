@@ -462,7 +462,9 @@ export const useStore = create<AppState>()(persist((set, get) => ({
         set({ simStatus: status.status, simProgress: status.progress, simMessage: status.message });
 
         if (status.status === 'complete' && status.result) {
-          set({ simResult: status.result });
+          set({ simResult: status.result, simStatus: 'complete', activeTab: 'sim' });
+          // Reset to ready state after a brief delay so sidebar shows presets again
+          setTimeout(() => set({ simStatus: null, simProgress: 0, simMessage: '' }), 1500);
         } else if (status.status === 'error') {
           console.error('Simulation error:', status.error);
         } else {
