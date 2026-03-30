@@ -8,6 +8,11 @@ dependencies = [
     "numpy>=1.24",
     "pyproj>=3.6",
     "djikmz>=0.1.0",
+    "networkx>=3.0",
+    "scipy>=1.10",
+    "trimesh>=3.21",
+    "rtree>=1.0",
+    "python-multipart>=0.0.7",
 ]
 
 [project.optional-dependencies]
@@ -19,11 +24,10 @@ server = [
     "fastapi>=0.100",
     "uvicorn[standard]>=0.22",
     "sqlalchemy>=2.0",
+    "python-multipart>=0.0.7",
 ]
 mesh = [
     "open3d>=0.17",
-    "trimesh>=3.21",
-    "scipy>=1.10",
     "pyrender>=0.1.45",
     "fast-simplification>=0.1",
 ]

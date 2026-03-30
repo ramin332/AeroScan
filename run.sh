@@ -6,12 +6,21 @@ FRONTEND_PORT=3847
 
 cd "$(dirname "$0")"
 
-# Activate venv
-source .venv/bin/activate
+# Recreate venv if broken (e.g. after repo rename/move)
+if [ ! -x ".venv/bin/python" ] || ! .venv/bin/python -c "import sys" &>/dev/null; then
+    echo "Venv missing or broken — recreating..."
+    rm -rf .venv
+    python3.12 -m venv .venv
+    .venv/bin/pip install -e ".[dev,server]" -q
+fi
+
+# Kill anything already on these ports
+lsof -ti :$BACKEND_PORT | xargs kill -9 2>/dev/null
+lsof -ti :$FRONTEND_PORT | xargs kill -9 2>/dev/null
 
 # Start backend
 echo "Starting backend on :$BACKEND_PORT ..."
-python -m flight_planner &
+.venv/bin/python -m flight_planner &
 BACKEND_PID=$!
 
 # Start frontend dev server
