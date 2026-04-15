@@ -1,3 +1,4 @@
+import { kmzDownloadUrl } from '../api/client';
 import { useStore } from '../store';
 
 export function VersionList() {
@@ -17,6 +18,16 @@ export function VersionList() {
         >
           <span className="ts">{v.timestamp.split('T')[1]?.substring(0, 8)}</span>
           <span className="wp">{v.waypoint_count} wp</span>
+          <a
+            className="kmz-dl"
+            href={kmzDownloadUrl(v.version_id)}
+            download
+            title="Download KMZ"
+            onClick={(e) => e.stopPropagation()}
+            style={{ fontSize: 11, opacity: 0.7, color: 'var(--accent)', textDecoration: 'none', padding: '0 4px' }}
+          >
+            ↓KMZ
+          </a>
           <span
             className="del"
             onClick={(e) => { e.stopPropagation(); deleteVersion(v.version_id); }}

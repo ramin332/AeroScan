@@ -87,10 +87,11 @@ export async function deleteBuilding(id: string): Promise<void> {
   await request(`/buildings/${id}`, { method: 'DELETE' });
 }
 
-export async function uploadMeshFile(
+export function uploadMeshFile(
   file: File,
   params: { name: string; lat: number; lon: number; height: number; num_stories: number; min_facade_area: number },
-): Promise<UploadedBuilding> {
+  onUploadProgress?: (loaded: number, total: number) => void,
+): Promise<{ task_id: string }> {
   const form = new FormData();
   form.append('file', file);
   form.append('name', params.name);
@@ -99,7 +100,34 @@ export async function uploadMeshFile(
   form.append('height', String(params.height));
   form.append('num_stories', String(params.num_stories));
   form.append('min_facade_area', String(params.min_facade_area));
-  return request('/buildings/upload-file', { method: 'POST', body: form });
+
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', `${BASE}/buildings/upload-file`);
+
+    if (onUploadProgress) {
+      xhr.upload.onprogress = (e) => {
+        if (e.lengthComputable) onUploadProgress(e.loaded, e.total);
+      };
+    }
+
+    xhr.onload = () => {
+      if (xhr.status >= 200 && xhr.status < 300) {
+        resolve(JSON.parse(xhr.responseText));
+      } else {
+        reject(new Error(`API error ${xhr.status}: ${xhr.responseText}`));
+      }
+    };
+    xhr.onerror = () => reject(new Error('Upload network error'));
+    xhr.send(form);
+  });
+}
+
+export async function getUploadStatus(taskId: string): Promise<{
+  status: string; progress: number; message: string;
+  result?: UploadedBuilding; error?: string;
+}> {
+  return request(`/buildings/upload-status/${taskId}`);
 }
 
 // --- Simulation / Reconstruction ---

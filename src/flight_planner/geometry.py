@@ -129,7 +129,10 @@ def build_rectangular_building(
         edge1 = ground[j] - ground[i]  # along the base of the wall
         edge2 = eave[i] - ground[i]  # up the wall
         normal = np.cross(edge1, edge2)
-        normal = normal / np.linalg.norm(normal)
+        norm_len = np.linalg.norm(normal)
+        if norm_len < 1e-9:
+            continue  # degenerate wall (coincident vertices)
+        normal = normal / norm_len
 
         # Ensure normal points outward (away from building center)
         center_to_wall = verts.mean(axis=0)
@@ -188,7 +191,10 @@ def build_rectangular_building(
             edge1 = verts[1] - verts[0]
             edge2 = verts[3] - verts[0]
             normal = np.cross(edge1, edge2)
-            normal = normal / np.linalg.norm(normal)
+            norm_len = np.linalg.norm(normal)
+            if norm_len < 1e-9:
+                continue  # degenerate roof face
+            normal = normal / norm_len
             # Ensure normal points outward (has a positive Z component for roofs)
             if normal[2] < 0:
                 normal = -normal
@@ -298,15 +304,21 @@ def generate_waypoints_for_facade(
         # Pitched surface: u_axis = horizontal component perpendicular to slope direction
         horiz_normal = np.array([normal[0], normal[1], 0.0])
         horiz_norm = np.linalg.norm(horiz_normal)
-        horiz_normal /= horiz_norm
-        u_axis = np.array([-horiz_normal[1], horiz_normal[0], 0.0])
-        u_axis /= np.linalg.norm(u_axis)
-        # v_axis: along the slope (perpendicular to u_axis and normal)
-        v_axis = np.cross(normal, u_axis)
-        v_axis /= np.linalg.norm(v_axis)
-        # Ensure v_axis has positive Z component (points uphill)
-        if v_axis[2] < 0:
-            v_axis = -v_axis
+        if horiz_norm < 1e-6:
+            # Nearly flat — fall back to horizontal roof case
+            u_axis = np.array([1.0, 0.0, 0.0])
+            v_axis = np.array([0.0, 1.0, 0.0])
+        else:
+            horiz_normal /= horiz_norm
+            u_axis = np.array([-horiz_normal[1], horiz_normal[0], 0.0])
+            # v_axis: along the slope (perpendicular to u_axis and normal)
+            v_axis = np.cross(normal, u_axis)
+            v_norm = np.linalg.norm(v_axis)
+            if v_norm > 1e-9:
+                v_axis /= v_norm
+            # Ensure v_axis has positive Z component (points uphill)
+            if v_axis[2] < 0:
+                v_axis = -v_axis
 
     # Project facade vertices onto the u-v plane to find extents
     center = facade.center
@@ -819,6 +831,143 @@ def _generate_surface_sample_waypoints(
     return facade_groups, stats
 
 
+def _points_inside_mesh(
+    mesh,  # trimesh.Trimesh
+    positions: np.ndarray,  # shape (N, 3)
+) -> np.ndarray:
+    """Test which points are inside a mesh using Open3D ray-parity.
+
+    Casts a ray from each point along +X and counts mesh intersections.
+    Odd count = inside. Works correctly for non-convex and non-watertight meshes.
+
+    Returns:
+        Boolean array of shape (N,), True = inside.
+    """
+    import open3d as o3d
+
+    vertices = np.asarray(mesh.vertices, dtype=np.float32)
+    faces = np.asarray(mesh.faces, dtype=np.uint32)
+
+    scene = o3d.t.geometry.RaycastingScene()
+    scene.add_triangles(
+        o3d.core.Tensor(vertices, dtype=o3d.core.float32),
+        o3d.core.Tensor(faces, dtype=o3d.core.uint32),
+    )
+
+    # Build rays: origin = each point, direction = +X axis
+    n = len(positions)
+    rays = np.zeros((n, 6), dtype=np.float32)
+    rays[:, :3] = positions.astype(np.float32)
+    rays[:, 3] = 1.0  # direction +X
+
+    counts = scene.count_intersections(o3d.core.Tensor(rays, dtype=o3d.core.float32))
+    return counts.numpy() % 2 == 1  # odd = inside
+
+
+def _check_path_collisions(
+    waypoints: list,  # list[Waypoint]
+    mesh,  # trimesh.Trimesh
+    margin_m: float = 0.5,
+) -> list[int]:
+    """Check flight path segments for mesh collisions.
+
+    For each consecutive waypoint pair (A, B), casts a ray from A toward B
+    and checks if any mesh intersection is closer than (segment_length - margin).
+
+    Returns:
+        List of segment indices where collisions were detected.
+        Segment i connects waypoints[i] to waypoints[i+1].
+    """
+    if len(waypoints) < 2:
+        return []
+
+    positions = np.array([[wp.x, wp.y, wp.z] for wp in waypoints])
+    origins = positions[:-1]  # A points
+    targets = positions[1:]   # B points
+    vectors = targets - origins
+    lengths = np.linalg.norm(vectors, axis=1)
+
+    # Skip zero-length segments
+    valid = lengths > 1e-6
+    if not valid.any():
+        return []
+
+    directions = np.zeros_like(vectors)
+    directions[valid] = vectors[valid] / lengths[valid, np.newaxis]
+
+    # Batch ray cast all segments at once
+    hits, idx_ray, _ = mesh.ray.intersects_location(
+        ray_origins=origins[valid],
+        ray_directions=directions[valid],
+    )
+
+    colliding = []
+    if len(hits) > 0:
+        # Map back to original segment indices
+        valid_indices = np.where(valid)[0]
+        for ri, orig_idx in enumerate(valid_indices):
+            mask = idx_ray == ri
+            if mask.any():
+                hit_dists = np.linalg.norm(hits[mask] - origins[orig_idx], axis=1)
+                # Hit must be within the segment (not beyond B) and not too close to A
+                seg_len = lengths[orig_idx]
+                within_segment = (hit_dists > margin_m) & (hit_dists < seg_len - margin_m)
+                if within_segment.any():
+                    colliding.append(int(orig_idx))
+
+    return colliding
+
+
+def _resolve_path_collision(
+    waypoints: list,  # list[Waypoint]
+    segment_idx: int,
+    mesh,  # trimesh.Trimesh
+    clearance_m: float,
+    altitude_margin_m: float,
+) -> list:
+    """Create a detour waypoint to route around a colliding segment.
+
+    Strategy: raise altitude and pull outward from mesh centroid.
+    Returns list with the detour waypoint inserted, or original if no resolution.
+    """
+    from .models import Waypoint
+
+    wp_a = waypoints[segment_idx]
+    wp_b = waypoints[segment_idx + 1]
+
+    # Midpoint of the segment
+    mid = np.array([
+        (wp_a.x + wp_b.x) / 2,
+        (wp_a.y + wp_b.y) / 2,
+        (wp_a.z + wp_b.z) / 2,
+    ])
+
+    # Pull outward from mesh centroid
+    centroid = np.array(mesh.centroid)
+    outward = mid - centroid
+    outward[2] = 0  # only horizontal displacement
+    dist = np.linalg.norm(outward)
+    if dist > 1e-6:
+        outward = outward / dist * clearance_m * 2
+    else:
+        outward = np.array([clearance_m * 2, 0, 0])
+
+    # Raise altitude
+    detour_pos = mid + outward
+    detour_pos[2] = max(wp_a.z, wp_b.z) + altitude_margin_m
+
+    detour = Waypoint(
+        x=float(detour_pos[0]),
+        y=float(detour_pos[1]),
+        z=float(detour_pos[2]),
+        heading_deg=wp_a.heading_deg,
+        gimbal_pitch_deg=0.0,
+        is_transition=True,
+        speed_ms=wp_a.speed_ms if wp_a.is_transition else wp_b.speed_ms,
+    )
+    return detour
+
+
 def _filter_waypoints_by_exclusion_zones(
     waypoints: list[Waypoint],
     zones: list[ExclusionZone],
@@ -933,10 +1082,27 @@ def generate_mission_waypoints(
         tsp_method=algo.tsp_method,
     )
 
-    # Concatenate all inspection waypoints
+    # Insert transition waypoints between facade groups to prevent
+    # building-corner collisions. Each transition pulls out along the
+    # previous facade normal, optionally adds a corner clearance point,
+    # then approaches the next facade from outside.
     all_waypoints: list[Waypoint] = []
-    for group in facade_groups:
+    facade_lookup = {f.index: f for f in building.facades}
+    for gi, group in enumerate(facade_groups):
         all_waypoints.extend(group)
+        if gi < len(facade_groups) - 1:
+            next_group = facade_groups[gi + 1]
+            prev_facade = facade_lookup.get(group[-1].facade_index)
+            next_facade = facade_lookup.get(next_group[0].facade_index)
+            if prev_facade is not None and next_facade is not None:
+                trans = _generate_transition_waypoints(
+                    group[-1], next_group[0],
+                    prev_facade, next_facade,
+                    clearance=config.obstacle_clearance_m,
+                    speed=config.flight_speed_ms,
+                    algo=algo,
+                )
+                all_waypoints.extend(trans)
 
     # Filter waypoints inside exclusion zones
     zone_removed = 0
@@ -945,11 +1111,11 @@ def generate_mission_waypoints(
             all_waypoints, zones,
         )
 
-    # Filter waypoints inside the building envelope (convex hull is watertight)
+    # Filter waypoints inside the building envelope (Open3D ray-parity for non-convex support)
     mesh_removed = 0
-    if mesh is not None and hasattr(mesh, 'convex_hull') and len(all_waypoints) > 0:
+    if mesh is not None and len(all_waypoints) > 0:
         positions = np.array([[wp.x, wp.y, wp.z] for wp in all_waypoints])
-        inside = mesh.convex_hull.contains(positions)
+        inside = _points_inside_mesh(mesh, positions)
         mesh_removed = int(inside.sum())
         if mesh_removed > 0:
             all_waypoints = [wp for wp, is_inside in zip(all_waypoints, inside) if not is_inside]
@@ -966,6 +1132,33 @@ def generate_mission_waypoints(
         clearance_removed = int(too_close.sum())
         if clearance_removed > 0:
             all_waypoints = [wp for wp, close in zip(all_waypoints, too_close) if not close]
+
+    # Check flight path segments for building collisions
+    path_collisions_detected = 0
+    path_collisions_resolved = 0
+    path_collisions_unresolved = 0
+    if mesh is not None and algo.enable_path_collision_check and len(all_waypoints) > 1:
+        for _attempt in range(2):  # max 2 resolution passes
+            colliding = _check_path_collisions(all_waypoints, mesh, algo.path_collision_margin_m)
+            if not colliding:
+                break
+            path_collisions_detected += len(colliding)
+            # Insert detour waypoints in reverse order to preserve indices
+            inserted = 0
+            for seg_idx in reversed(colliding):
+                detour = _resolve_path_collision(
+                    all_waypoints, seg_idx, mesh,
+                    config.obstacle_clearance_m, algo.transition_altitude_margin_m,
+                )
+                # Verify detour is not inside the mesh
+                detour_pos = np.array([[detour.x, detour.y, detour.z]])
+                if not _points_inside_mesh(mesh, detour_pos)[0]:
+                    all_waypoints.insert(seg_idx + 1, detour)
+                    inserted += 1
+            path_collisions_resolved += inserted
+        # Final check for remaining collisions
+        remaining = _check_path_collisions(all_waypoints, mesh, algo.path_collision_margin_m)
+        path_collisions_unresolved = len(remaining)
 
     total_after = len(all_waypoints)
 
@@ -1007,6 +1200,10 @@ def generate_mission_waypoints(
         stats["waypoints_removed_inside_mesh"] = mesh_removed
     if clearance_removed > 0:
         stats["waypoints_removed_too_close"] = clearance_removed
+    if path_collisions_detected > 0:
+        stats["path_collisions_detected"] = path_collisions_detected
+        stats["path_collisions_resolved"] = path_collisions_resolved
+        stats["path_collisions_unresolved"] = path_collisions_unresolved
 
     return all_waypoints, stats
 

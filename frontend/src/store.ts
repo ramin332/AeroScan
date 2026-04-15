@@ -61,6 +61,9 @@ export const DEFAULT_ALGORITHM: AlgorithmParams = {
   enable_waypoint_los: true,
   los_tolerance_m: 0.5,
   los_min_visible_ratio: 0.4,
+  // Path collision checking
+  enable_path_collision_check: true,
+  path_collision_margin_m: 0.5,
   // Path optimization
   grid_density: 1.0,
   enable_path_dedup: true,
@@ -110,6 +113,8 @@ interface AppState {
   versions: VersionSummary[];
   loading: boolean;
   uploading: boolean;
+  uploadProgress: number;   // 0-1
+  uploadMessage: string;
   activeTab: Tab;
 
   // Actions
@@ -183,6 +188,8 @@ export const useStore = create<AppState>()(persist((set, get) => ({
   versions: [],
   loading: false,
   uploading: false,
+  uploadProgress: 0,
+  uploadMessage: '',
   activeTab: '3d',
   lightMode: false,
   setLightMode: (v) => set({ lightMode: v }),
@@ -324,26 +331,50 @@ export const useStore = create<AppState>()(persist((set, get) => ({
   // --- Building upload ---
 
   uploadBuilding: async (file: File) => {
-    set({ uploading: true });
+    const fileSizeMB = (file.size / (1024 * 1024)).toFixed(1);
+    set({ uploading: true, uploadProgress: 0, uploadMessage: `Uploading ${fileSizeMB} MB…` });
     try {
       const ext = file.name.split('.').pop()?.toLowerCase() || '';
       const isMesh = ['obj', 'ply', 'stl', 'glb', 'gltf'].includes(ext);
       let uploaded;
 
       if (isMesh) {
-        // Mesh file → multipart upload
+        // Mesh file → multipart upload with progress
         const name = file.name.replace(/\.[^.]+$/, '') || 'Mesh building';
         const { building, minFacadeArea } = get();
-        uploaded = await api.uploadMeshFile(file, {
-          name,
-          lat: building.lat,
-          lon: building.lon,
-          height: 0, // auto-detect from mesh
-          num_stories: 1,
-          min_facade_area: minFacadeArea,
+        const { task_id } = await api.uploadMeshFile(
+          file,
+          { name, lat: building.lat, lon: building.lon, height: 0, num_stories: 1, min_facade_area: minFacadeArea },
+          (loaded, total) => {
+            const pct = total > 0 ? loaded / total : 0;
+            const loadedMB = (loaded / (1024 * 1024)).toFixed(1);
+            set({ uploadProgress: pct * 0.3, uploadMessage: `Uploading ${loadedMB}/${fileSizeMB} MB…` });
+          },
+        );
+
+        // Poll for processing progress
+        set({ uploadProgress: 0.3, uploadMessage: 'Processing mesh…' });
+        uploaded = await new Promise<UploadedBuilding>((resolve, reject) => {
+          const poll = async () => {
+            try {
+              const status = await api.getUploadStatus(task_id);
+              const progress = 0.3 + status.progress * 0.7; // 30-100%
+              set({ uploadProgress: progress, uploadMessage: status.message });
+              if (status.status === 'complete' && status.result) {
+                resolve(status.result);
+              } else if (status.status === 'error') {
+                reject(new Error(status.error || 'Processing failed'));
+              } else {
+                setTimeout(poll, 1000);
+              }
+            } catch (e) {
+              reject(e);
+            }
+          };
+          poll();
         });
       } else {
-        // GeoJSON → JSON upload
+        // GeoJSON → JSON upload (instant, no progress needed)
         const text = await file.text();
         const geojson = JSON.parse(text);
         const name = file.name.replace(/\.(geo)?json$/i, '') || 'Uploaded building';
@@ -389,11 +420,11 @@ export const useStore = create<AppState>()(persist((set, get) => ({
           roof_type: uploaded.roof_type as 'flat' | 'pitched',
           roof_pitch_deg: uploaded.roof_pitch_deg,
         },
-        uploading: false,
+        uploading: false, uploadProgress: 0, uploadMessage: '',
       }));
     } catch (e) {
       console.error('Upload failed:', e);
-      set({ uploading: false });
+      set({ uploading: false, uploadProgress: 0, uploadMessage: String(e) });
     }
   },
 

@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import json
 import math
+import threading
 import time
+import uuid
 from pathlib import Path
 from typing import Literal, Optional
 
@@ -12,7 +14,7 @@ from fastapi import APIRouter, Form, HTTPException, UploadFile
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
 
-from ..building_import import build_building_from_geojson, build_building_from_mesh
+from ..building_import import build_building_from_geojson, build_building_from_mesh, decode_mesh_viewer_data
 from ..reconstruct import delete_task as delete_sim_task, get_task as get_sim_task, get_task_result as get_sim_result, list_tasks as list_sim_tasks, start_simulation_async
 from ..building_presets import (
     l_shaped_block,
@@ -46,6 +48,18 @@ from .database import BuildingRecord, get_db
 from .state import session
 
 router = APIRouter()
+
+# --- Upload task tracking (in-memory, same pattern as simulation) ---
+
+_upload_tasks: dict[str, dict] = {}
+_upload_lock = threading.Lock()
+
+
+def _set_upload_progress(task_id: str, progress: float, message: str, **extra: object) -> None:
+    with _upload_lock:
+        if task_id in _upload_tasks:
+            _upload_tasks[task_id].update(progress=progress, message=message, **extra)
+
 
 # --- Pydantic models ---
 
@@ -123,6 +137,9 @@ class AlgorithmParams(BaseModel):
     enable_sweep_reversal: bool = True
     dedup_max_gimbal_diff_deg: float = Field(20.0, ge=5.0, le=90.0)
     tsp_method: Literal["auto", "nearest_neighbor", "greedy", "simulated_annealing", "threshold_accepting"] = "auto"
+    # Path collision checking
+    enable_path_collision_check: bool = True
+    path_collision_margin_m: float = Field(0.5, ge=0.1, le=3.0)
     # KMZ export
     min_waypoint_height_m: float = Field(2.0, ge=0.5, le=10.0)
 
@@ -244,7 +261,11 @@ async def upload_building_file(
     roof_pitch_deg: float = Form(0.0),
     min_facade_area: float = Form(1.0),
 ):
-    """Upload an OBJ/PLY/STL mesh file and create a building from it."""
+    """Upload an OBJ/PLY/STL mesh file — returns a task_id for progress polling.
+
+    The heavy mesh processing runs in a background thread. Poll
+    GET /buildings/upload-status/{task_id} for progress and result.
+    """
     if not file.filename:
         raise HTTPException(status_code=400, detail="No file provided")
 
@@ -255,79 +276,122 @@ async def upload_building_file(
 
     file_data = await file.read()
     build_name = name or file.filename.rsplit(".", 1)[0] or "Mesh building"
+    file_size_mb = len(file_data) / (1024 * 1024)
 
-    try:
-        building = build_building_from_mesh(
-            mesh_data=file_data,
-            file_type=supported[ext],
-            lat=lat,
-            lon=lon,
-            height=height if height > 0 else None,
-            num_stories=num_stories,
-            roof_type=roof_type,
-            roof_pitch_deg=roof_pitch_deg,
-            name=build_name,
-            min_facade_area=min_facade_area,
-        )
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Failed to parse mesh: {e}")
+    task_id = str(uuid.uuid4())
+    with _upload_lock:
+        _upload_tasks[task_id] = {
+            "status": "processing",
+            "progress": 0.0,
+            "message": f"Reading {file_size_mb:.0f} MB mesh…",
+            "result": None,
+            "error": None,
+        }
 
-    # Convert the computed footprint back to GeoJSON for storage.
-    # This lets the generate endpoint reconstruct the building without
-    # needing the original mesh binary.
-    from ..models import meters_per_deg as _m_per_deg
-    import math as _math
-    m_per_lat, m_per_lon = _m_per_deg(_math.radians(building.lat))
-    # Extract ground-level wall vertices to rebuild the footprint polygon
-    footprint_coords = []
-    for facade in building.facades:
-        if abs(facade.normal[2]) < 0.01:  # vertical walls only
-            v0 = facade.vertices[0]  # first ground vertex
-            lon_v = building.lon + v0[0] / m_per_lon
-            lat_v = building.lat + v0[1] / m_per_lat
-            footprint_coords.append([round(lon_v, 8), round(lat_v, 8)])
-    # Close the ring
-    if footprint_coords:
-        footprint_coords.append(footprint_coords[0])
-    footprint_geojson = {
-        "type": "Feature",
-        "geometry": {"type": "Polygon", "coordinates": [footprint_coords]},
-        "properties": {
-            "name": build_name,
-            "height": building.height,
-            "num_stories": num_stories,
-            "source": f"mesh_{ext}",
-        },
-    }
+    def _process() -> None:
+        try:
+            _set_upload_progress(task_id, 0.05, "Loading mesh into memory…")
 
-    record = BuildingRecord(
-        name=build_name,
-        source_type=f"mesh_{ext}",
-        geometry_data=json.dumps(footprint_geojson),
-        lat=building.lat,
-        lon=building.lon,
-        height=building.height,
-        num_stories=num_stories,
-        roof_type=roof_type,
-        roof_pitch_deg=roof_pitch_deg,
-        heading_deg=0.0,
-        properties_json=json.dumps({
-            "width": building.width,
-            "depth": building.depth,
-            "mesh_format": ext,
-            "auto_height": building.height,
-            "mesh_viewer": getattr(building, "_mesh_viewer_data", None),
-        }),
-    )
+            building = build_building_from_mesh(
+                mesh_data=file_data,
+                file_type=supported[ext],
+                lat=lat,
+                lon=lon,
+                height=height if height > 0 else None,
+                num_stories=num_stories,
+                roof_type=roof_type,
+                roof_pitch_deg=roof_pitch_deg,
+                name=build_name,
+                min_facade_area=min_facade_area,
+                progress_callback=lambda p, msg: _set_upload_progress(task_id, 0.05 + p * 0.85, msg),
+            )
 
-    db = get_db()
-    try:
-        db.add(record)
-        db.commit()
-        db.refresh(record)
-        return record.to_dict()
-    finally:
-        db.close()
+            _set_upload_progress(task_id, 0.92, "Saving to database…")
+
+            # Convert footprint to GeoJSON for storage
+            from ..models import meters_per_deg as _m_per_deg
+            m_per_lat, m_per_lon = _m_per_deg(math.radians(building.lat))
+            footprint_coords = []
+            for facade in building.facades:
+                if abs(facade.normal[2]) < 0.01:
+                    v0 = facade.vertices[0]
+                    lon_v = building.lon + v0[0] / m_per_lon
+                    lat_v = building.lat + v0[1] / m_per_lat
+                    footprint_coords.append([round(lon_v, 8), round(lat_v, 8)])
+            if footprint_coords:
+                footprint_coords.append(footprint_coords[0])
+            footprint_geojson = {
+                "type": "Feature",
+                "geometry": {"type": "Polygon", "coordinates": [footprint_coords]},
+                "properties": {
+                    "name": build_name,
+                    "height": building.height,
+                    "num_stories": num_stories,
+                    "source": f"mesh_{ext}",
+                },
+            }
+
+            record = BuildingRecord(
+                name=build_name,
+                source_type=f"mesh_{ext}",
+                geometry_data=json.dumps(footprint_geojson),
+                lat=building.lat,
+                lon=building.lon,
+                height=building.height,
+                num_stories=num_stories,
+                roof_type=roof_type,
+                roof_pitch_deg=roof_pitch_deg,
+                heading_deg=0.0,
+                properties_json=json.dumps({
+                    "width": building.width,
+                    "depth": building.depth,
+                    "mesh_format": ext,
+                    "auto_height": building.height,
+                    "mesh_viewer": getattr(building, "_mesh_viewer_data", None),
+                }),
+            )
+
+            db = get_db()
+            try:
+                db.add(record)
+                db.commit()
+                db.refresh(record)
+                result = record.to_dict()
+            finally:
+                db.close()
+
+            # Strip mesh_viewer binary blobs from the poll response — the
+            # frontend doesn't need them (mesh data flows through /generate).
+            result_clean = dict(result)
+            if "properties" in result_clean and isinstance(result_clean["properties"], dict):
+                result_clean["properties"] = {
+                    k: v for k, v in result_clean["properties"].items()
+                    if k != "mesh_viewer"
+                }
+
+            with _upload_lock:
+                _upload_tasks[task_id].update(
+                    status="complete", progress=1.0, message="Done", result=result_clean,
+                )
+
+        except Exception as e:
+            with _upload_lock:
+                _upload_tasks[task_id].update(
+                    status="error", progress=0.0, message=str(e), error=str(e),
+                )
+
+    threading.Thread(target=_process, daemon=True).start()
+    return {"task_id": task_id, "status": "processing", "message": f"Processing {file_size_mb:.0f} MB mesh…"}
+
+
+@router.get("/buildings/upload-status/{task_id}")
+def get_upload_status(task_id: str):
+    """Poll upload processing progress."""
+    with _upload_lock:
+        task = _upload_tasks.get(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Upload task not found")
+    return task
 
 
 @router.get("/buildings")
@@ -406,8 +470,7 @@ def benchmark_tsp(request: GenerateRequest):
                 from ..building_import import extract_facades
                 import trimesh
                 import numpy as np
-                positions = np.array(raw_mesh["positions"], dtype=np.float64).reshape(-1, 3)
-                indices = np.array(raw_mesh["indices"], dtype=np.int64).reshape(-1, 3)
+                positions, indices = decode_mesh_viewer_data(raw_mesh)
                 mesh_obj = trimesh.Trimesh(vertices=positions, faces=indices)
                 facades = extract_facades(mesh_obj, method=request.extraction_method, min_area_m2=request.min_facade_area, algo=algo_base)
                 if facades:
@@ -542,8 +605,7 @@ def generate(request: GenerateRequest):
                 import trimesh
                 import numpy as np
 
-                positions = np.array(raw_mesh["positions"], dtype=np.float64).reshape(-1, 3)
-                indices = np.array(raw_mesh["indices"], dtype=np.int64).reshape(-1, 3)
+                positions, indices = decode_mesh_viewer_data(raw_mesh)
                 mesh_obj = trimesh.Trimesh(vertices=positions, faces=indices)
 
                 facades = extract_facades(mesh_obj, method=request.extraction_method, min_area_m2=request.min_facade_area, algo=algo)
@@ -751,7 +813,17 @@ def generate(request: GenerateRequest):
     from ..building_import import last_rejected_candidates
     threejs_data = prepare_threejs_data(building, waypoints, candidate_facades=last_rejected_candidates)
     if raw_mesh:
-        threejs_data["rawMesh"] = raw_mesh
+        # Ensure raw mesh has flat arrays for the Three.js viewer.
+        # New uploads store compressed binary; decode to flat lists if needed.
+        if "positions" in raw_mesh and "indices" in raw_mesh:
+            threejs_data["rawMesh"] = {"positions": raw_mesh["positions"], "indices": raw_mesh["indices"]}
+        elif "positions_b64" in raw_mesh:
+            import numpy as np
+            verts, faces = decode_mesh_viewer_data(raw_mesh)
+            threejs_data["rawMesh"] = {
+                "positions": verts.astype(np.float32).flatten().round(3).tolist(),
+                "indices": faces.astype(np.int32).flatten().tolist(),
+            }
 
     viewer_data = {
         "threejs": threejs_data,

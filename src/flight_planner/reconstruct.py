@@ -201,13 +201,12 @@ def _export_render_mesh(building: Building, out_path: Path, raw_mesh: dict | Non
     """
     import trimesh
 
-    if raw_mesh and "positions" in raw_mesh and "indices" in raw_mesh:
+    if raw_mesh and ("positions" in raw_mesh or "positions_b64" in raw_mesh):
         # Use the actual raw mesh — the real building surface
-        n_v = len(raw_mesh["positions"]) // 3
-        n_f = len(raw_mesh["indices"]) // 3
+        from .building_import import decode_mesh_viewer_data
+        positions, indices = decode_mesh_viewer_data(raw_mesh)
+        n_v, n_f = len(positions), len(indices)
         logger.info(f"_export_render_mesh: using RAW MESH ({n_v} verts, {n_f} faces)")
-        positions = np.array(raw_mesh["positions"], dtype=np.float64).reshape(-1, 3)
-        indices = np.array(raw_mesh["indices"], dtype=np.int64).reshape(-1, 3)
         mesh = trimesh.Trimesh(vertices=positions, faces=indices)
         trimesh.repair.fix_normals(mesh)
 

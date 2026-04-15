@@ -66,6 +66,9 @@ export interface AlgorithmParams {
   enable_waypoint_los: boolean;
   los_tolerance_m: number;
   los_min_visible_ratio: number;
+  // Path collision checking
+  enable_path_collision_check: boolean;
+  path_collision_margin_m: number;
   // Path optimization
   grid_density: number;
   enable_path_dedup: boolean;

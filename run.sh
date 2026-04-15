@@ -11,7 +11,7 @@ if [ ! -x ".venv/bin/python" ] || ! .venv/bin/python -c "import sys" &>/dev/null
     echo "Venv missing or broken — recreating..."
     rm -rf .venv
     python3.12 -m venv .venv
-    .venv/bin/pip install -e ".[dev,server]" -q
+    .venv/bin/pip install -e ".[dev,server,mesh]" -q
 fi
 
 # Kill anything already on these ports

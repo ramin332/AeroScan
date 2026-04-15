@@ -20,7 +20,7 @@ const CAMERA_LABELS: Record<string, string> = {
 
 export function Sidebar() {
   const {
-    buildingSource, selectedBuildingId, buildings, uploading, minFacadeArea, extractionMethod, waypointStrategy,
+    buildingSource, selectedBuildingId, buildings, uploading, uploadProgress, uploadMessage, minFacadeArea, extractionMethod, waypointStrategy,
     preset, building, mission, algorithm, result, lightMode, setLightMode,
     disabledFacades, exclusionZones, toggleFacade, removeExclusionZone, updateExclusionZone,
     setBuildingSource, setPreset, setBuilding, setMission, setAlgorithm, resetAlgorithm, setMinFacadeArea, setExtractionMethod, setWaypointStrategy,
@@ -125,7 +125,11 @@ export function Sidebar() {
             <input ref={fileRef} type="file" accept=".json,.geojson,.obj,.ply,.stl,.glb,.gltf"
               onChange={handleFileChange} style={{ display: 'none' }} />
             {uploading ? (
-              <span className="upload-text">Uploading...</span>
+              <div className="upload-progress-info">
+                <div className="upload-progress-bar" style={{ width: `${Math.round(uploadProgress * 100)}%` }} />
+                <span className="upload-text">{uploadMessage || 'Processing…'}</span>
+                <span className="upload-hint">{Math.round(uploadProgress * 100)}%</span>
+              </div>
             ) : (
               <>
                 <span className="upload-icon">+</span>
@@ -390,6 +394,23 @@ export function Sidebar() {
               onReset={() => setAlgorithm({ los_min_visible_ratio: DEFAULT_ALGORITHM.los_min_visible_ratio })}
               onChange={(v) => setAlgorithm({ los_min_visible_ratio: v })} onCommit={autoGen} />
           </>
+        )}
+      </Section>
+
+      {/* ======== PATH COLLISION ======== */}
+      <Section title="Path Collision" defaultOpen>
+        <ToggleField label="Path collision check"
+          value={algorithm.enable_path_collision_check}
+          tooltip="Check flight path segments between waypoints for building collisions. Inserts detour waypoints to route around obstacles."
+          onChange={(v) => { setAlgorithm({ enable_path_collision_check: v }); autoGen(); }} />
+        {algorithm.enable_path_collision_check && (
+          <SliderField label="Collision margin" value={algorithm.path_collision_margin_m}
+            min={0.1} max={3} step={0.1}
+            format={(v) => `${v}m`}
+            tooltip="Buffer distance for segment collision test. A hit within this distance of a waypoint is ignored (the drone is already near the surface for inspection)."
+            defaultValue={DEFAULT_ALGORITHM.path_collision_margin_m}
+            onReset={() => setAlgorithm({ path_collision_margin_m: DEFAULT_ALGORITHM.path_collision_margin_m })}
+            onChange={(v) => setAlgorithm({ path_collision_margin_m: v })} onCommit={autoGen} />
         )}
       </Section>
 

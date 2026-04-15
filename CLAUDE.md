@@ -119,8 +119,9 @@ The mesh → facade → waypoint pipeline has multiple safety layers:
 2. **Centroid-based normal orientation** — initial outward guess
 3. **Visibility ray test** — cast from far outside along ±normal to verify the facade is reachable from outside the building. Interior faces (not visible from any direction) are rejected
 4. **Per-facade normal check** — before generating waypoints, verify normal orientation via visibility ray
-5. **Convex hull waypoint filter** — final safety net removes any waypoint inside the mesh's convex hull
+5. **Open3D ray-parity containment filter** — replaces convex hull. Uses `RaycastingScene.count_intersections()` (odd = inside) which correctly handles non-convex buildings (L-shaped, U-shaped, courtyards). Works on non-watertight meshes.
 6. **LOS (line-of-sight) check** — per-waypoint ray cast to verify clear view to facade surface
+7. **Path segment collision check** — for each consecutive waypoint pair, casts a ray along the flight path segment and checks for mesh intersections. Collisions are resolved by inserting altitude detour waypoints routed outward from the building. Unresolvable collisions are flagged as validation errors.
 
-### Mesh containment pitfall
-`mesh.contains()` requires a watertight mesh to work. Photogrammetry meshes are never watertight. Use `mesh.convex_hull.contains()` for reliable inside/outside tests, or use ray-based visibility tests which work on any mesh.
+### Mesh containment
+The old `mesh.convex_hull.contains()` approach failed for non-convex buildings (concave regions were incorrectly classified as "inside"). Open3D ray-parity (`count_intersections`, odd = inside) correctly handles all geometries including non-watertight photogrammetry meshes. `mesh.contains()` from trimesh still requires watertight meshes — avoid it.

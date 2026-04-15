@@ -10,12 +10,37 @@ and the polygon at height becomes a roof.
 
 from __future__ import annotations
 
+import base64
+import gzip
 import math
 from typing import Optional
 
 import numpy as np
 
 from .models import AlgorithmConfig, Building, Facade, meters_per_deg, RoofType
+
+
+def decode_mesh_viewer_data(raw_mesh: dict) -> tuple[np.ndarray, np.ndarray]:
+    """Decode mesh_viewer_data to (vertices, faces) numpy arrays.
+
+    Handles both formats:
+    - New: base64-encoded gzip-compressed binary (memory-efficient for large meshes)
+    - Legacy: flat JSON lists of floats/ints
+    """
+    if "positions_b64" in raw_mesh:
+        verts = np.frombuffer(
+            gzip.decompress(base64.b64decode(raw_mesh["positions_b64"])),
+            dtype=np.float32,
+        ).reshape(-1, 3).astype(np.float64)
+        faces = np.frombuffer(
+            gzip.decompress(base64.b64decode(raw_mesh["indices_b64"])),
+            dtype=np.int32,
+        ).reshape(-1, 3).astype(np.int64)
+    else:
+        verts = np.array(raw_mesh["positions"], dtype=np.float64).reshape(-1, 3)
+        faces = np.array(raw_mesh["indices"], dtype=np.int64).reshape(-1, 3)
+    return verts, faces
+
 
 # Module-level extraction stats populated by extract_facades / build_building_from_mesh.
 # Read by the API after calling these functions. Reset on each call.
@@ -251,7 +276,15 @@ def _extract_region_growing(
     # Use algo's angle threshold as the effective default
     angle_threshold_deg = algo.region_growing_angle_deg
 
-    n_faces = len(mesh.faces)
+    # Extract all trimesh arrays ONCE to avoid repeated cache hash verification.
+    # trimesh's TrackedArray rehashes the entire vertex/face buffer on every
+    # property access (~0.5ms per call × 29K regions = 75 seconds wasted).
+    _faces = np.asarray(mesh.faces)
+    _vertices = np.asarray(mesh.vertices)
+    _face_normals = np.asarray(mesh.face_normals)
+    _area_faces = np.asarray(mesh.area_faces)
+
+    n_faces = len(_faces)
     if n_faces < algo.min_mesh_faces:
         return None
 
@@ -268,37 +301,43 @@ def _extract_region_growing(
     # Connected components = groups of coplanar adjacent faces
     n_comp, labels = connected_components(graph, directed=False)
 
-    building_center = mesh.centroid.copy()
-    max_extent = float(max(mesh.bounding_box.extents))
+    building_center = _vertices.mean(axis=0)
+    max_extent = float((_vertices.max(axis=0) - _vertices.min(axis=0)).max())
 
     # --- Exterior vertex detection via Open3D Hidden Point Removal ---
     # Simulates viewing the mesh from multiple positions around the building.
     # Vertices never visible from any external viewpoint are interior.
+    #
+    # Skip HPR for meshes that were decimated or are from photogrammetry —
+    # decimation creates thin faces that HPR misclassifies as interior,
+    # and photogrammetry meshes don't have interior rooms anyway.
+    # The centroid-based normal orientation (below) handles outward-facing.
     _exterior_verts = None
-    try:
-        import open3d as o3d
-        pcd = o3d.geometry.PointCloud()
-        pcd.points = o3d.utility.Vector3dVector(mesh.vertices)
-        diameter = np.linalg.norm(
-            np.asarray(pcd.get_max_bound()) - np.asarray(pcd.get_min_bound())
-        )
-        radius = diameter * 100
-        visible = set()
-        # Camera positions on a sphere around the building
-        center_pt = mesh.centroid
-        for theta in np.linspace(0, 2 * np.pi, 12, endpoint=False):
-            for phi in [0.4, 0.8, 1.2, 1.5]:
-                cam = center_pt + np.array([
-                    diameter * np.cos(theta) * np.sin(phi),
-                    diameter * np.sin(theta) * np.sin(phi),
-                    diameter * np.cos(phi),
-                ])
-                _, pt_map = pcd.hidden_point_removal(cam.tolist(), radius)
-                visible.update(pt_map)
-        _exterior_verts = np.zeros(len(mesh.vertices), dtype=bool)
-        _exterior_verts[list(visible)] = True
-    except ImportError:
-        pass  # Open3D not available — skip HPR, fall back to occlusion check
+    _skip_hpr = n_faces <= algo.hpr_max_faces if hasattr(algo, 'hpr_max_faces') else n_faces <= 200_000
+    if not _skip_hpr:
+        try:
+            import open3d as o3d
+            pcd = o3d.geometry.PointCloud()
+            pcd.points = o3d.utility.Vector3dVector(_vertices)
+            diameter = np.linalg.norm(
+                np.asarray(pcd.get_max_bound()) - np.asarray(pcd.get_min_bound())
+            )
+            radius = diameter * 100
+            visible = set()
+            center_pt = building_center
+            for theta in np.linspace(0, 2 * np.pi, 12, endpoint=False):
+                for phi in [0.4, 0.8, 1.2, 1.5]:
+                    cam = center_pt + np.array([
+                        diameter * np.cos(theta) * np.sin(phi),
+                        diameter * np.sin(theta) * np.sin(phi),
+                        diameter * np.cos(phi),
+                    ])
+                    _, pt_map = pcd.hidden_point_removal(cam.tolist(), radius)
+                    visible.update(pt_map)
+            _exterior_verts = np.zeros(len(_vertices), dtype=bool)
+            _exterior_verts[list(visible)] = True
+        except ImportError:
+            pass
     facades: list[Facade] = []
     rejected: list[Facade] = []
     idx = 0
@@ -320,11 +359,11 @@ def _extract_region_growing(
 
     for comp_id in range(n_comp):
         face_mask = labels == comp_id
-        comp_area = float(mesh.area_faces[face_mask].sum())
+        comp_area = float(_area_faces[face_mask].sum())
 
         # Area-weighted average normal
-        comp_normals = mesh.face_normals[face_mask]
-        comp_areas = mesh.area_faces[face_mask]
+        comp_normals = _face_normals[face_mask]
+        comp_areas = _area_faces[face_mask]
         avg_normal = (comp_normals * comp_areas[:, np.newaxis]).sum(axis=0)
         norm_len = np.linalg.norm(avg_normal)
         if norm_len < 1e-9:
@@ -335,8 +374,8 @@ def _extract_region_growing(
 
         # Get vertices of all faces in this component
         face_indices = np.where(face_mask)[0]
-        vert_indices = np.unique(mesh.faces[face_indices].flatten())
-        verts = mesh.vertices[vert_indices]
+        vert_indices = np.unique(_faces[face_indices].flatten())
+        verts = _vertices[vert_indices]
         center = verts.mean(axis=0)
 
         # Orient normal outward (away from building center)
@@ -674,6 +713,7 @@ def build_building_from_mesh(
     min_facade_area: float = 1.0,
     method: str = "region_growing",
     algo: AlgorithmConfig | None = None,
+    progress_callback: Optional[callable] = None,
 ) -> Building:
     """Create a Building from an OBJ/PLY/STL mesh file.
 
@@ -693,6 +733,11 @@ def build_building_from_mesh(
     if algo is None:
         algo = AlgorithmConfig()
 
+    def _progress(p: float, msg: str) -> None:
+        if progress_callback is not None:
+            progress_callback(p, msg)
+
+    _progress(0.0, "Parsing mesh file…")
     mesh = trimesh.load(io.BytesIO(mesh_data), file_type=file_type)
 
     # Handle Scene objects (e.g., OBJ with multiple groups)
@@ -705,18 +750,20 @@ def build_building_from_mesh(
     if not isinstance(mesh, trimesh.Trimesh) or len(mesh.vertices) == 0:
         raise ValueError("Could not load mesh or mesh is empty")
 
+    n_faces_orig = len(mesh.faces)
+    n_verts_orig = len(mesh.vertices)
+    _progress(0.10, f"Loaded {n_verts_orig:,} vertices, {n_faces_orig:,} faces")
+
     # OBJ/GLTF/FBX files typically use Y-up convention.
     # PLY/STL files typically use Z-up.
     # We need Z-up (ENU: x=East, y=North, z=Up) for our coordinate system.
-    # Y-up → Z-up rotation: (x, y, z) → (x, -z, y)
+    # Y-up → Z-up rotation: swap Y and Z in-place (no .copy() needed)
     if file_type in ("obj", "glb", "gltf"):
-        verts = mesh.vertices.copy()
-        mesh.vertices[:, 0] = verts[:, 0]   # x stays
-        mesh.vertices[:, 1] = -verts[:, 2]  # y_new = -z_old (forward)
-        mesh.vertices[:, 2] = verts[:, 1]   # z_new = y_old (up)
+        y_old = mesh.vertices[:, 1].copy()
+        mesh.vertices[:, 1] = -mesh.vertices[:, 2]
+        mesh.vertices[:, 2] = y_old
 
-    # Fix mesh normals using trimesh's built-in repair (ensures consistent
-    # outward-facing normals on watertight or near-watertight meshes).
+    _progress(0.15, f"Fixing normals ({len(mesh.faces):,} faces)…")
     trimesh.repair.fix_normals(mesh)
 
     # Center the mesh at origin
@@ -753,51 +800,56 @@ def build_building_from_mesh(
 
     name = name or "Mesh building"
 
-    # Try facet-based extraction first (gives real wall/roof planes from mesh).
-    # Fall back to convex hull if facets aren't available.
-    facades = extract_facades(mesh, method=method, min_area_m2=min_facade_area, algo=algo)
+    # At upload time, only compute a convex hull footprint for the building
+    # outline and basic dimensions. Facade extraction (the expensive part) is
+    # deferred to /generate where the user's extraction method and parameters
+    # are applied to the stored mesh.
+    _progress(0.30, "Computing building footprint…")
+    from scipy.spatial import ConvexHull  # fast C implementation
+    pts_2d = mesh.vertices[:, :2]  # stay in numpy, no Python tuples
+    try:
+        hull = ConvexHull(pts_2d)
+        hull_coords = [(float(pts_2d[i, 0]), float(pts_2d[i, 1])) for i in hull.vertices]
+    except Exception:
+        # Fallback for degenerate meshes
+        hull_coords = _convex_hull_2d([(float(v[0]), float(v[1])) for v in mesh.vertices])
+    if len(hull_coords) < 3:
+        raise ValueError("Mesh footprint has fewer than 3 hull points")
 
-    if facades:
-        xs = [float(v[0]) for f in facades for v in f.vertices]
-        ys = [float(v[1]) for f in facades for v in f.vertices]
-        width = round(max(xs) - min(xs), 1) if xs else 0
-        depth = round(max(ys) - min(ys), 1) if ys else 0
+    xs = [p[0] for p in hull_coords]
+    ys = [p[1] for p in hull_coords]
+    width = round(max(xs) - min(xs), 1)
+    depth = round(max(ys) - min(ys), 1)
 
-        building = Building(
-            lat=lat,
-            lon=lon,
-            width=width,
-            depth=depth,
-            height=height,
-            heading_deg=0.0,
-            roof_type=RoofType(roof_type),
-            roof_pitch_deg=roof_pitch_deg,
-            num_stories=num_stories,
-            facades=facades,
-            label=name,
-        )
-    else:
-        # Fallback: convex hull footprint + flat roof
-        points_2d = [(float(v[0]), float(v[1])) for v in mesh.vertices]
-        hull = _convex_hull_2d(points_2d)
-        if len(hull) < 3:
-            raise ValueError("Mesh footprint has fewer than 3 hull points")
-        building = _footprint_to_building(
-            enu_coords=hull,
-            center_lat=lat,
-            center_lon=lon,
-            height=height,
-            num_stories=num_stories,
-            roof_type_str=roof_type,
-            roof_pitch_deg=roof_pitch_deg,
-            name=name,
-        )
+    building = _footprint_to_building(
+        enu_coords=hull_coords,
+        center_lat=lat,
+        center_lon=lon,
+        height=height,
+        num_stories=num_stories,
+        roof_type_str=roof_type,
+        roof_pitch_deg=roof_pitch_deg,
+        name=name,
+    )
+    _progress(0.50, f"Building: {width}m x {depth}m x {height}m, {len(mesh.faces):,} faces")
 
-    # Attach processed mesh geometry for 3D viewer rendering.
-    # Stored as a compact dict of flat arrays (positions + face indices).
+    # Attach processed mesh geometry for 3D viewer rendering and later
+    # facade extraction. Stored as base64-encoded compressed numpy arrays
+    # instead of JSON .tolist() to avoid the Python-object memory explosion
+    # (tolist on 1M verts = ~600MB of Python floats vs ~4MB compressed).
+    positions_f32 = mesh.vertices.astype(np.float32)
+    indices_i32 = mesh.faces.astype(np.int32)
+
+    _progress(0.85, "Compressing mesh for storage…")
     building._mesh_viewer_data = {
-        "positions": mesh.vertices.flatten().round(3).tolist(),
-        "indices": mesh.faces.flatten().tolist(),
+        "positions_b64": base64.b64encode(gzip.compress(positions_f32.tobytes())).decode("ascii"),
+        "indices_b64": base64.b64encode(gzip.compress(indices_i32.tobytes())).decode("ascii"),
+        "n_vertices": len(mesh.vertices),
+        "n_faces": len(mesh.faces),
+        # Keep flat arrays for small meshes (Three.js viewer needs them directly)
+        **({"positions": positions_f32.flatten().round(3).tolist(),
+            "indices": indices_i32.flatten().tolist()}
+           if len(mesh.faces) <= 200_000 else {}),
     }
 
     return building

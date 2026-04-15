@@ -53,8 +53,8 @@ function FacadeMesh({ vertices, color, hidden, highlighted, dimmed, disabled, on
   if (hidden) return null;
 
   const displayColor = disabled ? '#555' : dimmed ? '#667' : color;
-  const opacity = disabled ? 0.12 : dimmed ? 0.3 : highlighted ? 0.85 : 0.35;
-  const occlude = !disabled; // depth-only pass blocks things behind the facade
+  const opacity = disabled ? 0.12 : dimmed ? 0.15 : highlighted ? 0.55 : 0.2;
+  const occlude = !disabled && !dimmed; // depth-only pass blocks things behind the facade
 
   return (
     <group onClick={onClick}>
@@ -248,17 +248,17 @@ function RawMeshView({ mesh, dimmed }: { mesh: RawMeshData; dimmed?: boolean }) 
 
   return (
     <group>
-      {/* Ghost mesh: semi-transparent for orbital view */}
+      {/* Building mesh: prominent in orbital view, dimmed during flight */}
       <group>
         <mesh geometry={geometry} renderOrder={-1}>
           <meshStandardMaterial
-            color="#8899bb"
+            color="#a0b0c8"
             transparent
-            opacity={dimmed ? 0.08 : 0.25}
+            opacity={dimmed ? 0.1 : 0.7}
             side={THREE.DoubleSide}
-            roughness={0.7}
-            metalness={0.1}
-            depthWrite={false}
+            roughness={0.5}
+            metalness={0.15}
+            depthWrite={!dimmed}
           />
         </mesh>
         <mesh geometry={geometry} renderOrder={-1}>

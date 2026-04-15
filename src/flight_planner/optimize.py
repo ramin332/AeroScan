@@ -99,7 +99,7 @@ def deduplicate_waypoints(
 
         # Check gimbal angle similarity
         pitch_diff = abs(wp_i.gimbal_pitch_deg - wp_j.gimbal_pitch_deg)
-        yaw_diff = abs(wp_i.gimbal_yaw_deg - wp_j.gimbal_yaw_deg)
+        yaw_diff = abs((wp_i.gimbal_yaw_deg or 0.0) - (wp_j.gimbal_yaw_deg or 0.0))
         if yaw_diff > 180:
             yaw_diff = 360 - yaw_diff
 

@@ -69,6 +69,21 @@ def validate_mission(
 
     inspection_wps = [wp for wp in waypoints if not wp.is_transition]
 
+    # --- Numeric validity (NaN / Infinity would corrupt the KMZ) ---
+
+    _NUMERIC_FIELDS = ("x", "y", "z", "lat", "lon", "alt", "heading_deg", "gimbal_pitch_deg", "speed_ms")
+    for wp in waypoints:
+        for attr in _NUMERIC_FIELDS:
+            val = getattr(wp, attr, None)
+            if val is not None and (math.isnan(val) or math.isinf(val)):
+                issues.append(ValidationIssue(
+                    severity=Severity.ERROR,
+                    code="invalid_waypoint_value",
+                    message=f"WP{wp.index}: {attr} is {val} (NaN or infinity) — degenerate geometry?",
+                    waypoint_indices=[wp.index],
+                ))
+                break  # one error per waypoint is enough
+
     # --- Hard constraints (errors) ---
 
     if len(waypoints) > MAX_WAYPOINTS_PER_MISSION:
@@ -224,6 +239,22 @@ def validate_mission(
             severity=Severity.INFO,
             code="exclusion_zone_filtered",
             message=f"{zone_removed} waypoints removed by {', '.join(zone_desc)} zone(s)",
+        ))
+
+    # Path collision checks
+    path_unresolved = stats.get("path_collisions_unresolved", 0)
+    if path_unresolved > 0:
+        issues.append(ValidationIssue(
+            severity=Severity.ERROR,
+            code="path_collision",
+            message=f"{path_unresolved} flight path segment(s) clip through the building — increase clearance or adjust waypoints",
+        ))
+    path_resolved = stats.get("path_collisions_resolved", 0)
+    if path_resolved > 0:
+        issues.append(ValidationIssue(
+            severity=Severity.INFO,
+            code="path_collision_resolved",
+            message=f"{path_resolved} path collision(s) resolved by inserting detour waypoints",
         ))
 
     disabled = stats.get("disabled_facades", [])

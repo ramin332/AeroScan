@@ -80,10 +80,12 @@ CAMERAS: dict[CameraName, CameraSpec] = {
     ),
 }
 
-# Gimbal constraints (Matrice 4E)
+# Gimbal constraints (Matrice 4E) — confirmed in PSDK v3.15.0 gimbal management docs.
+# In Waypoint V3 (KMZ), gimbal yaw is set per-waypoint via gimbalYawRotateAngle
+# action (absolute angle from geographic north). ±60° range relative to aircraft body.
 GIMBAL_TILT_MIN_DEG = -90  # straight down
 GIMBAL_TILT_MAX_DEG = 35  # looking up
-GIMBAL_PAN_MIN_DEG = -60  # left (software-controlled via PSDK only)
+GIMBAL_PAN_MIN_DEG = -60  # left (set via WPML gimbalYawRotateAngle action)
 GIMBAL_PAN_MAX_DEG = 60  # right
 
 # Flight constraints
@@ -145,7 +147,7 @@ class Waypoint:
 
     # Gimbal angles
     gimbal_pitch_deg: float = 0.0
-    gimbal_yaw_deg: float = 0.0
+    gimbal_yaw_deg: Optional[float] = None  # None = follow aircraft heading; absolute deg from north when set
 
     # Flight speed to this waypoint (m/s)
     speed_ms: float = INSPECTION_SPEED_MS
@@ -399,6 +401,10 @@ class AlgorithmConfig:
     dedup_max_gimbal_diff_deg: float = 20.0  # max gimbal angle diff for merge eligibility
     tsp_method: str = "auto"  # "auto" | "nearest_neighbor" | "greedy" | "simulated_annealing" | "threshold_accepting"
 
+    # -- Path collision checking (geometry.py) --
+    enable_path_collision_check: bool = True  # check flight segments for mesh intersection
+    path_collision_margin_m: float = 0.5  # buffer distance for segment collision test
+
     # -- KMZ export (kmz_builder.py) --
     min_waypoint_height_m: float = 2.0  # clamp waypoint Z in KMZ output
 
@@ -424,10 +430,10 @@ class MissionConfig:
     # Mission metadata
     mission_name: str = "AeroScan Inspection"
 
-    # Drone enum value
-    # TODO: confirm droneEnumValue for Matrice 4E
-    drone_enum_value: int = 77  # placeholder, M3E=77, M4E TBD
-    payload_enum_value: int = 52  # placeholder
+    # Drone enum value — PROVISIONAL: using M3E values until DJI publishes M4E-specific
+    # WPML enum. DJI Pilot 2 validates against the connected drone at runtime.
+    drone_enum_value: int = 77  # PROVISIONAL (M3E=77, M4E TBD)
+    payload_enum_value: int = 66  # PROVISIONAL (M3E integrated camera=66)
 
     # Detail capture: take telephoto photos at flagged points
     enable_detail_capture: bool = False

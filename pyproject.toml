@@ -30,6 +30,7 @@ mesh = [
     "open3d>=0.17",
     "pyrender>=0.1.45",
     "fast-simplification>=0.1",
+    "pymeshlab>=2023.12",
 ]
 
 [build-system]
