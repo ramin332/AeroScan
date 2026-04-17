@@ -45,13 +45,27 @@ class BuildingRecord(Base):
     properties_json = Column(Text, default="{}")
     created_at = Column(String, default=lambda: datetime.now(timezone.utc).isoformat())
 
-    def to_dict(self) -> dict:
+    # Keys in properties_json that store multi-MB blobs. Stripped from list
+    # responses so `GET /buildings` doesn't ship the whole mesh + point cloud
+    # for every imported building.
+    _HEAVY_PROP_KEYS = frozenset({
+        "mesh_viewer",
+        "ply_b64",
+        "pc_b64",
+        "waypoints_raw",
+        "mission_area_wgs84",
+        "mission_config_raw",
+    })
+
+    def to_dict(self, include_heavy: bool = False) -> dict:
         props = {}
         if self.properties_json:
             try:
                 props = json.loads(self.properties_json)
             except (json.JSONDecodeError, TypeError):
                 pass
+        if not include_heavy:
+            props = {k: v for k, v in props.items() if k not in self._HEAVY_PROP_KEYS}
         return {
             "id": self.id,
             "name": self.name,
@@ -68,6 +82,23 @@ class BuildingRecord(Base):
             "properties": props,
             "created_at": self.created_at,
         }
+
+
+class FacadeCacheRecord(Base):
+    """JSON-serialized facade-extraction results keyed by (building_id, params_hash).
+
+    Facade extraction for a large mesh involves HPR with ~48 camera viewpoints
+    plus per-region raycasting — expensive enough that we want results to
+    survive server restarts. The in-memory dict layered on top of this is still
+    the hot path; this table is the cold-start fallback.
+    """
+
+    __tablename__ = "facade_cache"
+
+    cache_key = Column(String, primary_key=True)       # "{building_id}:{params_md5}"
+    building_id = Column(String, index=True, nullable=False)
+    payload_json = Column(Text, nullable=False)        # JSON {"facades":[...], "bbox":[...]}
+    created_at = Column(String, default=lambda: datetime.now(timezone.utc).isoformat())
 
 
 class SimulationRecord(Base):

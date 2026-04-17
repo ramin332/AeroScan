@@ -52,8 +52,17 @@ def _escape_html(text: str) -> str:
     )
 
 
-def prepare_leaflet_data(building: Building, waypoints: list[Waypoint]) -> dict:
-    """Prepare JSON-serializable data for the 2D Leaflet satellite map viewer."""
+def prepare_leaflet_data(
+    building: Building,
+    waypoints: list[Waypoint],
+    mission_area_poly: list[tuple[float, float]] | None = None,
+) -> dict:
+    """Prepare JSON-serializable data for the 2D Leaflet satellite map viewer.
+
+    ``mission_area_poly`` is an optional list of ``[lat, lon]`` points describing
+    an imported DJI mission-area polygon. When present, the frontend renders it
+    as a dashed outline distinct from the building footprint.
+    """
     center_lat = building.lat
     center_lon = building.lon
 
@@ -103,7 +112,7 @@ def prepare_leaflet_data(building: Building, waypoints: list[Waypoint]) -> dict:
             "component": f.component_tag,
         }
 
-    return {
+    result = {
         "facadeGroups": facade_groups,
         "facadeMeta": facade_meta,
         "flightPath": [[wp.lon, wp.lat] for wp in waypoints],
@@ -114,14 +123,26 @@ def prepare_leaflet_data(building: Building, waypoints: list[Waypoint]) -> dict:
         "waypointCount": len(waypoints),
         "facadeCount": len(building.facades),
     }
+    if mission_area_poly:
+        result["missionAreaPoly"] = [[lat, lon] for lat, lon in mission_area_poly]
+    return result
 
 
 def prepare_threejs_data(
     building: Building,
     waypoints: list[Waypoint],
     candidate_facades: list | None = None,
+    point_cloud: dict | None = None,
+    mission_area: list[tuple[float, float, float]] | None = None,
 ) -> dict:
-    """Prepare JSON-serializable data for the 3D Three.js viewer."""
+    """Prepare JSON-serializable data for the 3D Three.js viewer.
+
+    ``point_cloud`` — optional ``{"positions": [...], "colors": [...]}`` flat
+    float lists in ENU coordinates (colors 0..1). Rendered as ``THREE.Points``.
+
+    ``mission_area`` — optional list of ``(x, y, z)`` ENU vertices forming the
+    imported DJI mission-area polygon. Rendered as a dashed ground outline.
+    """
     facade_data = []
     for f in building.facades:
         normal_list = f.normal.tolist()
@@ -163,7 +184,7 @@ def prepare_threejs_data(
                 "direction": _facade_direction(normal_list),
             })
 
-    return {
+    result = {
         "facades": facade_data,
         "candidateFacades": candidate_data,
         "waypoints": wp_data,
@@ -171,3 +192,10 @@ def prepare_threejs_data(
         "buildingDims": f"{building.width}m x {building.depth}m x {building.height}m",
         "buildingHeight": building.height,
     }
+    if point_cloud is not None:
+        result["pointCloud"] = point_cloud
+    if mission_area:
+        result["missionArea"] = {
+            "vertices": [[float(x), float(y), float(z)] for x, y, z in mission_area],
+        }
+    return result

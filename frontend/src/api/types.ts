@@ -185,8 +185,23 @@ export interface WaypointData {
 }
 
 export interface RawMeshData {
-  positions: number[]; // flat [x0,y0,z0, x1,y1,z1, ...]
-  indices: number[];   // flat [i0,j0,k0, i1,j1,k1, ...]
+  // Legacy shape (kept for small meshes): flat JS-number arrays.
+  positions?: number[]; // flat [x0,y0,z0, x1,y1,z1, ...]
+  indices?: number[];   // flat [i0,j0,k0, i1,j1,k1, ...]
+  // Fast path: gzip+base64 of Float32Array (xyz) / Int32Array (triangles).
+  positions_b64?: string;
+  indices_b64?: string;
+  n_vertices?: number;
+  n_faces?: number;
+}
+
+export interface PointCloudData {
+  positions: number[]; // flat [x0,y0,z0, x1,y1,z1, ...] in ENU meters
+  colors: number[];    // flat [r0,g0,b0, ...] in 0..1
+}
+
+export interface MissionAreaData {
+  vertices: number[][]; // [[x,y,z], ...] in ENU meters
 }
 
 export interface ThreeJSData {
@@ -197,6 +212,8 @@ export interface ThreeJSData {
   buildingDims: string;
   buildingHeight: number;
   rawMesh?: RawMeshData | null;
+  pointCloud?: PointCloudData;
+  missionArea?: MissionAreaData;
 }
 
 // Leaflet viewer data
@@ -228,6 +245,7 @@ export interface LeafletData {
   buildingDims: string;
   waypointCount: number;
   facadeCount: number;
+  missionAreaPoly?: [number, number][]; // [lat, lon] pairs, DJI Smart3D import only
 }
 
 export interface ViewerData {

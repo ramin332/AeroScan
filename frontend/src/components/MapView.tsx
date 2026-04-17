@@ -304,6 +304,15 @@ export function MapView({ data }: { data: LeafletData | null }) {
           </Polygon>
         )}
 
+        {data.missionAreaPoly && data.missionAreaPoly.length > 2 && (
+          <Polygon
+            positions={data.missionAreaPoly as [number, number][]}
+            pathOptions={{ color: '#22d3ee', weight: 2, fill: false, dashArray: '6 4' }}
+          >
+            <Popup>DJI mission area</Popup>
+          </Polygon>
+        )}
+
         {Object.entries(data.facadeGroups).map(([fi, wps]) => {
           const meta = data.facadeMeta[fi];
           const color = meta?.color || '#888';

@@ -24,11 +24,13 @@ export function Sidebar() {
     preset, building, mission, algorithm, result, lightMode, setLightMode,
     disabledFacades, exclusionZones, toggleFacade, removeExclusionZone, updateExclusionZone,
     setBuildingSource, setPreset, setBuilding, setMission, setAlgorithm, resetAlgorithm, setMinFacadeArea, setExtractionMethod, setWaypointStrategy,
-    uploadBuilding, selectBuilding, deleteBuilding,
+    uploadBuilding, importKmz, optimizeKmz, cancelOptimize, selectBuilding, deleteBuilding,
+    kmzOptimizing, kmzOptimizeMessage, kmzAutoRefine, setKmzAutoRefine,
     simStatus, simProgress, simMessage, startSimulation,
   } = useStore();
 
   const fileRef = useRef<HTMLInputElement>(null);
+  const kmzRef = useRef<HTMLInputElement>(null);
 
   const isUploadMode = buildingSource === 'upload';
   const autoGen = () => {
@@ -64,6 +66,23 @@ export function Sidebar() {
   const handleDragOver = (e: React.DragEvent) => {
     e.preventDefault();
     e.stopPropagation();
+  };
+
+  const handleKmzChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (file) {
+      importKmz(file);
+      e.target.value = '';
+    }
+  };
+
+  const handleKmzDrop = (e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    const file = e.dataTransfer.files[0];
+    if (file && file.name.toLowerCase().endsWith('.kmz')) {
+      importKmz(file);
+    }
   };
 
   const resetAll = () => {
@@ -117,6 +136,28 @@ export function Sidebar() {
         </div>
       </div>
 
+      {/* DJI KMZ import — always visible */}
+      <div className="section">
+        <div className="upload-zone" onClick={() => kmzRef.current?.click()}
+          onDrop={handleKmzDrop} onDragOver={handleDragOver}>
+          <input ref={kmzRef} type="file" accept=".kmz"
+            onChange={handleKmzChange} style={{ display: 'none' }} />
+          {uploading ? (
+            <div className="upload-progress-info">
+              <div className="upload-progress-bar" style={{ width: `${Math.round(uploadProgress * 100)}%` }} />
+              <span className="upload-text">{uploadMessage || 'Processing…'}</span>
+              <span className="upload-hint">{Math.round(uploadProgress * 100)}%</span>
+            </div>
+          ) : (
+            <>
+              <span className="upload-icon">+</span>
+              <span className="upload-text">Import DJI KMZ</span>
+              <span className="upload-hint">Smart3D mission with point cloud</span>
+            </>
+          )}
+        </div>
+      </div>
+
       {/* Upload mode */}
       {isUploadMode && (
         <div className="section">
@@ -167,6 +208,36 @@ export function Sidebar() {
                 onChange={(v) => setBuilding({ lat: v })} onCommit={autoGen} />
               <Field label="Lon" value={building.lon} step={0.0001}
                 onChange={(v) => setBuilding({ lon: v })} onCommit={autoGen} />
+              {selectedBuilding.source_type === 'kmz_import' && (
+                <div style={{ marginTop: 8, paddingTop: 8, borderTop: '1px solid var(--border)' }}>
+                  <div style={{ fontSize: 11, color: 'var(--muted)', marginBottom: 6, fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.5px' }}>
+                    Reconstruction
+                  </div>
+                  <button
+                    onClick={() => kmzOptimizing ? cancelOptimize() : optimizeKmz()}
+                    disabled={uploading}
+                    title="Iteratively re-reconstruct at progressively finer voxel sizes (0.20 → 0.12 → 0.07 → 0.04m). Runs in background — keep using the app."
+                    style={{
+                      width: '100%', padding: '6px 10px', fontSize: 12,
+                      background: kmzOptimizing ? '#dc2626' : '#0ea5e9',
+                      color: '#fff', border: 'none', borderRadius: 4,
+                      cursor: uploading ? 'wait' : 'pointer', fontWeight: 600,
+                    }}>
+                    {kmzOptimizing ? 'Cancel optimize' : 'Optimize ↻'}
+                  </button>
+                  {kmzOptimizeMessage && (
+                    <div style={{ fontSize: 10, color: kmzOptimizing ? '#22d3ee' : 'var(--muted)', marginTop: 4, lineHeight: 1.4 }}>
+                      {kmzOptimizeMessage}
+                    </div>
+                  )}
+                  <label style={{ display: 'flex', alignItems: 'center', gap: 6, marginTop: 6, fontSize: 12, cursor: 'pointer' }}
+                    title="Auto-start Optimize after a fresh KMZ import.">
+                    <input type="checkbox" checked={kmzAutoRefine}
+                      onChange={(e) => setKmzAutoRefine(e.target.checked)} />
+                    <span style={{ color: 'var(--muted)' }}>Auto-optimize after import</span>
+                  </label>
+                </div>
+              )}
             </div>
           )}
         </div>

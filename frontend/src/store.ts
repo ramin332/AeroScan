@@ -150,6 +150,14 @@ interface AppState {
 
   // Building upload actions
   uploadBuilding: (file: File) => Promise<void>;
+  importKmz: (file: File, voxelSize?: number | null) => Promise<void>;
+  refineKmz: (voxelSize: number) => Promise<void>;
+  optimizeKmz: (buildingId?: string | null) => Promise<void>;
+  cancelOptimize: () => void;
+  kmzOptimizing: boolean;
+  kmzOptimizeMessage: string;
+  kmzAutoRefine: boolean;
+  setKmzAutoRefine: (v: boolean) => void;
   selectBuilding: (id: string) => void;
   deleteBuilding: (id: string) => Promise<void>;
   refreshBuildings: () => Promise<void>;
@@ -424,6 +432,123 @@ export const useStore = create<AppState>()(persist((set, get) => ({
       }));
     } catch (e) {
       console.error('Upload failed:', e);
+      set({ uploading: false, uploadProgress: 0, uploadMessage: String(e) });
+    }
+  },
+
+  kmzOptimizing: false,
+  kmzOptimizeMessage: '',
+  kmzAutoRefine: false,
+  setKmzAutoRefine: (v: boolean) => set({ kmzAutoRefine: v }),
+
+  refineKmz: async (voxelSize: number) => {
+    const { selectedBuildingId } = get();
+    if (!selectedBuildingId) return;
+    const { task_id } = await api.refineKmzBuilding(selectedBuildingId, voxelSize);
+    const result = await new Promise<GenerateResponse & { building_id?: string }>((resolve, reject) => {
+      const poll = async () => {
+        try {
+          const status = await api.getKmzImportStatus(task_id);
+          set({ kmzOptimizeMessage: status.message });
+          if (status.status === 'complete' && status.result) {
+            resolve(status.result as GenerateResponse & { building_id?: string });
+          } else if (status.status === 'error') {
+            reject(new Error(status.error || 'Refine failed'));
+          } else {
+            setTimeout(poll, 1000);
+          }
+        } catch (e) { reject(e); }
+      };
+      poll();
+    });
+    set({ result });
+    await get().refreshVersions();
+    await get().refreshBuildings();
+  },
+
+  cancelOptimize: () => set({ kmzOptimizing: false, kmzOptimizeMessage: 'Cancelled' }),
+
+  optimizeKmz: async (buildingId?: string | null) => {
+    const target = buildingId ?? get().selectedBuildingId;
+    if (!target) return;
+    if (get().kmzOptimizing) return;
+    const schedule = [0.20, 0.12, 0.07, 0.04];
+    set({ kmzOptimizing: true, kmzOptimizeMessage: 'Starting optimization…' });
+    try {
+      for (let i = 0; i < schedule.length; i++) {
+        if (!get().kmzOptimizing) break;
+        const v = schedule[i];
+        set({ kmzOptimizeMessage: `Pass ${i + 1}/${schedule.length} (voxel=${v.toFixed(2)}m)…` });
+        try {
+          await get().refineKmz(v);
+        } catch (e) {
+          console.warn(`Optimize pass voxel=${v} failed:`, e);
+          set({ kmzOptimizeMessage: `Pass ${i + 1} failed — stopping` });
+          break;
+        }
+      }
+      if (get().kmzOptimizing) {
+        set({ kmzOptimizeMessage: 'Optimization complete' });
+      }
+    } finally {
+      set({ kmzOptimizing: false });
+      setTimeout(() => {
+        if (!get().kmzOptimizing) set({ kmzOptimizeMessage: '' });
+      }, 4000);
+    }
+  },
+
+  importKmz: async (file: File, voxelSizeArg?: number | null) => {
+    const fileSizeMB = (file.size / (1024 * 1024)).toFixed(1);
+    const voxelSize = voxelSizeArg ?? null;
+    set({ uploading: true, uploadProgress: 0, uploadMessage: `Uploading ${fileSizeMB} MB KMZ…` });
+    try {
+      const { task_id } = await api.importKmz(file, voxelSize, (loaded, total) => {
+        const pct = total > 0 ? loaded / total : 0;
+        const loadedMB = (loaded / (1024 * 1024)).toFixed(1);
+        set({ uploadProgress: pct * 0.3, uploadMessage: `Uploading ${loadedMB}/${fileSizeMB} MB…` });
+      });
+
+      set({ uploadProgress: 0.3, uploadMessage: 'Parsing KMZ…' });
+      const result = await new Promise<GenerateResponse & { building_id?: string }>((resolve, reject) => {
+        const poll = async () => {
+          try {
+            const status = await api.getKmzImportStatus(task_id);
+            const progress = 0.3 + status.progress * 0.7;
+            set({ uploadProgress: progress, uploadMessage: status.message });
+            if (status.status === 'complete' && status.result) {
+              resolve(status.result as GenerateResponse & { building_id?: string });
+            } else if (status.status === 'error') {
+              reject(new Error(status.error || 'Import failed'));
+            } else {
+              setTimeout(poll, 1000);
+            }
+          } catch (e) {
+            reject(e);
+          }
+        };
+        poll();
+      });
+
+      set({
+        result,
+        uploading: false,
+        uploadProgress: 0,
+        uploadMessage: '',
+        activeTab: '3d',
+      });
+      await get().refreshVersions();
+      await get().refreshBuildings();
+      if (result.building_id) {
+        set({ selectedBuildingId: result.building_id, buildingSource: 'upload', preset: null });
+      }
+
+      // --- Background optimization chain (fire-and-forget, non-blocking) ---
+      if (get().kmzAutoRefine && result.building_id) {
+        void get().optimizeKmz(result.building_id);
+      }
+    } catch (e) {
+      console.error('KMZ import failed:', e);
       set({ uploading: false, uploadProgress: 0, uploadMessage: String(e) });
     }
   },

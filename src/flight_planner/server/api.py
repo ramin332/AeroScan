@@ -13,6 +13,7 @@ from typing import Literal, Optional
 from fastapi import APIRouter, Form, HTTPException, UploadFile
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
+from sqlalchemy import func
 
 from ..building_import import build_building_from_geojson, build_building_from_mesh, decode_mesh_viewer_data
 from ..reconstruct import delete_task as delete_sim_task, get_task as get_sim_task, get_task_result as get_sim_result, list_tasks as list_sim_tasks, start_simulation_async
@@ -44,7 +45,7 @@ from ..models import (
 )
 from ..validate import validate_mission
 from ..visualize import prepare_leaflet_data, prepare_threejs_data
-from .database import BuildingRecord, get_db
+from .database import BuildingRecord, FacadeCacheRecord, get_db
 from .state import session
 
 router = APIRouter()
@@ -53,6 +54,139 @@ router = APIRouter()
 
 _upload_tasks: dict[str, dict] = {}
 _upload_lock = threading.Lock()
+
+# --- Facade-extraction cache ---
+# Keyed by (building_id, fingerprint of extraction-affecting params). Stores
+# the decoded trimesh.Trimesh + extracted facades list. Avoids re-running
+# region-growing facade extraction every /generate when the user is only
+# tweaking mission parameters (GSD, camera, speed, etc.).
+_facade_cache: dict[str, tuple[object, list, tuple[float, float, float, float]]] = {}
+_facade_cache_lock = threading.Lock()
+_FACADE_CACHE_MAX = 8  # bounded LRU — each entry ~ mesh size
+
+
+def _facade_cache_key(building_id: str, extraction_method: str, min_facade_area: float, algo) -> str:
+    import hashlib as _h
+    fp = (
+        extraction_method,
+        round(min_facade_area, 3),
+        round(algo.region_growing_angle_deg, 2),
+        round(algo.downward_face_threshold, 2),
+        round(algo.ground_level_threshold_m, 3),
+        round(algo.occlusion_ray_offset_m, 4),
+        round(algo.occlusion_hit_fraction, 3),
+        round(algo.flat_roof_normal_threshold, 3),
+        round(algo.wall_normal_threshold, 3),
+        round(algo.min_mesh_faces, 0),
+    )
+    return f"{building_id}:{_h.md5(repr(fp).encode()).hexdigest()}"
+
+
+def _facades_to_json(facades, bbox) -> str:
+    """Serialize extracted facades + bbox to a JSON-safe payload."""
+    import numpy as _np
+    return json.dumps({
+        "bbox": [float(v) for v in bbox],
+        "facades": [
+            {
+                "vertices": _np.asarray(f.vertices, dtype=_np.float64).tolist(),
+                "normal": _np.asarray(f.normal, dtype=_np.float64).tolist(),
+                "component_tag": f.component_tag,
+                "label": f.label,
+                "index": int(f.index),
+            }
+            for f in facades
+        ],
+    })
+
+
+def _facades_from_json(payload: str):
+    """Inverse of _facades_to_json. Returns (facades, bbox)."""
+    import numpy as _np
+    from ..models import Facade as _Facade
+    data = json.loads(payload)
+    facades = [
+        _Facade(
+            vertices=_np.asarray(fd["vertices"], dtype=_np.float64),
+            normal=_np.asarray(fd["normal"], dtype=_np.float64),
+            component_tag=fd.get("component_tag", ""),
+            label=fd.get("label", ""),
+            index=int(fd.get("index", 0)),
+        )
+        for fd in data["facades"]
+    ]
+    bbox = tuple(data["bbox"])
+    return facades, bbox
+
+
+def _facade_cache_get(key: str):
+    with _facade_cache_lock:
+        hit = _facade_cache.get(key)
+    if hit is not None:
+        return hit
+    # Cold: check persistent store.
+    db = get_db()
+    try:
+        row = db.query(FacadeCacheRecord).filter_by(cache_key=key).first()
+        if row is None:
+            return None
+        try:
+            value = _facades_from_json(row.payload_json)
+        except (json.JSONDecodeError, KeyError, ValueError, TypeError):
+            # Corrupt row — drop it so we re-extract.
+            db.delete(row)
+            db.commit()
+            return None
+    finally:
+        db.close()
+    # Promote to in-memory cache.
+    with _facade_cache_lock:
+        _facade_cache[key] = value
+        while len(_facade_cache) > _FACADE_CACHE_MAX:
+            _facade_cache.pop(next(iter(_facade_cache)))
+    return value
+
+
+def _facade_cache_put(key: str, value) -> None:
+    with _facade_cache_lock:
+        if key in _facade_cache:
+            del _facade_cache[key]
+        _facade_cache[key] = value
+        while len(_facade_cache) > _FACADE_CACHE_MAX:
+            _facade_cache.pop(next(iter(_facade_cache)))
+    # Persist for next server start. Keyed by the full cache_key, so different
+    # extraction params for the same building each get their own row.
+    facades, bbox = value
+    building_id = key.split(":", 1)[0]
+    try:
+        payload = _facades_to_json(facades, bbox)
+    except (TypeError, ValueError):
+        return  # JSON-encoding failure shouldn't break the request path
+    db = get_db()
+    try:
+        existing = db.query(FacadeCacheRecord).filter_by(cache_key=key).first()
+        if existing is not None:
+            existing.payload_json = payload
+        else:
+            db.add(FacadeCacheRecord(
+                cache_key=key, building_id=building_id, payload_json=payload,
+            ))
+        db.commit()
+    finally:
+        db.close()
+
+
+def _facade_cache_invalidate(building_id: str) -> None:
+    """Drop all cached entries for a building (called when it's deleted or refined)."""
+    with _facade_cache_lock:
+        for k in [k for k in _facade_cache if k.startswith(f"{building_id}:")]:
+            del _facade_cache[k]
+    db = get_db()
+    try:
+        db.query(FacadeCacheRecord).filter_by(building_id=building_id).delete()
+        db.commit()
+    finally:
+        db.close()
 
 
 def _set_upload_progress(task_id: str, progress: float, message: str, **extra: object) -> None:
@@ -356,22 +490,13 @@ async def upload_building_file(
                 db.add(record)
                 db.commit()
                 db.refresh(record)
-                result = record.to_dict()
+                result = record.to_dict()  # to_dict strips heavy blobs by default
             finally:
                 db.close()
 
-            # Strip mesh_viewer binary blobs from the poll response — the
-            # frontend doesn't need them (mesh data flows through /generate).
-            result_clean = dict(result)
-            if "properties" in result_clean and isinstance(result_clean["properties"], dict):
-                result_clean["properties"] = {
-                    k: v for k, v in result_clean["properties"].items()
-                    if k != "mesh_viewer"
-                }
-
             with _upload_lock:
                 _upload_tasks[task_id].update(
-                    status="complete", progress=1.0, message="Done", result=result_clean,
+                    status="complete", progress=1.0, message="Done", result=result,
                 )
 
         except Exception as e:
@@ -392,6 +517,347 @@ def get_upload_status(task_id: str):
     if not task:
         raise HTTPException(status_code=404, detail="Upload task not found")
     return task
+
+
+@router.post("/import-kmz")
+async def import_kmz(
+    file: UploadFile,
+    voxel_size: float | None = Form(default=None),
+):
+    """Import a DJI Smart3D KMZ mission into AeroScan.
+
+    The KMZ is parsed, its reference point cloud runs through Poisson surface
+    reconstruction, the resulting mesh is stored as an ``UploadedBuilding`` (so
+    the user can re-run /generate on it with different mission params), and the
+    imported waypoints are stored as a new MissionVersion. Heavy work runs in a
+    background thread — poll ``/buildings/upload-status/{task_id}`` (reuses the
+    existing task polling endpoint).
+    """
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="No file provided")
+    if not file.filename.lower().endswith(".kmz"):
+        raise HTTPException(status_code=400, detail="Expected a .kmz file")
+
+    file_data = await file.read()
+    base_name = file.filename.rsplit(".", 1)[0] or "imported_kmz"
+    file_size_mb = len(file_data) / (1024 * 1024)
+
+    task_id = str(uuid.uuid4())
+    with _upload_lock:
+        _upload_tasks[task_id] = {
+            "status": "processing",
+            "progress": 0.0,
+            "message": f"Reading {file_size_mb:.1f} MB KMZ…",
+            "result": None,
+            "error": None,
+        }
+
+    def _process() -> None:
+        try:
+            import base64
+            import gzip
+            import hashlib
+            from ..kmz_import import (
+                parse_kmz,
+                waypoints_to_enu,
+                polygon_to_enu,
+                load_pointcloud,
+                pointcloud_to_viewer_arrays,
+                pointcloud_to_mesh_ply,
+            )
+            from ..models import ActionType, CameraAction, CameraName as _CameraName, MissionConfig
+
+            _set_upload_progress(task_id, 0.03, "Parsing KMZ archive…")
+            parsed = parse_kmz(file_data, name=base_name)
+            # Initial import uses a coarse voxel for speed — Optimize refines later.
+            effective_voxel = float(voxel_size) if voxel_size and voxel_size > 0 else 0.30
+            vox_tag = f":v{effective_voxel:.4f}"
+            kmz_hash = hashlib.sha256(file_data).hexdigest() + vox_tag
+
+            if not parsed.point_cloud_ply:
+                raise ValueError("KMZ does not contain a reference point cloud (wpmz/res/ply/.../cloud.ply)")
+
+            # --- Cache lookup: have we processed this exact KMZ before? ---
+            db = get_db()
+            try:
+                cached = (
+                    db.query(BuildingRecord)
+                    .filter_by(source_type="kmz_import")
+                    .all()
+                )
+                cached = next(
+                    (r for r in cached
+                     if (json.loads(r.properties_json or "{}")).get("kmz_hash") == kmz_hash),
+                    None,
+                )
+                cached_props = json.loads(cached.properties_json) if cached else {}
+            finally:
+                db.close()
+
+            pc_positions: list[float]
+            pc_colors: list[float]
+
+            if cached and cached_props.get("mesh_viewer") and cached_props.get("pc_b64"):
+                _set_upload_progress(task_id, 0.50, "Reusing cached reconstruction…")
+                raw_pc = gzip.decompress(base64.b64decode(cached_props["pc_b64"]))
+                import numpy as _np
+                pc_arr = _np.frombuffer(raw_pc, dtype=_np.float32)
+                half = pc_arr.size // 2
+                pc_positions = pc_arr[:half].tolist()
+                pc_colors = pc_arr[half:].tolist()
+
+                # Rebuild Building from cached mesh_viewer data (fast, no Open3D).
+                import numpy as _np2
+                verts, faces = decode_mesh_viewer_data(cached_props["mesh_viewer"])
+                # Re-encode to PLY so we can reuse build_building_from_mesh's full pipeline
+                import trimesh
+                tm = trimesh.Trimesh(vertices=verts, faces=faces, process=False)
+                mesh_bytes = tm.export(file_type="ply")
+                building = build_building_from_mesh(
+                    mesh_data=mesh_bytes, file_type="ply",
+                    lat=parsed.ref_lat, lon=parsed.ref_lon, name=parsed.name,
+                )
+                building.label = parsed.name
+                building_id = cached.id
+            else:
+                _set_upload_progress(task_id, 0.15, f"Loading point cloud ({len(parsed.point_cloud_ply)//1024} KB)…")
+                pcd = load_pointcloud(parsed.point_cloud_ply)
+
+                _set_upload_progress(task_id, 0.25, "Subsampling point cloud for viewer…")
+                pc_positions, pc_colors = pointcloud_to_viewer_arrays(pcd, max_points=250_000)
+
+                _set_upload_progress(task_id, 0.35, f"Reconstructing coarse mesh (voxel={effective_voxel:.2f}m)…")
+                mesh_bytes = pointcloud_to_mesh_ply(pcd, voxel_size_override=effective_voxel)
+
+                _set_upload_progress(task_id, 0.75, "Extracting facades from mesh…")
+                building = build_building_from_mesh(
+                    mesh_data=mesh_bytes,
+                    file_type="ply",
+                    lat=parsed.ref_lat,
+                    lon=parsed.ref_lon,
+                    name=parsed.name,
+                )
+                building.label = parsed.name
+                building_id = None
+
+            _set_upload_progress(task_id, 0.88, "Saving imported building…")
+
+            from ..models import meters_per_deg as _m_per_deg
+            m_per_lat, m_per_lon = _m_per_deg(math.radians(building.lat))
+            footprint_coords = []
+            for facade in building.facades:
+                if abs(facade.normal[2]) < 0.01:
+                    v0 = facade.vertices[0]
+                    lon_v = building.lon + v0[0] / m_per_lon
+                    lat_v = building.lat + v0[1] / m_per_lat
+                    footprint_coords.append([round(lon_v, 8), round(lat_v, 8)])
+            if footprint_coords:
+                footprint_coords.append(footprint_coords[0])
+            footprint_geojson = {
+                "type": "Feature",
+                "geometry": {"type": "Polygon", "coordinates": [footprint_coords]},
+                "properties": {"name": parsed.name, "height": building.height, "source": "kmz_import"},
+            }
+
+            if building_id is None:
+                import numpy as _np3
+                pc_arr = _np3.concatenate([
+                    _np3.asarray(pc_positions, dtype=_np3.float32),
+                    _np3.asarray(pc_colors, dtype=_np3.float32),
+                ])
+                pc_b64 = base64.b64encode(gzip.compress(pc_arr.tobytes())).decode("ascii")
+
+                record = BuildingRecord(
+                    name=parsed.name,
+                    source_type="kmz_import",
+                    geometry_data=json.dumps(footprint_geojson),
+                    lat=building.lat,
+                    lon=building.lon,
+                    height=building.height,
+                    num_stories=1,
+                    roof_type="flat",
+                    roof_pitch_deg=0.0,
+                    heading_deg=0.0,
+                    properties_json=json.dumps({
+                        "width": building.width,
+                        "depth": building.depth,
+                        "mesh_format": "ply",
+                        "auto_height": building.height,
+                        "mesh_viewer": getattr(building, "_mesh_viewer_data", None),
+                        "ref_alt": parsed.ref_alt,
+                        "ref_lat": parsed.ref_lat,
+                        "ref_lon": parsed.ref_lon,
+                        "kmz_hash": kmz_hash,
+                        "pc_b64": pc_b64,
+                        "ply_b64": base64.b64encode(gzip.compress(parsed.point_cloud_ply)).decode("ascii"),
+                        "mission_area_wgs84": parsed.mission_area_wgs84,
+                        "waypoints_raw": [
+                            {
+                                "index": wp.index,
+                                "lat": wp.lat, "lon": wp.lon, "alt_egm96": wp.alt_egm96,
+                                "heading_deg": wp.heading_deg,
+                                "gimbal_pitch_deg": wp.gimbal_pitch_deg,
+                                "speed_ms": wp.speed_ms,
+                            } for wp in parsed.waypoints
+                        ],
+                        "mission_config_raw": parsed.mission_config_raw,
+                        "voxel_size": effective_voxel,
+                    }),
+                )
+                db = get_db()
+                try:
+                    db.add(record)
+                    db.commit()
+                    db.refresh(record)
+                    building_id = record.id
+                finally:
+                    db.close()
+
+            # --- Build waypoints in local ENU ---
+            enu_wps = waypoints_to_enu(parsed.waypoints, parsed.ref_lat, parsed.ref_lon, parsed.ref_alt)
+            from ..models import Waypoint
+            waypoints: list[Waypoint] = []
+            for i, w in enumerate(enu_wps):
+                wp = Waypoint(
+                    x=w["x"], y=w["y"], z=w["z"],
+                    lat=w["lat"], lon=w["lon"], alt=w["alt"],
+                    heading_deg=w["heading_deg"],
+                    gimbal_pitch_deg=w["gimbal_pitch_deg"],
+                    speed_ms=w["speed_ms"],
+                    facade_index=-1,
+                    index=i,
+                    actions=[CameraAction(
+                        action_type=ActionType.TAKE_PHOTO,
+                        camera=_CameraName.WIDE,
+                    )],
+                )
+                waypoints.append(wp)
+
+            # Mission area polygon in ENU + WGS84 (lat, lon)
+            area_enu = polygon_to_enu(parsed.mission_area_wgs84, parsed.ref_lat, parsed.ref_lon, parsed.ref_alt)
+            area_latlon = [(lat, lon) for lon, lat, _ in parsed.mission_area_wgs84]
+
+            _set_upload_progress(task_id, 0.94, "Building viewer data…")
+
+            # MissionConfig from parsed mission_config where possible
+            raw_cfg = parsed.mission_config_raw or {}
+            def _fget(key: str, default: float) -> float:
+                try:
+                    return float(raw_cfg.get(key, default))
+                except (TypeError, ValueError):
+                    return default
+            config = MissionConfig(
+                flight_speed_ms=_fget("autoFlightSpeed", 2.0),
+                mission_name=f"Imported: {parsed.name}",
+            )
+
+            # Summary (light — no validation; these are DJI-native waypoints)
+            total_path_m = 0.0
+            for i in range(1, len(waypoints)):
+                dx = waypoints[i].x - waypoints[i - 1].x
+                dy = waypoints[i].y - waypoints[i - 1].y
+                dz = waypoints[i].z - waypoints[i - 1].z
+                total_path_m += math.sqrt(dx * dx + dy * dy + dz * dz)
+            est_time_s = total_path_m / max(config.flight_speed_ms, 0.1)
+            summary = {
+                "waypoint_count": len(waypoints),
+                "inspection_waypoints": len(waypoints),
+                "transition_waypoints": 0,
+                "photo_count": len(waypoints),
+                "facade_count": len(building.facades),
+                "camera_distance_m": 0.0,
+                "photo_footprint_m": [0.0, 0.0],
+                "total_path_m": round(total_path_m, 1),
+                "estimated_flight_time_s": round(est_time_s),
+                "facade_waypoint_counts": {},
+                "transitions": [],
+                "camera": {
+                    "name": "wide",
+                    "fov_h_deg": 0.0,
+                    "fov_v_deg": 0.0,
+                    "distance_m": 0.0,
+                    "focal_length_mm": 0.0,
+                },
+                "source": "kmz_import",
+            }
+
+            threejs_data = prepare_threejs_data(
+                building, waypoints,
+                point_cloud={"positions": pc_positions, "colors": pc_colors},
+                mission_area=area_enu,
+            )
+            # Attach raw reconstructed mesh so the viewer can render it.
+            # Forward the already-gzipped+base64 buffers: re-serializing via
+            # .tolist() + JSON for a multi-hundred-k-face mesh is the single
+            # slowest step in KMZ import and freezes the frontend during parse.
+            raw_mesh = getattr(building, "_mesh_viewer_data", None)
+            if raw_mesh and "positions_b64" in raw_mesh and "indices_b64" in raw_mesh:
+                threejs_data["rawMesh"] = {
+                    "positions_b64": raw_mesh["positions_b64"],
+                    "indices_b64": raw_mesh["indices_b64"],
+                    "n_vertices": raw_mesh.get("n_vertices"),
+                    "n_faces": raw_mesh.get("n_faces"),
+                }
+
+            leaflet_data = prepare_leaflet_data(
+                building, waypoints,
+                mission_area_poly=area_latlon,
+            )
+
+            viewer_data = {"threejs": threejs_data, "leaflet": leaflet_data}
+
+            version = session.store(
+                building_params={
+                    "lat": building.lat, "lon": building.lon,
+                    "width": building.width, "depth": building.depth,
+                    "height": building.height, "heading_deg": 0.0,
+                    "roof_type": "flat", "roof_pitch_deg": 0.0, "num_stories": 1,
+                },
+                mission_params={
+                    "target_gsd_mm_per_px": 2.0,
+                    "camera": "wide",
+                    "flight_speed_ms": config.flight_speed_ms,
+                    "mission_name": config.mission_name,
+                },
+                building=building,
+                waypoints=waypoints,
+                config=config,
+                summary=summary,
+                viewer_data=viewer_data,
+                selection={"building_id": building_id},
+            )
+
+            response = {
+                "version_id": version.version_id,
+                "timestamp": version.timestamp,
+                "summary": summary,
+                "viewer_data": viewer_data,
+                "validation": [],
+                "can_export": True,
+                "config_snapshot": {
+                    "building_id": building_id,
+                    "building": version.building_params,
+                    "mission": version.mission_params,
+                },
+                "building_id": building_id,
+                "imported_name": parsed.name,
+            }
+
+            with _upload_lock:
+                _upload_tasks[task_id].update(
+                    status="complete", progress=1.0, message="Import complete", result=response,
+                )
+
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            with _upload_lock:
+                _upload_tasks[task_id].update(
+                    status="error", progress=0.0, message=str(e), error=str(e),
+                )
+
+    threading.Thread(target=_process, daemon=True).start()
+    return {"task_id": task_id, "status": "processing", "message": f"Importing {file_size_mb:.1f} MB KMZ…"}
 
 
 @router.get("/buildings")
@@ -418,6 +884,237 @@ def get_building(building_id: str):
         db.close()
 
 
+class RefineKmzRequest(BaseModel):
+    voxel_size: float = Field(..., gt=0.01, le=1.0)
+
+
+@router.post("/buildings/{building_id}/refine-kmz")
+def refine_kmz_building(building_id: str, req: RefineKmzRequest):
+    """Re-reconstruct a KMZ-imported building at a finer voxel size.
+
+    Reuses the raw PLY bytes stored on the BuildingRecord so the user
+    doesn't have to re-upload. Updates mesh_viewer in place, invalidates
+    the facade cache for this building, and emits a new MissionVersion.
+    Heavy work runs in a background thread — poll the shared upload-status.
+    """
+    db = get_db()
+    try:
+        record = db.query(BuildingRecord).filter_by(id=building_id).first()
+        if not record:
+            raise HTTPException(status_code=404, detail="Building not found")
+        props = json.loads(record.properties_json or "{}")
+    finally:
+        db.close()
+
+    if not props.get("ply_b64"):
+        raise HTTPException(
+            status_code=400,
+            detail="This building was not imported from a KMZ; cannot refine.",
+        )
+
+    voxel_size = float(req.voxel_size)
+    task_id = str(uuid.uuid4())
+    with _upload_lock:
+        _upload_tasks[task_id] = {
+            "status": "processing",
+            "progress": 0.0,
+            "message": f"Refining at voxel={voxel_size:.3f}m…",
+            "result": None,
+            "error": None,
+        }
+
+    def _process() -> None:
+        try:
+            import base64
+            import gzip
+            from ..kmz_import import load_pointcloud, pointcloud_to_mesh_ply, pointcloud_to_viewer_arrays
+            from ..models import ActionType, CameraAction, CameraName as _CameraName, MissionConfig, Waypoint
+
+            ply_bytes = gzip.decompress(base64.b64decode(props["ply_b64"]))
+
+            _set_upload_progress(task_id, 0.10, "Loading point cloud…")
+            pcd = load_pointcloud(ply_bytes)
+
+            _set_upload_progress(task_id, 0.25, f"Reconstructing at voxel={voxel_size:.3f}m…")
+            mesh_bytes = pointcloud_to_mesh_ply(pcd, voxel_size_override=voxel_size)
+
+            _set_upload_progress(task_id, 0.55, "Subsampling point cloud for viewer…")
+            pc_positions, pc_colors = pointcloud_to_viewer_arrays(pcd, max_points=250_000)
+
+            ref_lat = float(props.get("ref_lat", record.lat))
+            ref_lon = float(props.get("ref_lon", record.lon))
+            ref_alt = float(props.get("ref_alt", 0.0))
+            name = record.name
+
+            _set_upload_progress(task_id, 0.70, "Extracting facades…")
+            building = build_building_from_mesh(
+                mesh_data=mesh_bytes, file_type="ply",
+                lat=ref_lat, lon=ref_lon, name=name,
+            )
+            building.label = name
+
+            # --- Persist updated mesh_viewer back onto the BuildingRecord ---
+            _set_upload_progress(task_id, 0.85, "Updating building record…")
+            import numpy as _np3
+            pc_arr = _np3.concatenate([
+                _np3.asarray(pc_positions, dtype=_np3.float32),
+                _np3.asarray(pc_colors, dtype=_np3.float32),
+            ])
+            pc_b64 = base64.b64encode(gzip.compress(pc_arr.tobytes())).decode("ascii")
+
+            new_props = dict(props)
+            new_props["mesh_viewer"] = getattr(building, "_mesh_viewer_data", None)
+            new_props["pc_b64"] = pc_b64
+            new_props["voxel_size"] = voxel_size
+            new_props["width"] = building.width
+            new_props["depth"] = building.depth
+            new_props["auto_height"] = building.height
+
+            db2 = get_db()
+            try:
+                rec = db2.query(BuildingRecord).filter_by(id=building_id).first()
+                if rec is None:
+                    raise ValueError("BuildingRecord disappeared during refine")
+                rec.height = building.height
+                rec.properties_json = json.dumps(new_props)
+                db2.commit()
+            finally:
+                db2.close()
+
+            # Facade cache is keyed on (building_id, extraction_method, ...) — invalidate.
+            _facade_cache_invalidate(building_id)
+
+            # --- Rebuild waypoints + mission area from stored raw data ---
+            waypoints_raw = props.get("waypoints_raw", [])
+            mission_area_wgs84 = [tuple(p) for p in props.get("mission_area_wgs84", [])]
+            mission_cfg_raw = props.get("mission_config_raw", {}) or {}
+
+            from ..kmz_import import ParsedWaypoint, waypoints_to_enu, polygon_to_enu
+            parsed_wps = [
+                ParsedWaypoint(
+                    index=int(w.get("index", i)),
+                    lon=float(w["lon"]), lat=float(w["lat"]),
+                    alt_egm96=float(w["alt_egm96"]),
+                    heading_deg=float(w["heading_deg"]),
+                    gimbal_pitch_deg=float(w["gimbal_pitch_deg"]),
+                    speed_ms=float(w.get("speed_ms", 2.0)),
+                )
+                for i, w in enumerate(waypoints_raw)
+            ]
+            enu_wps = waypoints_to_enu(parsed_wps, ref_lat, ref_lon, ref_alt)
+            waypoints: list[Waypoint] = []
+            for i, w in enumerate(enu_wps):
+                waypoints.append(Waypoint(
+                    x=w["x"], y=w["y"], z=w["z"],
+                    lat=w["lat"], lon=w["lon"], alt=w["alt"],
+                    heading_deg=w["heading_deg"],
+                    gimbal_pitch_deg=w["gimbal_pitch_deg"],
+                    speed_ms=w["speed_ms"],
+                    facade_index=-1, index=i,
+                    actions=[CameraAction(action_type=ActionType.TAKE_PHOTO, camera=_CameraName.WIDE)],
+                ))
+
+            area_enu = polygon_to_enu(mission_area_wgs84, ref_lat, ref_lon, ref_alt)
+            area_latlon = [(lat, lon) for lon, lat, _ in mission_area_wgs84]
+
+            def _fget(key: str, default: float) -> float:
+                try: return float(mission_cfg_raw.get(key, default))
+                except (TypeError, ValueError): return default
+            config = MissionConfig(
+                flight_speed_ms=_fget("autoFlightSpeed", 2.0),
+                mission_name=f"Refined ({voxel_size:.2f}m): {name}",
+            )
+
+            total_path_m = 0.0
+            for i in range(1, len(waypoints)):
+                dx = waypoints[i].x - waypoints[i-1].x
+                dy = waypoints[i].y - waypoints[i-1].y
+                dz = waypoints[i].z - waypoints[i-1].z
+                total_path_m += math.sqrt(dx*dx + dy*dy + dz*dz)
+            summary = {
+                "waypoint_count": len(waypoints),
+                "inspection_waypoints": len(waypoints),
+                "transition_waypoints": 0,
+                "photo_count": len(waypoints),
+                "facade_count": len(building.facades),
+                "camera_distance_m": 0.0,
+                "photo_footprint_m": [0.0, 0.0],
+                "total_path_m": round(total_path_m, 1),
+                "estimated_flight_time_s": round(total_path_m / max(config.flight_speed_ms, 0.1)),
+                "facade_waypoint_counts": {},
+                "transitions": [],
+                "camera": {"name": "wide", "fov_h_deg": 0.0, "fov_v_deg": 0.0, "distance_m": 0.0, "focal_length_mm": 0.0},
+                "source": "kmz_refine",
+                "voxel_size": voxel_size,
+            }
+
+            threejs_data = prepare_threejs_data(
+                building, waypoints,
+                point_cloud={"positions": pc_positions, "colors": pc_colors},
+                mission_area=area_enu,
+            )
+            raw_mesh = getattr(building, "_mesh_viewer_data", None)
+            if raw_mesh and "positions_b64" in raw_mesh and "indices_b64" in raw_mesh:
+                threejs_data["rawMesh"] = {
+                    "positions_b64": raw_mesh["positions_b64"],
+                    "indices_b64": raw_mesh["indices_b64"],
+                    "n_vertices": raw_mesh.get("n_vertices"),
+                    "n_faces": raw_mesh.get("n_faces"),
+                }
+            leaflet_data = prepare_leaflet_data(building, waypoints, mission_area_poly=area_latlon)
+            viewer_data = {"threejs": threejs_data, "leaflet": leaflet_data}
+
+            version = session.store(
+                building_params={
+                    "lat": building.lat, "lon": building.lon,
+                    "width": building.width, "depth": building.depth,
+                    "height": building.height, "heading_deg": 0.0,
+                    "roof_type": "flat", "roof_pitch_deg": 0.0, "num_stories": 1,
+                },
+                mission_params={
+                    "target_gsd_mm_per_px": 2.0, "camera": "wide",
+                    "flight_speed_ms": config.flight_speed_ms,
+                    "mission_name": config.mission_name,
+                },
+                building=building, waypoints=waypoints, config=config,
+                summary=summary, viewer_data=viewer_data,
+                selection={"building_id": building_id},
+            )
+
+            response = {
+                "version_id": version.version_id,
+                "timestamp": version.timestamp,
+                "summary": summary,
+                "viewer_data": viewer_data,
+                "validation": [],
+                "can_export": True,
+                "config_snapshot": {
+                    "building_id": building_id,
+                    "building": version.building_params,
+                    "mission": version.mission_params,
+                },
+                "building_id": building_id,
+                "imported_name": name,
+                "voxel_size": voxel_size,
+            }
+
+            with _upload_lock:
+                _upload_tasks[task_id].update(
+                    status="complete", progress=1.0,
+                    message=f"Refinement at {voxel_size:.3f}m complete", result=response,
+                )
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            with _upload_lock:
+                _upload_tasks[task_id].update(
+                    status="error", progress=0.0, message=str(e), error=str(e),
+                )
+
+    threading.Thread(target=_process, daemon=True).start()
+    return {"task_id": task_id, "status": "processing"}
+
+
 @router.delete("/buildings/{building_id}")
 def delete_building(building_id: str):
     """Delete an uploaded building."""
@@ -428,6 +1125,7 @@ def delete_building(building_id: str):
             raise HTTPException(status_code=404, detail="Building not found")
         db.delete(record)
         db.commit()
+        _facade_cache_invalidate(building_id)
         return {"deleted": building_id}
     finally:
         db.close()
@@ -471,7 +1169,10 @@ def benchmark_tsp(request: GenerateRequest):
                 import trimesh
                 import numpy as np
                 positions, indices = decode_mesh_viewer_data(raw_mesh)
-                mesh_obj = trimesh.Trimesh(vertices=positions, faces=indices)
+                # process=False: the mesh was already cleaned (fix_normals,
+                # merge_vertices) at upload time. Skipping the default pipeline
+                # saves a non-trivial amount of work for large meshes.
+                mesh_obj = trimesh.Trimesh(vertices=positions, faces=indices, process=False)
                 facades = extract_facades(mesh_obj, method=request.extraction_method, min_area_m2=request.min_facade_area, algo=algo_base)
                 if facades:
                     xs = [float(v[0]) for f in facades for v in f.vertices]
@@ -591,53 +1292,85 @@ def generate(request: GenerateRequest):
     if request.building_id:
         db = get_db()
         try:
-            record = db.query(BuildingRecord).filter_by(id=request.building_id).first()
-            if not record:
+            # Targeted fetch: only the columns we need + the mesh_viewer sub-document.
+            # Parsing the full properties_json is expensive (can contain multi-MB
+            # ply_b64 / pc_b64 blobs from KMZ imports); json_extract lets SQLite
+            # slice out just the mesh_viewer object before we ever touch Python.
+            row = (
+                db.query(
+                    BuildingRecord.id,
+                    BuildingRecord.name,
+                    BuildingRecord.lat,
+                    BuildingRecord.lon,
+                    BuildingRecord.height,
+                    BuildingRecord.num_stories,
+                    BuildingRecord.roof_type,
+                    BuildingRecord.roof_pitch_deg,
+                    BuildingRecord.geometry_data,
+                    func.json_extract(BuildingRecord.properties_json, "$.mesh_viewer").label("mesh_viewer_str"),
+                )
+                .filter(BuildingRecord.id == request.building_id)
+                .first()
+            )
+            if not row:
                 raise HTTPException(status_code=404, detail="Building not found")
 
-            props = json.loads(record.properties_json) if record.properties_json else {}
-            raw_mesh = props.get("mesh_viewer")
+            raw_mesh = json.loads(row.mesh_viewer_str) if row.mesh_viewer_str else None
 
             if raw_mesh:
                 # Reconstruct mesh from stored vertices/indices and re-run
                 # facet detection with the requested min_facade_area threshold.
+                # Only the facades list is cached (expensive); the trimesh.Trimesh
+                # is re-decoded fresh per request — trimesh's ray/rtree internals
+                # are not thread-safe across concurrent /generate calls.
                 from ..building_import import extract_facades
                 import trimesh
                 import numpy as np
 
                 positions, indices = decode_mesh_viewer_data(raw_mesh)
-                mesh_obj = trimesh.Trimesh(vertices=positions, faces=indices)
+                # process=False: the mesh was already cleaned (fix_normals,
+                # merge_vertices) at upload time. Skipping the default pipeline
+                # saves a non-trivial amount of work for large meshes.
+                mesh_obj = trimesh.Trimesh(vertices=positions, faces=indices, process=False)
 
-                facades = extract_facades(mesh_obj, method=request.extraction_method, min_area_m2=request.min_facade_area, algo=algo)
-                if facades:
-                    xs = [float(v[0]) for f in facades for v in f.vertices]
-                    ys = [float(v[1]) for f in facades for v in f.vertices]
+                cache_key = _facade_cache_key(row.id, request.extraction_method, request.min_facade_area, algo)
+                cached = _facade_cache_get(cache_key)
+                if cached is not None:
+                    facades, bbox = cached
+                    width, depth = bbox[0], bbox[1]
+                else:
+                    facades = extract_facades(mesh_obj, method=request.extraction_method, min_area_m2=request.min_facade_area, algo=algo)
+                    xs = [float(v[0]) for f in facades for v in f.vertices] if facades else []
+                    ys = [float(v[1]) for f in facades for v in f.vertices] if facades else []
                     width = round(max(xs) - min(xs), 1) if xs else 0
                     depth = round(max(ys) - min(ys), 1) if ys else 0
+                    _facade_cache_put(cache_key, (facades, (width, depth, 0.0, 0.0)))
+
+                if facades:
                     from ..models import Building as BuildingModel
                     building = BuildingModel(
-                        lat=record.lat,
-                        lon=record.lon,
+                        lat=row.lat,
+                        lon=row.lon,
                         width=width,
                         depth=depth,
-                        height=record.height,
+                        height=row.height,
                         facades=facades,
-                        label=record.name,
+                        label=row.name,
                     )
                 else:
                     # Fallback to GeoJSON footprint
-                    geojson = json.loads(record.geometry_data)
-                    building = build_building_from_geojson(geojson, height=record.height, name=record.name)
+                    geojson = json.loads(row.geometry_data)
+                    building = build_building_from_geojson(geojson, height=row.height, name=row.name)
             else:
                 # GeoJSON-only building (no mesh data)
-                geojson = json.loads(record.geometry_data)
+                geojson = json.loads(row.geometry_data)
                 building = build_building_from_geojson(
                     geojson,
                     height=request.building.height,
                     num_stories=request.building.num_stories,
                     roof_type=request.building.roof_type,
                     roof_pitch_deg=request.building.roof_pitch_deg,
-                    name=record.name,
+                    name=row.name,
                 )
         finally:
             db.close()
@@ -813,17 +1546,20 @@ def generate(request: GenerateRequest):
     from ..building_import import last_rejected_candidates
     threejs_data = prepare_threejs_data(building, waypoints, candidate_facades=last_rejected_candidates)
     if raw_mesh:
-        # Ensure raw mesh has flat arrays for the Three.js viewer.
-        # New uploads store compressed binary; decode to flat lists if needed.
-        if "positions" in raw_mesh and "indices" in raw_mesh:
-            threejs_data["rawMesh"] = {"positions": raw_mesh["positions"], "indices": raw_mesh["indices"]}
-        elif "positions_b64" in raw_mesh:
-            import numpy as np
-            verts, faces = decode_mesh_viewer_data(raw_mesh)
+        # Forward the already-gzipped+base64 mesh blobs directly when present:
+        # decoding to Python lists and re-serializing as JSON costs ~1 GB of
+        # intermediate Python objects for a 100k-face mesh, and the frontend
+        # has to parse all that JSON back. The browser can gunzip the base64
+        # payload to a Float32Array natively via DecompressionStream.
+        if "positions_b64" in raw_mesh and "indices_b64" in raw_mesh:
             threejs_data["rawMesh"] = {
-                "positions": verts.astype(np.float32).flatten().round(3).tolist(),
-                "indices": faces.astype(np.int32).flatten().tolist(),
+                "positions_b64": raw_mesh["positions_b64"],
+                "indices_b64": raw_mesh["indices_b64"],
+                "n_vertices": raw_mesh.get("n_vertices"),
+                "n_faces": raw_mesh.get("n_faces"),
             }
+        elif "positions" in raw_mesh and "indices" in raw_mesh:
+            threejs_data["rawMesh"] = {"positions": raw_mesh["positions"], "indices": raw_mesh["indices"]}
 
     viewer_data = {
         "threejs": threejs_data,

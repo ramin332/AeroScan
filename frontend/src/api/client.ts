@@ -130,6 +130,59 @@ export async function getUploadStatus(taskId: string): Promise<{
   return request(`/buildings/upload-status/${taskId}`);
 }
 
+// --- KMZ import ---
+
+export function importKmz(
+  file: File,
+  voxelSize?: number | null,
+  onUploadProgress?: (loaded: number, total: number) => void,
+): Promise<{ task_id: string }> {
+  const form = new FormData();
+  form.append('file', file);
+  if (voxelSize && voxelSize > 0) form.append('voxel_size', String(voxelSize));
+
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', `${BASE}/import-kmz`);
+
+    if (onUploadProgress) {
+      xhr.upload.onprogress = (e) => {
+        if (e.lengthComputable) onUploadProgress(e.loaded, e.total);
+      };
+    }
+
+    xhr.onload = () => {
+      if (xhr.status >= 200 && xhr.status < 300) {
+        resolve(JSON.parse(xhr.responseText));
+      } else {
+        reject(new Error(`API error ${xhr.status}: ${xhr.responseText}`));
+      }
+    };
+    xhr.onerror = () => reject(new Error('Upload network error'));
+    xhr.send(form);
+  });
+}
+
+export async function getKmzImportStatus(taskId: string): Promise<{
+  status: string; progress: number; message: string;
+  result?: GenerateResponse & { building_id?: string; imported_name?: string };
+  error?: string;
+}> {
+  // Reuses the shared upload-status endpoint
+  return request(`/buildings/upload-status/${taskId}`);
+}
+
+export async function refineKmzBuilding(
+  buildingId: string,
+  voxelSize: number,
+): Promise<{ task_id: string }> {
+  return request(`/buildings/${buildingId}/refine-kmz`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ voxel_size: voxelSize }),
+  });
+}
+
 // --- Simulation / Reconstruction ---
 
 export async function listSimulations(): Promise<{ tasks: SimulationStatus[] }> {

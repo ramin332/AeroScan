@@ -2,7 +2,7 @@ import { useRef, useMemo, useState, useCallback, useEffect } from 'react';
 import { Canvas, useThree, useFrame, type ThreeEvent } from '@react-three/fiber';
 import { OrbitControls, Line, PivotControls } from '@react-three/drei';
 import * as THREE from 'three';
-import type { RawMeshData, ThreeJSData, WaypointData } from '../api/types';
+import type { MissionAreaData, PointCloudData, RawMeshData, ThreeJSData, WaypointData } from '../api/types';
 import { DroneMarker, getVisitedIndex, DRONE_LAYER } from './DroneAnimation';
 import { useStore } from '../store';
 
@@ -223,20 +223,38 @@ function FlightPath({ waypoints }: { waypoints: WaypointData[] }) {
 
 function RawMeshView({ mesh, dimmed }: { mesh: RawMeshData; dimmed?: boolean }) {
   const solidRef = useRef<THREE.Mesh>(null);
+  const [geometry, setGeometry] = useState<THREE.BufferGeometry | null>(null);
 
-  const geometry = useMemo(() => {
-    const geo = new THREE.BufferGeometry();
-    // Convert ENU positions to Three.js coordinate system
-    const pos = new Float32Array(mesh.positions.length);
-    for (let i = 0; i < mesh.positions.length; i += 3) {
-      pos[i] = mesh.positions[i];       // x → x
-      pos[i + 1] = mesh.positions[i + 2]; // z → y (up)
-      pos[i + 2] = -mesh.positions[i + 1]; // -y → z (toward camera)
-    }
-    geo.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
-    geo.setIndex(new THREE.BufferAttribute(new Uint32Array(mesh.indices), 1));
-    geo.computeVertexNormals();
-    return geo;
+  useEffect(() => {
+    let disposed = false;
+    let prev: THREE.BufferGeometry | null = null;
+
+    (async () => {
+      const { positions, indices } = await decodeRawMesh(mesh);
+      if (disposed) return;
+
+      const geo = new THREE.BufferGeometry();
+      // Convert ENU (x=E, y=N, z=Up) → Three.js (x=right, y=up, z=toward camera).
+      // Swap in-place on the Float32Array to avoid a second allocation.
+      for (let i = 0; i < positions.length; i += 3) {
+        const y = positions[i + 1];
+        const z = positions[i + 2];
+        positions[i + 1] = z;
+        positions[i + 2] = -y;
+      }
+      geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+      geo.setIndex(new THREE.BufferAttribute(indices, 1));
+      geo.computeVertexNormals();
+      setGeometry((old) => {
+        prev = old;
+        return geo;
+      });
+      if (prev) prev.dispose();
+    })();
+
+    return () => {
+      disposed = true;
+    };
   }, [mesh]);
 
   // Solid mesh only visible to PIP camera (layer 3); ghost mesh stays on default layer 0
@@ -245,6 +263,8 @@ function RawMeshView({ mesh, dimmed }: { mesh: RawMeshData; dimmed?: boolean }) 
       solidRef.current.layers.set(MESH_SOLID_LAYER);
     }
   });
+
+  if (!geometry) return null;
 
   return (
     <group>
@@ -283,6 +303,83 @@ function RawMeshView({ mesh, dimmed }: { mesh: RawMeshData; dimmed?: boolean }) 
         />
       </mesh>
     </group>
+  );
+}
+
+/** Decode rawMesh (binary base64+gzip fast path or legacy flat-list fallback). */
+async function decodeRawMesh(mesh: RawMeshData): Promise<{ positions: Float32Array; indices: Uint32Array }> {
+  if (mesh.positions_b64 && mesh.indices_b64) {
+    const [posBuf, idxBuf] = await Promise.all([
+      gunzipBase64(mesh.positions_b64),
+      gunzipBase64(mesh.indices_b64),
+    ]);
+    // Stored as Float32Array (positions) + Int32Array (indices).
+    const positions = new Float32Array(posBuf.buffer, posBuf.byteOffset, posBuf.byteLength / 4).slice();
+    const indicesI32 = new Int32Array(idxBuf.buffer, idxBuf.byteOffset, idxBuf.byteLength / 4);
+    const indices = new Uint32Array(indicesI32);
+    return { positions, indices };
+  }
+  const posArr = mesh.positions ?? [];
+  const idxArr = mesh.indices ?? [];
+  return {
+    positions: Float32Array.from(posArr),
+    indices: Uint32Array.from(idxArr),
+  };
+}
+
+async function gunzipBase64(b64: string): Promise<Uint8Array> {
+  const bin = atob(b64);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  // DecompressionStream is available in all evergreen browsers.
+  const stream = new Response(
+    new Blob([bytes]).stream().pipeThrough(new DecompressionStream('gzip')),
+  );
+  return new Uint8Array(await stream.arrayBuffer());
+}
+
+function PointCloudView({ data }: { data: PointCloudData }) {
+  const geometry = useMemo(() => {
+    const g = new THREE.BufferGeometry();
+    const src = data.positions;
+    const pos = new Float32Array(src.length);
+    for (let i = 0; i < src.length; i += 3) {
+      pos[i] = src[i];
+      pos[i + 1] = src[i + 2];
+      pos[i + 2] = -src[i + 1];
+    }
+    g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+    if (data.colors && data.colors.length === src.length) {
+      g.setAttribute('color', new THREE.BufferAttribute(new Float32Array(data.colors), 3));
+    }
+    return g;
+  }, [data]);
+
+  const hasColor = data.colors && data.colors.length === data.positions.length;
+
+  return (
+    <points geometry={geometry} frustumCulled={false}>
+      <pointsMaterial
+        size={0.04}
+        sizeAttenuation
+        vertexColors={hasColor}
+        color={hasColor ? undefined : '#9aa'}
+        transparent
+        opacity={0.9}
+      />
+    </points>
+  );
+}
+
+function MissionAreaView({ data }: { data: MissionAreaData }) {
+  const points = useMemo(() => {
+    const pts = data.vertices.map((v) => enu(v[0], v[1], v[2]));
+    if (pts.length > 2) pts.push(pts[0]);
+    return pts;
+  }, [data]);
+  if (points.length < 2) return null;
+  return (
+    <Line points={points} color="#22d3ee" lineWidth={1.5} dashed dashSize={0.5} gapSize={0.3} />
   );
 }
 
@@ -504,6 +601,12 @@ function Scene({ data, onWaypointClick, visitedIndex, viewMode, activeFacades, l
       {data.rawMesh && (
         <RawMeshView mesh={data.rawMesh} dimmed={viewMode === 'flight' && activeFacades != null} />
       )}
+
+      {/* Imported DJI Smart3D reference point cloud */}
+      {data.pointCloud && <PointCloudView data={data.pointCloud} />}
+
+      {/* Imported DJI mission-area polygon (dashed ground outline) */}
+      {data.missionArea && <MissionAreaView data={data.missionArea} />}
     </group>
   );
 }
