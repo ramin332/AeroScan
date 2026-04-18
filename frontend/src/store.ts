@@ -92,32 +92,15 @@ export const DEFAULT_ALGORITHM: AlgorithmParams = {
   min_waypoint_height_m: 2.0,
 };
 
-export const PRESETS: Record<string, Partial<BuildingParams>> = {
-  simple_box: { width: 20, depth: 10, height: 8, heading_deg: 0, roof_type: 'flat', roof_pitch_deg: 0, num_stories: 3 },
-  pitched_roof_house: { width: 30, depth: 10, height: 6, heading_deg: 45, roof_type: 'pitched', roof_pitch_deg: 30, num_stories: 2 },
-  l_shaped_block: { width: 25, depth: 10, height: 9, heading_deg: 0, roof_type: 'flat', roof_pitch_deg: 0, num_stories: 3 },
-  large_apartment_block: { width: 60, depth: 12, height: 18, heading_deg: 15, roof_type: 'flat', roof_pitch_deg: 0, num_stories: 6 },
-};
-
 type Tab = '3d' | 'map' | 'sim';
-type BuildingSource = 'upload' | 'preset';
 
 interface AppState {
-  // Building source
-  buildingSource: BuildingSource;
   selectedBuildingId: string | null;
-  buildings: UploadedBuilding[];
 
   // Params
-  preset: string | null;
   building: BuildingParams;
   mission: MissionParams;
   algorithm: AlgorithmParams;
-
-  // Mesh settings
-  minFacadeArea: number;
-  extractionMethod: string;
-  waypointStrategy: string;
 
   // Exclusion zones & facade toggling
   disabledFacades: Set<number>;
@@ -136,11 +119,6 @@ interface AppState {
   activeTab: Tab;
 
   // Actions
-  setMinFacadeArea: (v: number) => void;
-  setExtractionMethod: (v: string) => void;
-  setWaypointStrategy: (v: string) => void;
-  setBuildingSource: (source: BuildingSource) => void;
-  setPreset: (name: string | null) => void;
   setBuilding: (patch: Partial<BuildingParams>) => void;
   setMission: (patch: Partial<MissionParams>) => void;
   setAlgorithm: (patch: Partial<AlgorithmParams>) => void;
@@ -169,24 +147,56 @@ interface AppState {
   setSectionOpen: (key: string, open: boolean) => void;
 
   // Building upload actions
-  uploadBuilding: (file: File) => Promise<void>;
   importKmz: (file: File, voxelSize?: number | null, mode?: 'raw' | 'facades') => Promise<void>;
   kmzImportMode: 'raw' | 'facades';
   setKmzImportMode: (v: 'raw' | 'facades') => void;
   lastKmzFile: File | null;
   toggleKmzFacades: () => Promise<void>;
   refineKmz: (voxelSize: number) => Promise<void>;
+  triggerRefine: () => void;
+  refineRunning: boolean;
+  refinePending: boolean;
   optimizeKmz: (buildingId?: string | null) => Promise<void>;
   cancelOptimize: () => void;
   kmzOptimizing: boolean;
   kmzOptimizeMessage: string;
   kmzAutoRefine: boolean;
   setKmzAutoRefine: (v: boolean) => void;
+  // Reconstruction knobs (voxel + CGAL alpha_wrap_3)
+  kmzOptimizeMin: number;   // finest voxel in optimize schedule (m)
+  kmzOptimizeMax: number;   // coarsest voxel in optimize schedule (m)
+  kmzOptimizeSteps: number; // number of passes
+  kmzAwAlpha: number | null;   // override CGAL alpha (null = auto from voxel)
+  kmzAwOffset: number | null;  // override CGAL offset (null = auto from voxel)
+  setKmzReconParams: (p: Partial<{
+    kmzOptimizeMin: number; kmzOptimizeMax: number; kmzOptimizeSteps: number;
+    kmzAwAlpha: number | null; kmzAwOffset: number | null;
+  }>) => void;
+  // Facade detection (CGAL Shape-Detection) knobs. null = backend default.
+  kmzFdEpsilon: number | null;         // plane-fit ε (m)
+  kmzFdClusterEpsilon: number | null;  // max inlier gap (m)
+  kmzFdMinPoints: number | null;       // min inliers per region
+  kmzFdMinWallArea: number | null;     // min wall area (m²)
+  kmzFdMinRoofArea: number | null;     // min roof area (m²)
+  kmzFdMinDensity: number | null;      // min inlier density (pts/m²)
+  kmzFdNormalThreshold: number | null; // normal-agreement (cos θ)
+  setKmzFacadeParams: (p: Partial<{
+    kmzFdEpsilon: number | null; kmzFdClusterEpsilon: number | null;
+    kmzFdMinPoints: number | null; kmzFdMinWallArea: number | null;
+    kmzFdMinRoofArea: number | null; kmzFdMinDensity: number | null;
+    kmzFdNormalThreshold: number | null;
+  }>) => void;
+  // DJI vs Inspection mode (UI-only split; affects which sliders are shown).
+  kmzMode: 'dji' | 'inspection';
+  setKmzMode: (v: 'dji' | 'inspection') => void;
+  // Saved buildings (persisted on backend sqlite). Displayed as "Saved buildings" list.
+  buildings: import('./api/types').UploadedBuilding[];
+  refreshBuildings: () => Promise<void>;
+  selectBuilding: (id: string) => Promise<void>;
+  deleteBuilding: (id: string) => Promise<void>;
+  stripRosetteOnly: () => Promise<void>;
   showOriginalGimbals: boolean;
   setShowOriginalGimbals: (v: boolean) => void;
-  selectBuilding: (id: string) => void;
-  deleteBuilding: (id: string) => Promise<void>;
-  refreshBuildings: () => Promise<void>;
 
   // Simulation / reconstruction
   simTaskId: string | null;
@@ -203,18 +213,12 @@ interface AppState {
 }
 
 export const useStore = create<AppState>()(persist((set, get) => ({
-  buildingSource: 'preset',
   selectedBuildingId: null,
-  buildings: [],
-  minFacadeArea: 1.0,
-  extractionMethod: 'region_growing',
-  waypointStrategy: 'facade_grid',
   disabledFacades: new Set<number>(),
   enabledCandidates: new Set<number>(),
   exclusionZones: [],
   zoneDrawMode: false,
 
-  preset: 'simple_box',
   building: { ...DEFAULT_BUILDING },
   mission: { ...DEFAULT_MISSION },
   algorithm: { ...DEFAULT_ALGORITHM },
@@ -231,34 +235,8 @@ export const useStore = create<AppState>()(persist((set, get) => ({
   sectionState: {},
   setSectionOpen: (key, open) => set((s) => ({ sectionState: { ...s.sectionState, [key]: open } })),
 
-  setMinFacadeArea: (v) => set({ minFacadeArea: v }),
-  setExtractionMethod: (v: string) => set({ extractionMethod: v }),
-  setWaypointStrategy: (v: string) => set({ waypointStrategy: v }),
-
-  setBuildingSource: (source) => {
-    set({ buildingSource: source });
-    if (source === 'preset') {
-      set({ selectedBuildingId: null });
-    } else {
-      set({ preset: null });
-    }
-  },
-
-  setPreset: (name) => {
-    if (name && PRESETS[name]) {
-      set({
-        preset: name,
-        buildingSource: 'preset',
-        selectedBuildingId: null,
-        building: { ...DEFAULT_BUILDING, ...PRESETS[name] },
-      });
-    } else {
-      set({ preset: null });
-    }
-  },
-
   setBuilding: (patch) =>
-    set((s) => ({ building: { ...s.building, ...patch }, preset: null })),
+    set((s) => ({ building: { ...s.building, ...patch } })),
 
   setMission: (patch) =>
     set((s) => ({ mission: { ...s.mission, ...patch } })),
@@ -292,18 +270,15 @@ export const useStore = create<AppState>()(persist((set, get) => ({
   setZoneDrawMode: (v) => set({ zoneDrawMode: v }),
 
   generate: async () => {
-    const { preset, selectedBuildingId, buildingSource, building, mission, algorithm, minFacadeArea, extractionMethod, waypointStrategy, disabledFacades, enabledCandidates, exclusionZones } = get();
+    const { selectedBuildingId, building, mission, algorithm, disabledFacades, enabledCandidates, exclusionZones } = get();
+    if (!selectedBuildingId) return;
     set({ loading: true });
     try {
       const result = await api.generate({
-        preset: buildingSource === 'preset' ? preset : undefined,
-        building_id: buildingSource === 'upload' ? selectedBuildingId : undefined,
+        building_id: selectedBuildingId,
         building,
         mission,
         algorithm,
-        min_facade_area: buildingSource === 'upload' ? minFacadeArea : undefined,
-        extraction_method: buildingSource === 'upload' ? extractionMethod : undefined,
-        waypoint_strategy: buildingSource === 'upload' ? waypointStrategy : undefined,
         disabled_facades: disabledFacades.size > 0 ? [...disabledFacades] : undefined,
         enabled_candidates: enabledCandidates.size > 0 ? [...enabledCandidates] : undefined,
         exclusion_zones: exclusionZones.length > 0 ? exclusionZones : undefined,
@@ -401,7 +376,7 @@ export const useStore = create<AppState>()(persist((set, get) => ({
         enabled_candidates: enabledCandidates.size > 0 ? [...enabledCandidates] : undefined,
         exclusion_zones: exclusionZones.length > 0 ? exclusionZones : undefined,
       });
-      set({ result, mission: { ...NEN2767_MISSION }, loading: false });
+      set({ result, mission: { ...NEN2767_MISSION }, loading: false, kmzMode: 'inspection' });
       await get().refreshVersions();
     } catch (e) {
       console.error('Generate inspection mission failed:', e);
@@ -410,122 +385,152 @@ export const useStore = create<AppState>()(persist((set, get) => ({
   },
 
 
-  // --- Building upload ---
-
-  uploadBuilding: async (file: File) => {
-    const fileSizeMB = (file.size / (1024 * 1024)).toFixed(1);
-    set({ uploading: true, uploadProgress: 0, uploadMessage: `Uploading ${fileSizeMB} MB…` });
-    try {
-      const ext = file.name.split('.').pop()?.toLowerCase() || '';
-      const isMesh = ['obj', 'ply', 'stl', 'glb', 'gltf'].includes(ext);
-      let uploaded;
-
-      if (isMesh) {
-        // Mesh file → multipart upload with progress
-        const name = file.name.replace(/\.[^.]+$/, '') || 'Mesh building';
-        const { building, minFacadeArea } = get();
-        const { task_id } = await api.uploadMeshFile(
-          file,
-          { name, lat: building.lat, lon: building.lon, height: 0, num_stories: 1, min_facade_area: minFacadeArea },
-          (loaded, total) => {
-            const pct = total > 0 ? loaded / total : 0;
-            const loadedMB = (loaded / (1024 * 1024)).toFixed(1);
-            set({ uploadProgress: pct * 0.3, uploadMessage: `Uploading ${loadedMB}/${fileSizeMB} MB…` });
-          },
-        );
-
-        // Poll for processing progress
-        set({ uploadProgress: 0.3, uploadMessage: 'Processing mesh…' });
-        uploaded = await new Promise<UploadedBuilding>((resolve, reject) => {
-          const poll = async () => {
-            try {
-              const status = await api.getUploadStatus(task_id);
-              const progress = 0.3 + status.progress * 0.7; // 30-100%
-              set({ uploadProgress: progress, uploadMessage: status.message });
-              if (status.status === 'complete' && status.result) {
-                if (status.phase_timings) {
-                  set({ lastPhaseTimings: status.phase_timings });
-                  console.log('[aeroscan] upload-mesh phase_timings', status.phase_timings);
-                }
-                resolve(status.result);
-              } else if (status.status === 'error') {
-                if (status.phase_timings) set({ lastPhaseTimings: status.phase_timings });
-                reject(new Error(status.error || 'Processing failed'));
-              } else {
-                setTimeout(poll, 1000);
-              }
-            } catch (e) {
-              reject(e);
-            }
-          };
-          poll();
-        });
-      } else {
-        // GeoJSON → JSON upload (instant, no progress needed)
-        const text = await file.text();
-        const geojson = JSON.parse(text);
-        const name = file.name.replace(/\.(geo)?json$/i, '') || 'Uploaded building';
-
-        let height = 8.0;
-        let numStories = 1;
-        let roofType: 'flat' | 'pitched' = 'flat';
-        let roofPitchDeg = 0;
-
-        const props = geojson.type === 'Feature'
-          ? geojson.properties || {}
-          : geojson.type === 'FeatureCollection' && geojson.features?.[0]
-            ? geojson.features[0].properties || {}
-            : {};
-
-        if (props.height) height = Number(props.height);
-        if (props.num_stories) numStories = Number(props.num_stories);
-        if (props.roof_type === 'pitched') roofType = 'pitched';
-        if (props.roof_pitch_deg) roofPitchDeg = Number(props.roof_pitch_deg);
-
-        uploaded = await api.uploadBuilding({
-          name,
-          geojson,
-          height,
-          num_stories: numStories,
-          roof_type: roofType,
-          roof_pitch_deg: roofPitchDeg,
-        });
-      }
-
-      // Add to list, select it, and load its params
-      set((s) => ({
-        buildings: [uploaded, ...s.buildings],
-        selectedBuildingId: uploaded.id,
-        buildingSource: 'upload',
-        preset: null,
-        building: {
-          ...s.building,
-          lat: uploaded.lat,
-          lon: uploaded.lon,
-          height: uploaded.height,
-          num_stories: uploaded.num_stories,
-          roof_type: uploaded.roof_type as 'flat' | 'pitched',
-          roof_pitch_deg: uploaded.roof_pitch_deg,
-        },
-        uploading: false, uploadProgress: 0, uploadMessage: '',
-      }));
-    } catch (e) {
-      console.error('Upload failed:', e);
-      set({ uploading: false, uploadProgress: 0, uploadMessage: String(e) });
-    }
-  },
-
   kmzOptimizing: false,
   kmzOptimizeMessage: '',
   kmzAutoRefine: false,
   setKmzAutoRefine: (v: boolean) => set({ kmzAutoRefine: v }),
+  kmzOptimizeMin: 0.08,
+  kmzOptimizeMax: 0.16,
+  kmzOptimizeSteps: 3,
+  kmzAwAlpha: null,
+  kmzAwOffset: null,
+  setKmzReconParams: (p) => set(p),
+  // Facade detection defaults: null = use backend library defaults.
+  kmzFdEpsilon: null,
+  kmzFdClusterEpsilon: null,
+  kmzFdMinPoints: null,
+  kmzFdMinWallArea: null,
+  kmzFdMinRoofArea: null,
+  kmzFdMinDensity: null,
+  kmzFdNormalThreshold: null,
+  setKmzFacadeParams: (p) => set(p),
+  kmzMode: 'dji',
+  setKmzMode: (v) => set({ kmzMode: v }),
+  buildings: [],
+  refreshBuildings: async () => {
+    try {
+      const data = await api.listBuildings();
+      set({ buildings: data.buildings });
+    } catch (e) {
+      console.error('Refresh buildings failed:', e);
+    }
+  },
+  selectBuilding: async (id) => {
+    // Fast path: hit /buildings/{id}/load which returns the gzipped response
+    // from the last refine plus the exact settings that produced it. No
+    // alpha_wrap, no CGAL extraction — instant. Falls back to refine only if
+    // the building has never been refined (409 from backend).
+    set({ selectedBuildingId: id, loading: true });
+    try {
+      const { result, settings } = await api.loadBuilding(id);
+      const patch: Partial<AppState> = { result, loading: false };
+      if (settings.voxel_size != null) patch.kmzOptimizeMin = settings.voxel_size;
+      if ('aw_alpha' in settings) patch.kmzAwAlpha = settings.aw_alpha ?? null;
+      if ('aw_offset' in settings) patch.kmzAwOffset = settings.aw_offset ?? null;
+      if ('fd_epsilon' in settings) patch.kmzFdEpsilon = settings.fd_epsilon ?? null;
+      if ('fd_cluster_epsilon' in settings) patch.kmzFdClusterEpsilon = settings.fd_cluster_epsilon ?? null;
+      if ('fd_min_points' in settings) patch.kmzFdMinPoints = settings.fd_min_points ?? null;
+      if ('fd_min_wall_area_m2' in settings) patch.kmzFdMinWallArea = settings.fd_min_wall_area_m2 ?? null;
+      if ('fd_min_roof_area_m2' in settings) patch.kmzFdMinRoofArea = settings.fd_min_roof_area_m2 ?? null;
+      if ('fd_min_density_per_m2' in settings) patch.kmzFdMinDensity = settings.fd_min_density_per_m2 ?? null;
+      if ('fd_normal_threshold' in settings) patch.kmzFdNormalThreshold = settings.fd_normal_threshold ?? null;
+      set(patch);
+      await get().refreshVersions();
+    } catch (e) {
+      console.warn('Fast load failed, falling back to refine:', e);
+      set({ loading: false });
+      get().triggerRefine();
+    }
+  },
+  deleteBuilding: async (id) => {
+    try {
+      await api.deleteBuilding(id);
+      set((s) => {
+        const wasSelected = s.selectedBuildingId === id;
+        return {
+          buildings: s.buildings.filter((b) => b.id !== id),
+          selectedBuildingId: wasSelected ? null : s.selectedBuildingId,
+          // Clear the viewer if the deleted building was the one on screen.
+          result: wasSelected ? null : s.result,
+        };
+      });
+    } catch (e) {
+      console.error('Delete building failed:', e);
+    }
+  },
+  stripRosetteOnly: async () => {
+    // Keep DJI's gimbals, only strip the SmartOblique rosette + cap speed.
+    // Uses the rewrite-gimbals endpoint with a very lenient pitch_margin
+    // so no gimbal angle changes materially — and we still get the
+    // smart_oblique strip + speed cap.
+    const current = get().result;
+    if (!current?.version_id) return;
+    set({ loading: true });
+    try {
+      const res = await api.rewriteGimbals(current.version_id, {
+        rewrite_angles: false,
+        strip_smart_oblique: true,
+      });
+      await get().loadVersion(res.version_id);
+      await get().refreshVersions();
+    } catch (e) {
+      console.error('Strip rosette failed:', e);
+      set({ loading: false });
+    }
+  },
+  refineRunning: false,
+  refinePending: false,
+  triggerRefine: () => {
+    // Coalescing fire-and-forget wrapper. If a refine is in flight, mark
+    // the next one as pending; when the in-flight one finishes we kick off
+    // a fresh refine with the latest params.
+    const run = async () => {
+      if (get().refineRunning) {
+        set({ refinePending: true });
+        return;
+      }
+      set({ refineRunning: true, refinePending: false });
+      try {
+        await get().refineKmz(get().kmzOptimizeMin);
+      } catch (e) {
+        console.error('[triggerRefine] refine failed:', e);
+      } finally {
+        const pending = get().refinePending;
+        set({ refineRunning: false, refinePending: false });
+        if (pending) run();
+      }
+    };
+    void run();
+  },
   showOriginalGimbals: true,
   setShowOriginalGimbals: (v: boolean) => set({ showOriginalGimbals: v }),
 
   refineKmz: async (voxelSize: number) => {
-    const { selectedBuildingId } = get();
-    if (!selectedBuildingId) return;
-    const { task_id } = await api.refineKmzBuilding(selectedBuildingId, voxelSize);
+    const s = get();
+    if (!s.selectedBuildingId) return;
+    // Clamp: values below each backend minimum fall back to library defaults
+    // (null). This lets the UI sliders start at 0 (= "auto") without tripping
+    // Pydantic validation on the way up.
+    const gte = (v: number | null | undefined, lo: number) =>
+      (v != null && v >= lo) ? v : null;
+    set({ kmzOptimizeMessage: `Refining (voxel=${voxelSize.toFixed(2)}m)…` });
+    let task_id: string;
+    try {
+      ({ task_id } = await api.refineKmzBuilding(s.selectedBuildingId, voxelSize, {
+        awAlpha: s.kmzAwAlpha, awOffset: s.kmzAwOffset,
+        fdEpsilon: gte(s.kmzFdEpsilon, 0.005),
+        fdClusterEpsilon: gte(s.kmzFdClusterEpsilon, 0.02),
+        fdMinPoints: gte(s.kmzFdMinPoints, 5),
+        fdMinWallAreaM2: gte(s.kmzFdMinWallArea, 0.05),
+        fdMinRoofAreaM2: gte(s.kmzFdMinRoofArea, 0.05),
+        fdMinDensityPerM2: gte(s.kmzFdMinDensity, 1.0),
+        fdNormalThreshold: gte(s.kmzFdNormalThreshold, 0.5),
+      }));
+    } catch (e) {
+      console.error('Refine request failed:', e);
+      set({ kmzOptimizeMessage: `Refine failed: ${String(e)}` });
+      throw e;
+    }
     const result = await new Promise<GenerateResponse & { building_id?: string }>((resolve, reject) => {
       const poll = async () => {
         try {
@@ -544,7 +549,6 @@ export const useStore = create<AppState>()(persist((set, get) => ({
     });
     set({ result });
     await get().refreshVersions();
-    await get().refreshBuildings();
   },
 
   cancelOptimize: () => set({ kmzOptimizing: false, kmzOptimizeMessage: 'Cancelled' }),
@@ -553,7 +557,17 @@ export const useStore = create<AppState>()(persist((set, get) => ({
     const target = buildingId ?? get().selectedBuildingId;
     if (!target) return;
     if (get().kmzOptimizing) return;
-    const schedule = [0.20, 0.12, 0.07, 0.04];
+    const { kmzOptimizeMin, kmzOptimizeMax, kmzOptimizeSteps } = get();
+    const vMin = Math.max(0.04, Math.min(0.30, kmzOptimizeMin));
+    const vMax = Math.max(vMin + 0.01, Math.min(0.40, kmzOptimizeMax));
+    const n = Math.max(1, Math.min(6, kmzOptimizeSteps | 0));
+    // Geometric ramp coarse → fine (coarse first stabilizes topology, fine passes add detail).
+    const schedule: number[] = n === 1
+      ? [vMin]
+      : Array.from({ length: n }, (_, i) => {
+          const t = i / (n - 1);
+          return +(vMax * Math.pow(vMin / vMax, t)).toFixed(3);
+        });
     set({ kmzOptimizing: true, kmzOptimizeMessage: 'Starting optimization…' });
     try {
       for (let i = 0; i < schedule.length; i++) {
@@ -636,10 +650,10 @@ export const useStore = create<AppState>()(persist((set, get) => ({
         activeTab: '3d',
       });
       await get().refreshVersions();
-      await get().refreshBuildings();
       if (result.building_id) {
-        set({ selectedBuildingId: result.building_id, buildingSource: 'upload', preset: null });
+        set({ selectedBuildingId: result.building_id });
       }
+      void get().refreshBuildings();
 
       // --- Background optimization chain (fire-and-forget, non-blocking) ---
       // Raw mode has no mesh to refine, so skip the chain entirely.
@@ -649,48 +663,6 @@ export const useStore = create<AppState>()(persist((set, get) => ({
     } catch (e) {
       console.error('KMZ import failed:', e);
       set({ uploading: false, uploadProgress: 0, uploadMessage: String(e) });
-    }
-  },
-
-  selectBuilding: (id) => {
-    const { buildings } = get();
-    const b = buildings.find((b) => b.id === id);
-    if (b) {
-      set({
-        selectedBuildingId: id,
-        buildingSource: 'upload',
-        preset: null,
-        building: {
-          ...get().building,
-          lat: b.lat,
-          lon: b.lon,
-          height: b.height,
-          num_stories: b.num_stories,
-          roof_type: b.roof_type as 'flat' | 'pitched',
-          roof_pitch_deg: b.roof_pitch_deg,
-        },
-      });
-    }
-  },
-
-  deleteBuilding: async (id) => {
-    try {
-      await api.deleteBuilding(id);
-      set((s) => ({
-        buildings: s.buildings.filter((b) => b.id !== id),
-        selectedBuildingId: s.selectedBuildingId === id ? null : s.selectedBuildingId,
-      }));
-    } catch (e) {
-      console.error('Delete building failed:', e);
-    }
-  },
-
-  refreshBuildings: async () => {
-    try {
-      const data = await api.listBuildings();
-      set({ buildings: data.buildings });
-    } catch (e) {
-      console.error('Refresh buildings failed:', e);
     }
   },
 
@@ -764,14 +736,22 @@ export const useStore = create<AppState>()(persist((set, get) => ({
   partialize: (state) => ({
     lightMode: state.lightMode,
     activeTab: state.activeTab,
-    buildingSource: state.buildingSource,
-    preset: state.preset,
     building: state.building,
     mission: state.mission,
     algorithm: state.algorithm,
-    minFacadeArea: state.minFacadeArea,
-    extractionMethod: state.extractionMethod,
-    waypointStrategy: state.waypointStrategy,
     sectionState: state.sectionState,
+    kmzMode: state.kmzMode,
+    kmzOptimizeMin: state.kmzOptimizeMin,
+    kmzOptimizeMax: state.kmzOptimizeMax,
+    kmzOptimizeSteps: state.kmzOptimizeSteps,
+    kmzAwAlpha: state.kmzAwAlpha,
+    kmzAwOffset: state.kmzAwOffset,
+    kmzFdEpsilon: state.kmzFdEpsilon,
+    kmzFdClusterEpsilon: state.kmzFdClusterEpsilon,
+    kmzFdMinPoints: state.kmzFdMinPoints,
+    kmzFdMinWallArea: state.kmzFdMinWallArea,
+    kmzFdMinRoofArea: state.kmzFdMinRoofArea,
+    kmzFdMinDensity: state.kmzFdMinDensity,
+    kmzFdNormalThreshold: state.kmzFdNormalThreshold,
   }),
 }));

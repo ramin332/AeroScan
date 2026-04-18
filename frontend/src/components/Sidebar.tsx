@@ -1,16 +1,9 @@
 import { useEffect, useRef, useState } from 'react';
-import { useStore, PRESETS, DEFAULT_ALGORITHM, DEFAULT_MISSION } from '../store';
+import { useStore, DEFAULT_ALGORITHM, DEFAULT_MISSION } from '../store';
 import { kmzDownloadUrl } from '../api/client';
 import type { AlgorithmParams, ExclusionZone, GimbalStats, GimbalDiffEntry, FacadeCoverageEntry } from '../api/types';
 import { DroneInfo } from './DroneInfo';
 import { VersionList } from './VersionList';
-
-const PRESET_LABELS: Record<string, string> = {
-  simple_box: 'Simple box (20x10x8m)',
-  pitched_roof_house: 'Pitched roof (30x10x6m)',
-  l_shaped_block: 'L-shaped block',
-  large_apartment_block: 'Large apartment (60x12x18m)',
-};
 
 const CAMERA_LABELS: Record<string, string> = {
   wide: 'Wide 24mm',
@@ -18,55 +11,48 @@ const CAMERA_LABELS: Record<string, string> = {
   telephoto: 'Telephoto 168mm',
 };
 
+// Backend defaults for the CGAL Shape-Detection facade extractor
+// (src/flight_planner/kmz_import.py:facades_from_pointcloud_cgal).
+// Single source of truth for "what the slider shows when the store is null".
+const FD_DEFAULTS = {
+  epsilon: 0.05,          // m — plane-fit ε
+  clusterEpsilon: 0.25,   // m — max inlier gap
+  minPoints: 40,          // region seed threshold
+  normalThreshold: 0.92,  // cos(θ) agreement
+  minWallArea: 0.5,       // m²
+  minRoofArea: 0.5,       // m²
+  minDensity: 25,         // pts/m²
+} as const;
+
 export function Sidebar() {
   const {
-    buildingSource, selectedBuildingId, buildings, uploading, uploadProgress, uploadMessage, minFacadeArea, extractionMethod, waypointStrategy,
-    preset, building, mission, algorithm, result, lightMode, setLightMode,
+    selectedBuildingId, uploading, uploadProgress, uploadMessage,
+    mission, algorithm, result, lightMode, setLightMode,
     disabledFacades, exclusionZones, toggleFacade, removeExclusionZone, updateExclusionZone,
-    setBuildingSource, setPreset, setBuilding, setMission, setAlgorithm, resetAlgorithm, setMinFacadeArea, setExtractionMethod, setWaypointStrategy,
-    uploadBuilding, importKmz, optimizeKmz, cancelOptimize, selectBuilding, deleteBuilding,
+    setMission, setAlgorithm, resetAlgorithm,
+    importKmz, optimizeKmz, cancelOptimize, triggerRefine,
     kmzOptimizing, kmzOptimizeMessage, kmzAutoRefine, setKmzAutoRefine,
+    refineRunning,
+    kmzOptimizeMin, kmzOptimizeMax, kmzOptimizeSteps, kmzAwAlpha, kmzAwOffset, setKmzReconParams,
+    kmzFdEpsilon, kmzFdClusterEpsilon, kmzFdMinPoints,
+    kmzFdMinWallArea, kmzFdMinRoofArea, kmzFdMinDensity, kmzFdNormalThreshold,
+    setKmzFacadeParams,
+    kmzMode, setKmzMode,
+    buildings, refreshBuildings, selectBuilding, deleteBuilding, stripRosetteOnly,
     simStatus, simProgress, simMessage, startSimulation,
     rewriteGimbals, generateInspectionMission, toggleKmzFacades, lastKmzFile,
   } = useStore();
 
-  const fileRef = useRef<HTMLInputElement>(null);
+  useEffect(() => { void refreshBuildings(); }, [refreshBuildings]);
+
+  const isKmz = !!result?.summary?.source?.startsWith('kmz_');
+  const inspectionMode = isKmz ? kmzMode === 'inspection' : true;
+
   const kmzRef = useRef<HTMLInputElement>(null);
 
-  const isUploadMode = buildingSource === 'upload';
-  const autoGen = () => {
-    const s = useStore.getState();
-    // KMZ-derived missions own their own trajectory (DJI planned it). Filter
-    // changes update UI state only — they must not regenerate a fresh path.
-    // The user explicitly clicks "Rewrite for NEN-2767 inspection" to branch.
-    if (s.result?.summary?.source?.startsWith('kmz_')) return;
-    const ok = s.buildingSource !== 'upload' || !!s.selectedBuildingId;
-    if (ok) s.generate();
-  };
-
-  // Generate on initial mount with default params
-  useEffect(() => { autoGen(); }, []); // eslint-disable-line react-hooks/exhaustive-deps
-
-  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (file) {
-      uploadBuilding(file);
-      e.target.value = '';
-    }
-  };
-
-  const handleDrop = (e: React.DragEvent) => {
-    e.preventDefault();
-    e.stopPropagation();
-    const file = e.dataTransfer.files[0];
-    if (file) {
-      const ext = file.name.split('.').pop()?.toLowerCase() || '';
-      const supported = ['json', 'geojson', 'obj', 'ply', 'stl', 'glb', 'gltf'];
-      if (supported.includes(ext)) {
-        uploadBuilding(file);
-      }
-    }
-  };
+  // Every mission in this app is KMZ-derived; there's no auto-regenerate
+  // for raw building params any more. Buttons trigger explicit actions.
+  const autoGen = () => {};
 
   const handleDragOver = (e: React.DragEvent) => {
     e.preventDefault();
@@ -97,28 +83,13 @@ export function Sidebar() {
       min_photo_distance_m: DEFAULT_MISSION.min_photo_distance_m,
       yaw_rate_deg_per_s: DEFAULT_MISSION.yaw_rate_deg_per_s,
     });
-    autoGen();
   };
-
-  const selectedBuilding = buildings.find((b) => b.id === selectedBuildingId);
-  const showBoxParams = !isUploadMode && preset !== 'l_shaped_block';
 
   return (
     <aside className="sidebar">
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', paddingRight: 12, borderBottom: '1px solid var(--border)' }}>
         <h1>AeroScan Flight Planner</h1>
         <div style={{ display: 'flex', gap: 4 }}>
-          <button
-            className="theme-toggle"
-            onClick={() => {
-              setPreset('simple_box');
-              setMission(DEFAULT_MISSION);
-              resetAlgorithm();
-            }}
-            title="Reset all values to defaults"
-          >
-            {'\u21BA'}
-          </button>
           <button
             className="theme-toggle"
             onClick={() => setLightMode(!lightMode)}
@@ -129,17 +100,6 @@ export function Sidebar() {
         </div>
       </div>
       <DroneInfo />
-
-      {/* ======== BUILDING ======== */}
-      <div className="section">
-        <h3>Building</h3>
-        <div className="source-toggle">
-          <button className={`source-btn ${isUploadMode ? 'active' : ''}`}
-            onClick={() => { setBuildingSource('upload'); autoGen(); }}>Upload</button>
-          <button className={`source-btn ${!isUploadMode ? 'active' : ''}`}
-            onClick={() => { setBuildingSource('preset'); setTimeout(autoGen); }}>Preset</button>
-        </div>
-      </div>
 
       {/* DJI KMZ import — always visible */}
       <div className="section">
@@ -184,6 +144,14 @@ export function Sidebar() {
             >
               Rewrite gimbals (keep DJI path)
             </button>
+            <button
+              className="btn-secondary"
+              style={{ marginTop: 6, width: '100%', fontSize: 12, padding: '6px 10px' }}
+              onClick={() => stripRosetteOnly()}
+              title="Keep DJI gimbals EXACTLY as they are. Only strip the SmartOblique 5-pose rosette so every waypoint takes 1 photo toward the facade, and cap speed to 3 m/s."
+            >
+              Strip rosette only (keep DJI gimbals)
+            </button>
             {(result.summary.source?.startsWith('kmz_')) &&
              (result.building_id || result.config_snapshot?.building_id) && (
               <button
@@ -214,189 +182,241 @@ export function Sidebar() {
         )}
       </div>
 
-      {/* Upload mode */}
-      {isUploadMode && (
-        <div className="section">
-          <div className="upload-zone" onClick={() => fileRef.current?.click()}
-            onDrop={handleDrop} onDragOver={handleDragOver}>
-            <input ref={fileRef} type="file" accept=".json,.geojson,.obj,.ply,.stl,.glb,.gltf"
-              onChange={handleFileChange} style={{ display: 'none' }} />
-            {uploading ? (
-              <div className="upload-progress-info">
-                <div className="upload-progress-bar" style={{ width: `${Math.round(uploadProgress * 100)}%` }} />
-                <span className="upload-text">{uploadMessage || 'Processing…'}</span>
-                <span className="upload-hint">{Math.round(uploadProgress * 100)}%</span>
-              </div>
-            ) : (
-              <>
-                <span className="upload-icon">+</span>
-                <span className="upload-text">Upload Building</span>
-                <span className="upload-hint">GeoJSON, OBJ, PLY, STL</span>
-              </>
-            )}
+      {/* ======== SAVED BUILDINGS (always expanded) ======== */}
+      {buildings.length > 0 && (
+        <div className="section" style={{ padding: 10 }}>
+          <div style={{
+            display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+            marginBottom: 8,
+          }}>
+            <h3 style={{ margin: 0 }}>Saved buildings</h3>
+            <span style={{ fontSize: 11, color: 'var(--text-dim)' }}>
+              {buildings.length}
+            </span>
           </div>
-          {buildings.length > 0 && (
-            <div className="building-list">
-              {buildings.map((b) => (
-                <div key={b.id}
-                  className={`building-item ${selectedBuildingId === b.id ? 'active' : ''}`}
-                  onClick={() => { selectBuilding(b.id); autoGen(); }}>
-                  <div className="building-item-info">
-                    <span className="building-name">{b.name}</span>
-                    <span className="building-meta">
-                      {b.lat.toFixed(4)}, {b.lon.toFixed(4)} &middot; {b.height}m
-                    </span>
-                  </div>
-                  <span className="del" onClick={(e) => { e.stopPropagation(); deleteBuilding(b.id); }}>x</span>
-                </div>
-              ))}
-            </div>
-          )}
-          {selectedBuilding && (
-            <div className="building-details">
-              <div className="building-dims">
-                {selectedBuilding.width > 0
-                  ? `${selectedBuilding.width} \u00D7 ${selectedBuilding.depth} \u00D7 ${selectedBuilding.height} m`
-                  : `${selectedBuilding.height} m tall`}
-              </div>
-              <div className="building-source">{selectedBuilding.source_type}</div>
-              <Field label="Lat" value={building.lat} step={0.0001}
-                onChange={(v) => setBuilding({ lat: v })} onCommit={autoGen} />
-              <Field label="Lon" value={building.lon} step={0.0001}
-                onChange={(v) => setBuilding({ lon: v })} onCommit={autoGen} />
-              {selectedBuilding.source_type === 'kmz_import' && (
-                <div style={{ marginTop: 8, paddingTop: 8, borderTop: '1px solid var(--border)' }}>
-                  <div style={{ fontSize: 11, color: 'var(--muted)', marginBottom: 6, fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.5px' }}>
-                    Reconstruction
-                  </div>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+            {buildings.map((b) => {
+              const isActive = selectedBuildingId === b.id;
+              return (
+                <div
+                  key={b.id}
+                  style={{
+                    display: 'flex', alignItems: 'stretch', gap: 0,
+                    background: isActive ? 'rgba(59,130,246,0.18)' : 'var(--bg-elev, rgba(255,255,255,0.03))',
+                    border: `1px solid ${isActive ? 'rgba(59,130,246,0.6)' : 'var(--border)'}`,
+                    borderRadius: 6, overflow: 'hidden',
+                  }}
+                >
                   <button
-                    onClick={() => kmzOptimizing ? cancelOptimize() : optimizeKmz()}
-                    disabled={uploading}
-                    title="Iteratively re-reconstruct at progressively finer voxel sizes (0.20 → 0.12 → 0.07 → 0.04m). Runs in background — keep using the app."
+                    onClick={() => void selectBuilding(b.id)}
+                    disabled={isActive}
+                    title={isActive ? 'Currently loaded' : `Open "${b.name}"`}
                     style={{
-                      width: '100%', padding: '6px 10px', fontSize: 12,
-                      background: kmzOptimizing ? '#dc2626' : '#0ea5e9',
-                      color: '#fff', border: 'none', borderRadius: 4,
-                      cursor: uploading ? 'wait' : 'pointer', fontWeight: 600,
+                      flex: 1, textAlign: 'left', background: 'transparent',
+                      border: 'none', padding: '8px 10px', cursor: isActive ? 'default' : 'pointer',
+                      color: 'inherit', display: 'flex', flexDirection: 'column',
+                      gap: 2, minWidth: 0,
+                    }}
+                  >
+                    <span style={{
+                      fontWeight: 600, fontSize: 13,
+                      overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
                     }}>
-                    {kmzOptimizing ? 'Cancel optimize' : 'Optimize ↻'}
+                      {b.name}
+                    </span>
+                    <span style={{ fontSize: 10, color: 'var(--text-dim)', display: 'flex', gap: 8 }}>
+                      <span>{b.source_type}</span>
+                      <span>·</span>
+                      <span>{new Date(b.created_at).toLocaleDateString()}</span>
+                      {isActive && <span style={{ color: 'rgb(96,165,250)' }}>· loaded</span>}
+                    </span>
                   </button>
-                  {kmzOptimizeMessage && (
-                    <div style={{ fontSize: 10, color: kmzOptimizing ? '#22d3ee' : 'var(--muted)', marginTop: 4, lineHeight: 1.4 }}>
-                      {kmzOptimizeMessage}
-                    </div>
-                  )}
-                  <label style={{ display: 'flex', alignItems: 'center', gap: 6, marginTop: 6, fontSize: 12, cursor: 'pointer' }}
-                    title="Auto-start Optimize after a fresh KMZ import.">
-                    <input type="checkbox" checked={kmzAutoRefine}
-                      onChange={(e) => setKmzAutoRefine(e.target.checked)} />
-                    <span style={{ color: 'var(--muted)' }}>Auto-optimize after import</span>
-                  </label>
+                  <button
+                    onClick={() => void deleteBuilding(b.id)}
+                    title={`Delete "${b.name}"`}
+                    style={{
+                      background: 'transparent', border: 'none',
+                      borderLeft: '1px solid var(--border)',
+                      cursor: 'pointer', color: 'var(--text-dim)',
+                      padding: '0 12px', fontSize: 16, lineHeight: 1,
+                      display: 'flex', alignItems: 'center', justifyContent: 'center',
+                    }}
+                    onMouseEnter={(e) => { (e.currentTarget as HTMLButtonElement).style.color = '#f87171'; }}
+                    onMouseLeave={(e) => { (e.currentTarget as HTMLButtonElement).style.color = 'var(--text-dim)'; }}
+                  >
+                    ×
+                  </button>
                 </div>
-              )}
-            </div>
-          )}
+              );
+            })}
+          </div>
         </div>
       )}
 
-      {/* Preset mode */}
-      {!isUploadMode && (
-        <>
-          <div className="section">
-            <select value={preset || ''}
-              onChange={(e) => { setPreset(e.target.value || null); autoGen(); }}>
-              <option value="">Custom building</option>
-              {Object.keys(PRESETS).map((k) => (
-                <option key={k} value={k}>{PRESET_LABELS[k] || k}</option>
-              ))}
-            </select>
-          </div>
-          {showBoxParams && (
-            <Section title="Dimensions" defaultOpen>
-              <Field label="Width (m)" value={building.width} min={1} max={200} step={1}
-                onChange={(v) => setBuilding({ width: v })} onCommit={autoGen} />
-              <Field label="Depth (m)" value={building.depth} min={1} max={200} step={1}
-                onChange={(v) => setBuilding({ depth: v })} onCommit={autoGen} />
-              <Field label="Height (m)" value={building.height} min={1} max={100} step={0.5}
-                onChange={(v) => setBuilding({ height: v })} onCommit={autoGen} />
-              <SliderField label="Heading" value={building.heading_deg} min={0} max={360} step={5}
-                format={(v) => `${v}\u00B0`}
-                onChange={(v) => setBuilding({ heading_deg: v })} onCommit={autoGen} />
-              <div className="field">
-                <label>Roof</label>
-                <select value={building.roof_type}
-                  onChange={(e) => { setBuilding({ roof_type: e.target.value as 'flat' | 'pitched' }); autoGen(); }}>
-                  <option value="flat">Flat</option>
-                  <option value="pitched">Pitched</option>
-                </select>
-              </div>
-              {building.roof_type === 'pitched' && (
-                <SliderField label="Pitch" value={building.roof_pitch_deg} min={5} max={60} step={5}
-                  format={(v) => `${v}\u00B0`}
-                  onChange={(v) => setBuilding({ roof_pitch_deg: v })} onCommit={autoGen} />
-              )}
-              <Field label="Lat" value={building.lat} step={0.0001}
-                onChange={(v) => setBuilding({ lat: v })} onCommit={autoGen} />
-              <Field label="Lon" value={building.lon} step={0.0001}
-                onChange={(v) => setBuilding({ lon: v })} onCommit={autoGen} />
-            </Section>
-          )}
-        </>
+      {/* ======== MODE TOGGLE (KMZ only) ======== */}
+      {isKmz && selectedBuildingId && (
+        <div className="section" style={{ display: 'flex', gap: 6, padding: 8 }}>
+          <button
+            className={kmzMode === 'dji' ? 'btn-primary' : 'btn-secondary'}
+            style={{ flex: 1, fontSize: 12, padding: '6px 8px' }}
+            onClick={() => setKmzMode('dji')}
+            title="Original DJI flight path. Tune mesh + facade detection to drive the gimbal rewrite. Waypoints stay as DJI flew them.">
+            DJI mode
+          </button>
+          <button
+            className={kmzMode === 'inspection' ? 'btn-primary' : 'btn-secondary'}
+            style={{ flex: 1, fontSize: 12, padding: '6px 8px' }}
+            onClick={() => setKmzMode('inspection')}
+            title="Generate a fresh NEN-2767 inspection mission from the detected facades. Tune mission / flight / TSP params below.">
+            Inspection mode
+          </button>
+        </div>
       )}
 
-      {/* Facade detection (upload only) */}
-      {isUploadMode && (
-        <Section title="Facade Detection" defaultOpen>
-          <div className="field">
-            <label>Waypoint Strategy</label>
-            <select value={waypointStrategy}
-              onChange={(e) => { setWaypointStrategy(e.target.value); autoGen(); }}>
-              <option value="facade_grid">Facade Grid</option>
-              <option value="surface_sampling">Surface Sampling</option>
-            </select>
-          </div>
-          <div className="field">
-            <label>Method</label>
-            <select value={extractionMethod}
-              onChange={(e) => { setExtractionMethod(e.target.value); autoGen(); }}>
-              <option value="region_growing">Region Growing</option>
-              <option value="meshlab">MeshLab</option>
-              <option value="convex_hull">Convex Hull</option>
-            </select>
-          </div>
-          <SliderField label="Min surface" value={minFacadeArea}
-            min={0.5} max={10} step={0.5}
-            format={(v) => `${v} m\u00B2`}
-            onChange={(v) => setMinFacadeArea(v)} onCommit={autoGen} />
-          {waypointStrategy === 'surface_sampling' && (
-            <>
-              <SliderField label="Sample density" value={algorithm.surface_sample_count}
-                min={500} max={10000} step={500}
-                format={(v) => `${v}`}
-                tooltip="Target number of Poisson-disk sample points on the mesh surface. Higher = denser coverage."
-                defaultValue={DEFAULT_ALGORITHM.surface_sample_count}
-                onReset={() => setAlgorithm({ surface_sample_count: DEFAULT_ALGORITHM.surface_sample_count })}
-                onChange={(v) => setAlgorithm({ surface_sample_count: v })} onCommit={autoGen} />
-              <SliderField label="Dedup radius" value={algorithm.surface_dedup_radius_m}
-                min={0.1} max={3} step={0.1}
-                format={(v) => `${v}m`}
-                tooltip="Merge cameras closer than this distance with similar headings."
-                defaultValue={DEFAULT_ALGORITHM.surface_dedup_radius_m}
-                onReset={() => setAlgorithm({ surface_dedup_radius_m: DEFAULT_ALGORITHM.surface_dedup_radius_m })}
-                onChange={(v) => setAlgorithm({ surface_dedup_radius_m: v })} onCommit={autoGen} />
-              <SliderField label="Dedup angle" value={algorithm.surface_dedup_max_angle_deg}
-                min={5} max={90} step={5}
-                format={(v) => `${v}\u00B0`}
-                tooltip="Max heading difference for two nearby cameras to be merged."
-                defaultValue={DEFAULT_ALGORITHM.surface_dedup_max_angle_deg}
-                onReset={() => setAlgorithm({ surface_dedup_max_angle_deg: DEFAULT_ALGORITHM.surface_dedup_max_angle_deg })}
-                onChange={(v) => setAlgorithm({ surface_dedup_max_angle_deg: v })} onCommit={autoGen} />
-            </>
+      {/* ======== DJI: Mesh reconstruction (KMZ only) ======== */}
+      {isKmz && selectedBuildingId && (
+        <Section title="DJI: Mesh reconstruction" defaultOpen>
+          <button
+            onClick={() => kmzOptimizing ? cancelOptimize() : optimizeKmz()}
+            disabled={uploading}
+            className="btn-primary"
+            style={{ width: '100%', background: kmzOptimizing ? '#dc2626' : undefined }}
+            title={`Re-reconstruct from ${kmzOptimizeMax.toFixed(2)}m → ${kmzOptimizeMin.toFixed(2)}m in ${kmzOptimizeSteps} passes (geometric ramp).`}>
+            {kmzOptimizing ? 'Cancel optimize' : `Optimize (${kmzOptimizeMax.toFixed(2)} → ${kmzOptimizeMin.toFixed(2)}m, ${kmzOptimizeSteps}×)`}
+          </button>
+          {(kmzOptimizeMessage || refineRunning) && (
+            <div className="field-hint" style={{ marginTop: 4, color: (kmzOptimizing || refineRunning) ? 'var(--accent)' : undefined }}>
+              {refineRunning && !kmzOptimizing ? 'Refining…' : kmzOptimizeMessage}
+            </div>
           )}
+          <ToggleField label="Auto-optimize on import" value={kmzAutoRefine}
+            tooltip="Run the optimization chain automatically after each KMZ import."
+            onChange={setKmzAutoRefine} />
+          <SliderField label="Voxel max" value={kmzOptimizeMax}
+            min={0.05} max={0.30} step={0.01} format={(v) => `${v.toFixed(2)} m`}
+            tooltip="Coarsest voxel (first pass). Larger = faster but less detail."
+            defaultValue={0.16}
+            onReset={() => setKmzReconParams({ kmzOptimizeMax: 0.16 })}
+            onChange={(v) => setKmzReconParams({ kmzOptimizeMax: v })}
+            onCommit={triggerRefine} />
+          <SliderField label="Voxel min" value={kmzOptimizeMin}
+            min={0.05} max={0.25} step={0.01} format={(v) => `${v.toFixed(2)} m`}
+            tooltip="Finest voxel (last pass). Smaller = more detail but noisier + slower. Floor ~0.06m."
+            defaultValue={0.08}
+            onReset={() => setKmzReconParams({ kmzOptimizeMin: 0.08 })}
+            onChange={(v) => setKmzReconParams({ kmzOptimizeMin: v })}
+            onCommit={triggerRefine} />
+          <SliderField label="Passes" value={kmzOptimizeSteps}
+            min={1} max={6} step={1} format={(v) => `${v}`}
+            tooltip="Number of passes from max → min (geometric ramp)."
+            defaultValue={3}
+            onReset={() => setKmzReconParams({ kmzOptimizeSteps: 3 })}
+            onChange={(v) => setKmzReconParams({ kmzOptimizeSteps: v })} />
+          <SliderField label={`α (probe)${kmzAwAlpha == null ? ' (auto)' : ''}`}
+            value={kmzAwAlpha ?? Math.max(0.06, Math.min(0.60, kmzOptimizeMin * 2))}
+            min={0.02} max={0.80} step={0.02}
+            format={(v) => `${v.toFixed(2)} m`}
+            tooltip="CGAL alpha_wrap_3 α (probe size). Default 2× voxel. Smaller hugs small features."
+            defaultValue={Math.max(0.06, Math.min(0.60, kmzOptimizeMin * 2))}
+            onReset={() => setKmzReconParams({ kmzAwAlpha: null })}
+            onChange={(v) => setKmzReconParams({ kmzAwAlpha: v })}
+            onCommit={triggerRefine} />
+          <SliderField label={`offset (wrap)${kmzAwOffset == null ? ' (auto)' : ''}`}
+            value={kmzAwOffset ?? Math.max(0.03, Math.min(0.20, kmzOptimizeMin * 1))}
+            min={0.01} max={0.40} step={0.01}
+            format={(v) => `${v.toFixed(2)} m`}
+            tooltip="CGAL alpha_wrap_3 offset (wrap distance). Default 1× voxel. Smaller = tighter."
+            defaultValue={Math.max(0.03, Math.min(0.20, kmzOptimizeMin * 1))}
+            onReset={() => setKmzReconParams({ kmzAwOffset: null })}
+            onChange={(v) => setKmzReconParams({ kmzAwOffset: v })}
+            onCommit={triggerRefine} />
         </Section>
       )}
 
-      {/* ======== INSPECTION ======== */}
+      {/* ======== DJI: Facade detection (KMZ only) ======== */}
+      {isKmz && selectedBuildingId && (
+        <Section title="DJI: Facade detection" defaultOpen={false}>
+          <div className="field-hint" style={{ marginBottom: 6 }}>
+            CGAL Shape-Detection (region growing). Tuned for many small facets over few large walls — gimbal targets dormers, sills, balconies. Changes re-run on release.
+          </div>
+          <SliderField label={`ε (plane tol)${kmzFdEpsilon == null ? ' (auto)' : ''}`}
+            value={kmzFdEpsilon ?? FD_DEFAULTS.epsilon}
+            min={0.005} max={0.25} step={0.005}
+            format={(v) => `${v.toFixed(3)} m`}
+            tooltip="Max distance from inlier to fitted plane. Smaller = stricter planarity (more facets). Default 0.05m."
+            defaultValue={FD_DEFAULTS.epsilon}
+            onReset={() => setKmzFacadeParams({ kmzFdEpsilon: null })}
+            onChange={(v) => setKmzFacadeParams({ kmzFdEpsilon: v })}
+            onCommit={triggerRefine} />
+          <SliderField label={`cluster ε (gap)${kmzFdClusterEpsilon == null ? ' (auto)' : ''}`}
+            value={kmzFdClusterEpsilon ?? FD_DEFAULTS.clusterEpsilon}
+            min={0.02} max={1.2} step={0.02}
+            format={(v) => `${v.toFixed(2)} m`}
+            tooltip="Max allowed gap between neighboring inliers. Smaller = split wall at small gaps. Default 0.25m."
+            defaultValue={FD_DEFAULTS.clusterEpsilon}
+            onReset={() => setKmzFacadeParams({ kmzFdClusterEpsilon: null })}
+            onChange={(v) => setKmzFacadeParams({ kmzFdClusterEpsilon: v })}
+            onCommit={triggerRefine} />
+          <SliderField label={`min points${kmzFdMinPoints == null ? ' (auto)' : ''}`}
+            value={kmzFdMinPoints ?? FD_DEFAULTS.minPoints}
+            min={5} max={400} step={5}
+            format={(v) => `${v} pts`}
+            tooltip="Smallest region accepted. Lower = more small facets survive. Default 40."
+            defaultValue={FD_DEFAULTS.minPoints}
+            onReset={() => setKmzFacadeParams({ kmzFdMinPoints: null })}
+            onChange={(v) => setKmzFacadeParams({ kmzFdMinPoints: Math.round(v) })}
+            onCommit={triggerRefine} />
+          <SliderField label={`normal agreement${kmzFdNormalThreshold == null ? ' (auto)' : ''}`}
+            value={kmzFdNormalThreshold ?? FD_DEFAULTS.normalThreshold}
+            min={0.5} max={0.999} step={0.005}
+            format={(v) => v.toFixed(3)}
+            tooltip="Cosine-similarity between seed normal and candidate neighbor. Higher = stricter. Default 0.92."
+            defaultValue={FD_DEFAULTS.normalThreshold}
+            onReset={() => setKmzFacadeParams({ kmzFdNormalThreshold: null })}
+            onChange={(v) => setKmzFacadeParams({ kmzFdNormalThreshold: v })}
+            onCommit={triggerRefine} />
+          <SliderField label={`min wall area${kmzFdMinWallArea == null ? ' (auto)' : ''}`}
+            value={kmzFdMinWallArea ?? FD_DEFAULTS.minWallArea}
+            min={0.05} max={10} step={0.05}
+            format={(v) => `${v.toFixed(2)} m²`}
+            tooltip="Drop walls smaller than this. Lower = keep tiny panels / pilasters. Default 0.5 m²."
+            defaultValue={FD_DEFAULTS.minWallArea}
+            onReset={() => setKmzFacadeParams({ kmzFdMinWallArea: null })}
+            onChange={(v) => setKmzFacadeParams({ kmzFdMinWallArea: v })}
+            onCommit={triggerRefine} />
+          <SliderField label={`min roof area${kmzFdMinRoofArea == null ? ' (auto)' : ''}`}
+            value={kmzFdMinRoofArea ?? FD_DEFAULTS.minRoofArea}
+            min={0.05} max={10} step={0.05}
+            format={(v) => `${v.toFixed(2)} m²`}
+            tooltip="Drop roof facets smaller than this. Lower = keep dormers. Default 0.5 m²."
+            defaultValue={FD_DEFAULTS.minRoofArea}
+            onReset={() => setKmzFacadeParams({ kmzFdMinRoofArea: null })}
+            onChange={(v) => setKmzFacadeParams({ kmzFdMinRoofArea: v })}
+            onCommit={triggerRefine} />
+          <SliderField label={`min density${kmzFdMinDensity == null ? ' (auto)' : ''}`}
+            value={kmzFdMinDensity ?? FD_DEFAULTS.minDensity}
+            min={1} max={200} step={1}
+            format={(v) => `${v} pts/m²`}
+            tooltip="Reject 'ghost planes' whose inlier density falls below this. Higher = stricter. Default 25."
+            defaultValue={FD_DEFAULTS.minDensity}
+            onReset={() => setKmzFacadeParams({ kmzFdMinDensity: null })}
+            onChange={(v) => setKmzFacadeParams({ kmzFdMinDensity: Math.round(v) })}
+            onCommit={triggerRefine} />
+          <button
+            className="btn-secondary"
+            style={{ width: '100%', fontSize: 11, marginTop: 6 }}
+            onClick={() => setKmzFacadeParams({
+              kmzFdEpsilon: null, kmzFdClusterEpsilon: null, kmzFdMinPoints: null,
+              kmzFdMinWallArea: null, kmzFdMinRoofArea: null, kmzFdMinDensity: null,
+              kmzFdNormalThreshold: null,
+            })}>
+            Reset facade detection
+          </button>
+        </Section>
+      )}
+
+      {/* ======== INSPECTION + FLIGHT + PATH OPT (mission-generation only) ======== */}
+      {inspectionMode && (<>
       <Section title="Inspection" defaultOpen>
         <SliderField label="GSD (mm/px)" value={mission.target_gsd_mm_per_px}
           min={1} max={5} step={0.25}
@@ -497,6 +517,7 @@ export function Sidebar() {
           </>
         )}
       </Section>
+      </>)}
 
       {/* ======== WAYPOINT LOS ======== */}
       <Section title="Line-of-Sight" defaultOpen>
@@ -618,84 +639,6 @@ export function Sidebar() {
           onReset={() => setAlgorithm({ gimbal_near_limit_deg: DEFAULT_ALGORITHM.gimbal_near_limit_deg })}
           onChange={(v) => setAlgorithm({ gimbal_near_limit_deg: v })} onCommit={autoGen} />
       </Section>
-
-      {/* ======== GEOMETRY (advanced) ======== */}
-      <Section title="Geometry">
-        <SliderField label="Transit margin" value={algorithm.transition_altitude_margin_m}
-          min={0} max={10} step={0.5}
-          format={(v) => `${v}m`}
-          tooltip="Extra altitude during facade-to-facade transitions."
-          defaultValue={DEFAULT_ALGORITHM.transition_altitude_margin_m}
-          onReset={() => setAlgorithm({ transition_altitude_margin_m: DEFAULT_ALGORITHM.transition_altitude_margin_m })}
-          onChange={(v) => setAlgorithm({ transition_altitude_margin_m: v })} onCommit={autoGen} />
-        <SliderField label="Roof threshold" value={algorithm.roof_normal_threshold}
-          min={0.1} max={0.9} step={0.05}
-          format={(v) => `${v}`}
-          tooltip="Normal Z above this = roof surface."
-          defaultValue={DEFAULT_ALGORITHM.roof_normal_threshold}
-          onReset={() => setAlgorithm({ roof_normal_threshold: DEFAULT_ALGORITHM.roof_normal_threshold })}
-          onChange={(v) => setAlgorithm({ roof_normal_threshold: v })} onCommit={autoGen} />
-      </Section>
-
-      {/* ======== MESH IMPORT (upload only) ======== */}
-      {isUploadMode && (
-        <Section title="Mesh Import">
-          {result?.perf?.extraction && (
-            <div className="field-hint" style={{ marginBottom: 6, color: 'var(--accent2)' }}>
-              {result.perf.extraction.facades_extracted} facades extracted ({result.perf.extraction.walls}W {result.perf.extraction.roofs}R) from {result.perf.extraction.regions_found} regions
-            </div>
-          )}
-          <SliderField label="Default height" value={algorithm.default_building_height_m}
-            min={1} max={100} step={1}
-            format={(v) => `${v}m`}
-            tooltip="Fallback height when auto-scaling kicks in."
-            defaultValue={DEFAULT_ALGORITHM.default_building_height_m}
-            onReset={() => setAlgorithm({ default_building_height_m: DEFAULT_ALGORITHM.default_building_height_m })}
-            onChange={(v) => setAlgorithm({ default_building_height_m: v })} onCommit={autoGen} />
-          <SliderField label="Region angle" value={algorithm.region_growing_angle_deg}
-            min={1} max={45} step={1}
-            format={(v) => `${v}\u00B0`}
-            tooltip="Max angle between adjacent normals for region growing."
-            defaultValue={DEFAULT_ALGORITHM.region_growing_angle_deg}
-            onReset={() => setAlgorithm({ region_growing_angle_deg: DEFAULT_ALGORITHM.region_growing_angle_deg })}
-            onChange={(v) => setAlgorithm({ region_growing_angle_deg: v })} onCommit={autoGen} />
-          <SliderField label="Wall nz" value={algorithm.wall_normal_threshold}
-            min={0.01} max={0.9} step={0.05}
-            format={(v) => `${v}`}
-            tooltip="Normal Z below this = wall."
-            defaultValue={DEFAULT_ALGORITHM.wall_normal_threshold}
-            onReset={() => setAlgorithm({ wall_normal_threshold: DEFAULT_ALGORITHM.wall_normal_threshold })}
-            onChange={(v) => setAlgorithm({ wall_normal_threshold: v })} onCommit={autoGen} />
-          <SliderField label="Flat roof nz" value={algorithm.flat_roof_normal_threshold}
-            min={0.5} max={1} step={0.05}
-            format={(v) => `${v}`}
-            tooltip="Normal Z above this = flat roof."
-            defaultValue={DEFAULT_ALGORITHM.flat_roof_normal_threshold}
-            onReset={() => setAlgorithm({ flat_roof_normal_threshold: DEFAULT_ALGORITHM.flat_roof_normal_threshold })}
-            onChange={(v) => setAlgorithm({ flat_roof_normal_threshold: v })} onCommit={autoGen} />
-          <SliderField label="Occlusion frac" value={algorithm.occlusion_hit_fraction}
-            min={0.1} max={1} step={0.1}
-            format={(v) => `${v}`}
-            tooltip="Interior wall detection threshold."
-            defaultValue={DEFAULT_ALGORITHM.occlusion_hit_fraction}
-            onReset={() => setAlgorithm({ occlusion_hit_fraction: DEFAULT_ALGORITHM.occlusion_hit_fraction })}
-            onChange={(v) => setAlgorithm({ occlusion_hit_fraction: v })} onCommit={autoGen} />
-          <SliderField label="Ground filter" value={algorithm.ground_level_threshold_m}
-            min={0} max={5} step={0.1}
-            format={(v) => `${v}m`}
-            tooltip="Surfaces below this Z are filtered as ground."
-            defaultValue={DEFAULT_ALGORITHM.ground_level_threshold_m}
-            onReset={() => setAlgorithm({ ground_level_threshold_m: DEFAULT_ALGORITHM.ground_level_threshold_m })}
-            onChange={(v) => setAlgorithm({ ground_level_threshold_m: v })} onCommit={autoGen} />
-          <SliderField label="Auto-scale" value={algorithm.auto_scale_height_threshold_m}
-            min={10} max={500} step={10}
-            format={(v) => `>${v}m`}
-            tooltip="Mesh height above this triggers auto-rescale."
-            defaultValue={DEFAULT_ALGORITHM.auto_scale_height_threshold_m}
-            onReset={() => setAlgorithm({ auto_scale_height_threshold_m: DEFAULT_ALGORITHM.auto_scale_height_threshold_m })}
-            onChange={(v) => setAlgorithm({ auto_scale_height_threshold_m: v })} onCommit={autoGen} />
-        </Section>
-      )}
 
       {/* ======== RESET ======== */}
       <div className="section" style={{ paddingTop: 0 }}>
@@ -1020,22 +963,6 @@ function Section({ title, defaultOpen, children }: {
 }
 
 // --- Field components ---
-
-function Field({ label, value, min, max, step, onChange, onCommit }: {
-  label: string; value: number; min?: number; max?: number; step?: number;
-  onChange: (v: number) => void;
-  onCommit?: () => void;
-}) {
-  return (
-    <div className="field">
-      <label>{label}</label>
-      <input type="number" value={value} min={min} max={max} step={step}
-        onChange={(e) => onChange(parseFloat(e.target.value) || 0)}
-        onBlur={onCommit}
-        onKeyDown={(e) => { if (e.key === 'Enter') onCommit?.(); }} />
-    </div>
-  );
-}
 
 function ToggleField({ label, value, onChange, tooltip }: {
   label: string; value: boolean;

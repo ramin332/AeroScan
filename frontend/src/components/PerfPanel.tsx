@@ -9,15 +9,11 @@ export function PerfPanel({ perf }: { perf: PerfStats | null | undefined }) {
   const [benchResults, setBenchResults] = useState<BenchmarkResult[] | null>(null);
   const [benching, setBenching] = useState(false);
 
-  // Grab current request params for benchmark
-  const preset = useStore((s) => s.preset);
-  const buildingSource = useStore((s) => s.buildingSource);
+  // Grab current request params for benchmark — every mission is KMZ-derived.
   const selectedBuildingId = useStore((s) => s.selectedBuildingId);
   const building = useStore((s) => s.building);
   const mission = useStore((s) => s.mission);
   const algorithm = useStore((s) => s.algorithm);
-  const minFacadeArea = useStore((s) => s.minFacadeArea);
-  const extractionMethod = useStore((s) => s.extractionMethod);
 
   if (!perf) return null;
 
@@ -36,13 +32,10 @@ export function PerfPanel({ perf }: { perf: PerfStats | null | undefined }) {
     setBenching(true);
     try {
       const res = await benchmarkTsp({
-        preset: buildingSource === 'preset' ? preset : undefined,
-        building_id: buildingSource === 'upload' ? selectedBuildingId : undefined,
+        building_id: selectedBuildingId ?? undefined,
         building,
         mission,
         algorithm,
-        min_facade_area: buildingSource === 'upload' ? minFacadeArea : undefined,
-        extraction_method: buildingSource === 'upload' ? extractionMethod : undefined,
       });
       setBenchResults(res.benchmark);
     } catch {

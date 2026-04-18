@@ -67,7 +67,14 @@ export function kmzDownloadUrl(versionId: string): string {
 
 export async function rewriteGimbals(
   versionId: string,
-  params?: { max_distance_m?: number; pitch_margin_deg?: number; preserve_heading?: boolean },
+  params?: {
+    max_distance_m?: number;
+    pitch_margin_deg?: number;
+    preserve_heading?: boolean;
+    rewrite_angles?: boolean;
+    flight_speed_ms?: number | null;
+    strip_smart_oblique?: boolean;
+  },
 ): Promise<{
   version_id: string;
   parent_version_id: string;
@@ -104,6 +111,26 @@ export async function getBuilding(id: string): Promise<UploadedBuilding> {
 
 export async function deleteBuilding(id: string): Promise<void> {
   await request(`/buildings/${id}`, { method: 'DELETE' });
+}
+
+export interface LoadedBuildingSettings {
+  voxel_size?: number | null;
+  aw_alpha?: number | null;
+  aw_offset?: number | null;
+  fd_epsilon?: number | null;
+  fd_cluster_epsilon?: number | null;
+  fd_min_points?: number | null;
+  fd_min_wall_area_m2?: number | null;
+  fd_min_roof_area_m2?: number | null;
+  fd_min_density_per_m2?: number | null;
+  fd_normal_threshold?: number | null;
+}
+
+export async function loadBuilding(id: string): Promise<{
+  result: GenerateResponse;
+  settings: LoadedBuildingSettings;
+}> {
+  return request(`/buildings/${id}/load`, { method: 'POST' });
 }
 
 export function uploadMeshFile(
@@ -195,15 +222,33 @@ export async function getKmzImportStatus(taskId: string): Promise<{
   return request(`/buildings/upload-status/${taskId}`);
 }
 
+export interface RefineKmzOpts {
+  awAlpha?: number | null;
+  awOffset?: number | null;
+  fdEpsilon?: number | null;
+  fdClusterEpsilon?: number | null;
+  fdMinPoints?: number | null;
+  fdMinWallAreaM2?: number | null;
+  fdMinRoofAreaM2?: number | null;
+  fdMinDensityPerM2?: number | null;
+  fdNormalThreshold?: number | null;
+}
+
 export async function refineKmzBuilding(
   buildingId: string,
   voxelSize: number,
-  smoothIterations?: number,
-  decimationRatio?: number,
+  opts?: RefineKmzOpts,
 ): Promise<{ task_id: string }> {
   const body: Record<string, number> = { voxel_size: voxelSize };
-  if (smoothIterations !== undefined) body.smooth_iterations = smoothIterations;
-  if (decimationRatio !== undefined) body.decimation_ratio = decimationRatio;
+  if (opts?.awAlpha != null) body.aw_alpha = opts.awAlpha;
+  if (opts?.awOffset != null) body.aw_offset = opts.awOffset;
+  if (opts?.fdEpsilon != null) body.fd_epsilon = opts.fdEpsilon;
+  if (opts?.fdClusterEpsilon != null) body.fd_cluster_epsilon = opts.fdClusterEpsilon;
+  if (opts?.fdMinPoints != null) body.fd_min_points = opts.fdMinPoints;
+  if (opts?.fdMinWallAreaM2 != null) body.fd_min_wall_area_m2 = opts.fdMinWallAreaM2;
+  if (opts?.fdMinRoofAreaM2 != null) body.fd_min_roof_area_m2 = opts.fdMinRoofAreaM2;
+  if (opts?.fdMinDensityPerM2 != null) body.fd_min_density_per_m2 = opts.fdMinDensityPerM2;
+  if (opts?.fdNormalThreshold != null) body.fd_normal_threshold = opts.fdNormalThreshold;
   return request(`/buildings/${buildingId}/refine-kmz`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },

@@ -875,16 +875,37 @@ def facades_from_pointcloud_cgal(
             v_dir = np.cross(normal, u_dir)
             v_dir /= float(np.linalg.norm(v_dir)) or 1.0
 
-        # Oriented bounding rectangle in the plane frame — tight percentile
-        # clamp suppresses straggler inliers that would otherwise stretch
-        # the rectangle across the whole scene.
+        # Oriented bounding rectangle in the plane frame.
+        #
+        # Size-adaptive trim: percentile clamps remove stragglers on
+        # large planes (roofs, walls with noisy edges) but squeeze real
+        # inliers off the edge of small facets (sills, dormers). So:
+        #   - Small inlier sets → use true min/max (no trim).
+        #   - Large inlier sets → use percentile trim to reject noise.
+        # The switch point scales with plane area so both extremes fit
+        # their target cleanly.
         rel = inl_pts - plane_centroid
         us = rel @ u_dir
         vs = rel @ v_dir
-        pct_lo = float(bbox_percentile)
-        pct_hi = 100.0 - pct_lo
-        u_min, u_max = float(np.percentile(us, pct_lo)), float(np.percentile(us, pct_hi))
-        v_min, v_max = float(np.percentile(vs, pct_lo)), float(np.percentile(vs, pct_hi))
+        u_lo_raw, u_hi_raw = float(us.min()), float(us.max())
+        v_lo_raw, v_hi_raw = float(vs.min()), float(vs.max())
+        raw_area = max((u_hi_raw - u_lo_raw) * (v_hi_raw - v_lo_raw), 1e-6)
+
+        if raw_area < 2.0:
+            # Small facet — trust the inliers, use raw extents.
+            u_min, u_max = u_lo_raw, u_hi_raw
+            v_min, v_max = v_lo_raw, v_hi_raw
+        else:
+            # Large facet — trim percentile outliers. Use a tighter trim
+            # for bigger planes since noise-driven stretching scales with
+            # plane extent.
+            pct_scale = min(1.0, raw_area / 20.0)
+            pct_lo = float(bbox_percentile) * (0.4 + 0.6 * pct_scale)
+            pct_hi = 100.0 - pct_lo
+            u_min = float(np.percentile(us, pct_lo))
+            u_max = float(np.percentile(us, pct_hi))
+            v_min = float(np.percentile(vs, pct_lo))
+            v_max = float(np.percentile(vs, pct_hi))
         width = u_max - u_min
         height = v_max - v_min
         area = max(width * height, 1e-6)
@@ -1457,6 +1478,8 @@ def pointcloud_to_mesh_ply(
     smooth_iterations: int = 12,
     decimation_ratio: float = 0.35,
     use_cgal_alpha_wrap: bool = True,
+    aw_alpha_override: float | None = None,
+    aw_offset_override: float | None = None,
 ) -> bytes:
     """Reconstruct a triangle mesh from a point cloud; return PLY bytes.
 
@@ -1507,8 +1530,14 @@ def pointcloud_to_mesh_ply(
             # alpha ≈ 2× voxel spacing (finer probe keeps small features
             # like sills, dormers, parapets); offset ≈ 1× voxel spacing
             # (tight wrap so the mesh hugs geometry, not noise haze).
-            aw_alpha = max(0.06, min(0.60, voxel_size * 2.0))
-            aw_offset = max(0.03, min(0.20, voxel_size * 1.0))
+            aw_alpha = (
+                float(aw_alpha_override) if aw_alpha_override and aw_alpha_override > 0
+                else max(0.06, min(0.60, voxel_size * 2.0))
+            )
+            aw_offset = (
+                float(aw_offset_override) if aw_offset_override and aw_offset_override > 0
+                else max(0.03, min(0.20, voxel_size * 1.0))
+            )
             return pointcloud_to_mesh_cgal_alpha_wrap(
                 pts, alpha=aw_alpha, offset=aw_offset,
             )

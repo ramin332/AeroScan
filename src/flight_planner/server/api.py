@@ -19,7 +19,14 @@ from .._profiling import get_recorded as _get_phase_timings, start_recording as 
 from ..building_import import build_building_from_geojson, build_building_from_mesh, decode_mesh_viewer_data, extract_facades
 
 
-def _kmz_extract_best_facades(clipped_mesh, polygon_enu, points_xyz, *, min_area_m2: float = 5.0):
+def _kmz_extract_best_facades(
+    clipped_mesh,
+    polygon_enu,
+    points_xyz,
+    *,
+    min_area_m2: float = 5.0,
+    fd_overrides: dict | None = None,
+):
     """Extract facades from a clipped KMZ mesh / point cloud.
 
     Priority chain, best-first for DJI Smart3D data:
@@ -29,10 +36,16 @@ def _kmz_extract_best_facades(clipped_mesh, polygon_enu, points_xyz, *, min_area
     3. MeshLab plane segmentation on the clipped mesh.
     4. Mesh region growing.
     5. Polygon-derived walls (last resort, boxy).
+
+    ``fd_overrides`` forwards CGAL Shape-Detection knobs (epsilon,
+    cluster_epsilon, min_points, density/area gates, normal_threshold)
+    from the UI through to ``facades_from_pointcloud_cgal``. ``None``
+    values are dropped so library defaults apply.
     """
+    fd_kwargs = {k: v for k, v in (fd_overrides or {}).items() if v is not None}
     try:
         from ..kmz_import import facades_from_pointcloud_cgal as _ffc
-        cgal_out = _ffc(points_xyz, polygon_enu)
+        cgal_out = _ffc(points_xyz, polygon_enu, **fd_kwargs)
         if len(cgal_out) >= 3:
             print(f"[kmz facades] cgal region_growing → {len(cgal_out)} facades")
             return cgal_out
@@ -1204,8 +1217,19 @@ def get_building(building_id: str):
 
 class RefineKmzRequest(BaseModel):
     voxel_size: float = Field(..., gt=0.01, le=1.0)
-    smooth_iterations: int = Field(12, ge=0, le=60)
-    decimation_ratio: float = Field(0.35, gt=0.0, le=1.0)
+    # CGAL alpha_wrap_3 overrides (None → auto-derived from voxel_size).
+    aw_alpha: float | None = Field(default=None, gt=0.005, le=2.0)
+    aw_offset: float | None = Field(default=None, gt=0.001, le=1.0)
+    # CGAL Shape-Detection facade extraction overrides (None → library defaults).
+    # Bounds are inclusive on both sides so slider steps can land on the
+    # boundary without triggering 422 validation errors.
+    fd_epsilon: float | None = Field(default=None, ge=0.005, le=0.5)
+    fd_cluster_epsilon: float | None = Field(default=None, ge=0.02, le=2.0)
+    fd_min_points: int | None = Field(default=None, ge=5, le=1000)
+    fd_min_wall_area_m2: float | None = Field(default=None, ge=0.05, le=20.0)
+    fd_min_roof_area_m2: float | None = Field(default=None, ge=0.05, le=20.0)
+    fd_min_density_per_m2: float | None = Field(default=None, ge=1.0, le=500.0)
+    fd_normal_threshold: float | None = Field(default=None, ge=0.5, le=0.999)
 
 
 @router.post("/buildings/{building_id}/refine-kmz")
@@ -1259,8 +1283,8 @@ def refine_kmz_building(building_id: str, req: RefineKmzRequest):
             mesh_bytes = pointcloud_to_mesh_ply(
                 pcd,
                 voxel_size_override=voxel_size,
-                smooth_iterations=int(req.smooth_iterations),
-                decimation_ratio=float(req.decimation_ratio),
+                aw_alpha_override=(float(req.aw_alpha) if req.aw_alpha else None),
+                aw_offset_override=(float(req.aw_offset) if req.aw_offset else None),
             )
 
             _set_upload_progress(task_id, 0.55, "Subsampling point cloud for viewer…")
@@ -1295,7 +1319,19 @@ def refine_kmz_building(building_id: str, req: RefineKmzRequest):
             _mesh_clipped_ref = _trimesh3.load(
                 _io.BytesIO(clipped_bytes_ref), file_type="ply", force="mesh", process=False,
             )
-            building.facades = _kmz_extract_best_facades(_mesh_clipped_ref, clip_poly_ref, pc_xyz_ref)
+            fd_overrides_refine = {
+                "epsilon": req.fd_epsilon,
+                "cluster_epsilon": req.fd_cluster_epsilon,
+                "min_points": req.fd_min_points,
+                "min_wall_area_m2": req.fd_min_wall_area_m2,
+                "min_roof_area_m2": req.fd_min_roof_area_m2,
+                "min_density_per_m2": req.fd_min_density_per_m2,
+                "normal_threshold": req.fd_normal_threshold,
+            }
+            building.facades = _kmz_extract_best_facades(
+                _mesh_clipped_ref, clip_poly_ref, pc_xyz_ref,
+                fd_overrides=fd_overrides_refine,
+            )
             # Restrict to facades inside the DJI flight envelope (waypoint hull + 2 m margin)
             from ..kmz_import import ParsedWaypoint as _ParsedWaypoint_ref, waypoints_to_enu as _wp_enu_ref
             _waypoints_raw_ref = props.get("waypoints_raw", [])
@@ -1319,7 +1355,7 @@ def refine_kmz_building(building_id: str, req: RefineKmzRequest):
                 _hull_poly_r = _waypoint_hull_polygon([(w["x"], w["y"]) for w in _enu_wps_r], expand_m=2.0)
                 building.facades = _filter_facades_by_camera_coverage(building.facades, _hull_poly_r)
 
-            # --- Persist updated mesh_viewer back onto the BuildingRecord ---
+            # --- Pre-compute pc_b64 now; DB write happens after response is built. ---
             _set_upload_progress(task_id, 0.85, "Updating building record…")
             import numpy as _np3
             pc_arr = _np3.concatenate([
@@ -1327,25 +1363,6 @@ def refine_kmz_building(building_id: str, req: RefineKmzRequest):
                 _np3.asarray(pc_colors, dtype=_np3.float32),
             ])
             pc_b64 = base64.b64encode(gzip.compress(pc_arr.tobytes())).decode("ascii")
-
-            new_props = dict(props)
-            new_props["mesh_viewer"] = getattr(building, "_mesh_viewer_data", None)
-            new_props["pc_b64"] = pc_b64
-            new_props["voxel_size"] = voxel_size
-            new_props["width"] = building.width
-            new_props["depth"] = building.depth
-            new_props["auto_height"] = building.height
-
-            db2 = get_db()
-            try:
-                rec = db2.query(BuildingRecord).filter_by(id=building_id).first()
-                if rec is None:
-                    raise ValueError("BuildingRecord disappeared during refine")
-                rec.height = building.height
-                rec.properties_json = json.dumps(new_props)
-                db2.commit()
-            finally:
-                db2.close()
 
             # Facade cache is keyed on (building_id, extraction_method, ...) — invalidate.
             _facade_cache_invalidate(building_id)
@@ -1486,6 +1503,51 @@ def refine_kmz_building(building_id: str, req: RefineKmzRequest):
                 "voxel_size": voxel_size,
             }
 
+            last_settings = {
+                "voxel_size": voxel_size,
+                "aw_alpha": float(req.aw_alpha) if req.aw_alpha is not None else None,
+                "aw_offset": float(req.aw_offset) if req.aw_offset is not None else None,
+                "fd_epsilon": float(req.fd_epsilon) if req.fd_epsilon is not None else None,
+                "fd_cluster_epsilon": float(req.fd_cluster_epsilon) if req.fd_cluster_epsilon is not None else None,
+                "fd_min_points": int(req.fd_min_points) if req.fd_min_points is not None else None,
+                "fd_min_wall_area_m2": float(req.fd_min_wall_area_m2) if req.fd_min_wall_area_m2 is not None else None,
+                "fd_min_roof_area_m2": float(req.fd_min_roof_area_m2) if req.fd_min_roof_area_m2 is not None else None,
+                "fd_min_density_per_m2": float(req.fd_min_density_per_m2) if req.fd_min_density_per_m2 is not None else None,
+                "fd_normal_threshold": float(req.fd_normal_threshold) if req.fd_normal_threshold is not None else None,
+            }
+
+            # Persist the full response + settings so selectBuilding can load
+            # instantly without re-running alpha_wrap + CGAL extraction.
+            new_props = dict(props)
+            new_props["mesh_viewer"] = getattr(building, "_mesh_viewer_data", None)
+            new_props["pc_b64"] = pc_b64
+            new_props["voxel_size"] = voxel_size
+            new_props["width"] = building.width
+            new_props["depth"] = building.depth
+            new_props["auto_height"] = building.height
+            new_props["last_settings"] = last_settings
+            new_props["last_version_id"] = version.version_id
+            # Gzip the response so SQLite row stays manageable. mesh_viewer is
+            # already stored separately; compress the combined payload once.
+            try:
+                resp_bytes = json.dumps(response).encode("utf-8")
+                new_props["last_response_gz_b64"] = base64.b64encode(
+                    gzip.compress(resp_bytes)
+                ).decode("ascii")
+            except (TypeError, ValueError):
+                new_props.pop("last_response_gz_b64", None)
+
+            db2 = get_db()
+            try:
+                rec = db2.query(BuildingRecord).filter_by(id=building_id).first()
+                if rec is None:
+                    raise ValueError("BuildingRecord disappeared during refine")
+                rec.height = building.height
+                rec.properties_json = json.dumps(new_props)
+                db2.commit()
+            finally:
+                db2.close()
+
             with _upload_lock:
                 _upload_tasks[task_id].update(
                     status="complete", progress=1.0,
@@ -1501,6 +1563,141 @@ def refine_kmz_building(building_id: str, req: RefineKmzRequest):
 
     threading.Thread(target=_process, daemon=True).start()
     return {"task_id": task_id, "status": "processing"}
+
+
+@router.post("/buildings/{building_id}/load")
+def load_building(building_id: str):
+    """Instantly re-hydrate a saved building's last viewer state + settings.
+
+    Reads the gzipped ``last_response`` and ``last_settings`` blobs written by
+    ``refine_kmz_building``. Skips alpha_wrap and CGAL extraction entirely —
+    mesh + facades come back exactly as they were when this building was last
+    refined. Emits a fresh ``MissionVersion`` so the existing KMZ / rewrite
+    endpoints work against the loaded state.
+    """
+    import base64
+    import gzip
+
+    db = get_db()
+    try:
+        record = db.query(BuildingRecord).filter_by(id=building_id).first()
+        if not record:
+            raise HTTPException(status_code=404, detail="Building not found")
+        props = json.loads(record.properties_json or "{}")
+        name = record.name
+        lat = float(record.lat)
+        lon = float(record.lon)
+    finally:
+        db.close()
+
+    resp_gz_b64 = props.get("last_response_gz_b64")
+    if not resp_gz_b64:
+        raise HTTPException(
+            status_code=409,
+            detail="No cached response for this building — run a refine first.",
+        )
+
+    try:
+        stored_response = json.loads(gzip.decompress(base64.b64decode(resp_gz_b64)))
+    except (ValueError, OSError, json.JSONDecodeError) as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Cached response corrupt: {exc}",
+        )
+
+    # Re-emit as a fresh MissionVersion so downstream endpoints (KMZ download,
+    # rewrite-gimbals) have a live version_id to target. Waypoints + building
+    # geometry come from stored raw data — no reconstruction needed.
+    from ..kmz_import import ParsedWaypoint, SmartObliquePose, waypoints_to_enu
+    from ..models import ActionType, CameraAction, CameraName as _CameraName, MissionConfig, Waypoint
+
+    ref_lat = float(props.get("ref_lat", lat))
+    ref_lon = float(props.get("ref_lon", lon))
+    ref_alt = float(props.get("ref_alt", 0.0))
+    waypoints_raw = props.get("waypoints_raw", [])
+    parsed_wps = [
+        ParsedWaypoint(
+            index=int(w.get("index", i)),
+            lon=float(w["lon"]), lat=float(w["lat"]),
+            alt_egm96=float(w["alt_egm96"]),
+            heading_deg=float(w["heading_deg"]),
+            gimbal_pitch_deg=float(w["gimbal_pitch_deg"]),
+            speed_ms=float(w.get("speed_ms", 2.0)),
+            gimbal_yaw_raw_deg=float(w.get("gimbal_yaw_raw_deg", 0.0)),
+            gimbal_heading_mode=str(w.get("gimbal_heading_mode", "smoothTransition")),
+            gimbal_yaw_base=str(w.get("gimbal_yaw_base", "aircraft")),
+            smart_oblique_poses=[
+                SmartObliquePose(
+                    pitch_deg=float(p.get("pitch", 0.0)),
+                    yaw_offset_deg=float(p.get("yaw_offset", 0.0)),
+                    roll_deg=float(p.get("roll", 0.0)),
+                )
+                for p in (w.get("smart_oblique_poses") or [])
+            ],
+        )
+        for i, w in enumerate(waypoints_raw)
+    ]
+    enu_wps = waypoints_to_enu(parsed_wps, ref_lat, ref_lon, ref_alt)
+    waypoints: list[Waypoint] = []
+    for i, w in enumerate(enu_wps):
+        waypoints.append(Waypoint(
+            x=w["x"], y=w["y"], z=w["z"],
+            lat=w["lat"], lon=w["lon"], alt=w["alt"],
+            heading_deg=w["heading_deg"],
+            gimbal_pitch_deg=w["gimbal_pitch_deg"],
+            gimbal_yaw_deg=w.get("gimbal_yaw_deg"),
+            speed_ms=w["speed_ms"],
+            facade_index=-1, index=i,
+            actions=[CameraAction(action_type=ActionType.TAKE_PHOTO, camera=_CameraName.WIDE)],
+        ))
+
+    # Minimal Building stub — full geometry lives in viewer_data.rawMesh already.
+    from ..models import Building
+    building_stub = Building(
+        lat=ref_lat, lon=ref_lon,
+        width=float(props.get("width", 10.0)),
+        depth=float(props.get("depth", 10.0)),
+        height=float(props.get("auto_height", record.height or 10.0)),
+        heading_deg=0.0,
+        facades=[], label=name,
+    )
+    config = MissionConfig(
+        flight_speed_ms=2.0,
+        mission_name=f"Loaded: {name}",
+    )
+
+    version = session.store(
+        building_params={
+            "lat": ref_lat, "lon": ref_lon,
+            "width": building_stub.width, "depth": building_stub.depth,
+            "height": building_stub.height, "heading_deg": 0.0,
+            "roof_type": "flat", "roof_pitch_deg": 0.0, "num_stories": 1,
+        },
+        mission_params={
+            "target_gsd_mm_per_px": 2.0, "camera": "wide",
+            "flight_speed_ms": config.flight_speed_ms,
+            "mission_name": config.mission_name,
+        },
+        building=building_stub, waypoints=waypoints, config=config,
+        summary=stored_response.get("summary", {}),
+        viewer_data=stored_response.get("viewer_data", {}),
+        selection={"building_id": building_id},
+    )
+
+    # Swap the freshly-minted version_id into the returned response so the
+    # frontend's version tracking stays coherent.
+    response = dict(stored_response)
+    response["version_id"] = version.version_id
+    response["timestamp"] = version.timestamp
+    config_snap = dict(response.get("config_snapshot", {}))
+    config_snap["building_id"] = building_id
+    response["config_snapshot"] = config_snap
+    response["building_id"] = building_id
+
+    return {
+        "result": response,
+        "settings": props.get("last_settings", {}),
+    }
 
 
 @router.delete("/buildings/{building_id}")
@@ -2082,6 +2279,10 @@ class RewriteGimbalsRequest(BaseModel):
     max_distance_m: float = Field(default=60.0, gt=0.0, le=500.0)
     pitch_margin_deg: float = Field(default=2.0, ge=0.0, le=20.0)
     preserve_heading: bool = True
+    # If False, the perpendicular gimbal rewrite is skipped entirely — useful
+    # when the DJI gimbals already point correctly and the caller only wants
+    # to strip the SmartOblique rosette + cap speed.
+    rewrite_angles: bool = True
     # NEN-2767 enrichment: cap flight speed + collapse SmartOblique rosette to
     # a single per-waypoint photo. Null/False means keep the DJI defaults.
     flight_speed_ms: float | None = Field(default=3.0, ge=0.5, le=15.0)
@@ -2112,13 +2313,18 @@ def rewrite_gimbals(version_id: str, req: RewriteGimbalsRequest | None = None):
         )
 
     params = req or RewriteGimbalsRequest()
-    new_waypoints = rewrite_gimbals_perpendicular(
-        waypoints=version.waypoints,
-        facades=version.building.facades,
-        max_distance_m=params.max_distance_m,
-        pitch_margin_deg=params.pitch_margin_deg,
-        preserve_heading=params.preserve_heading,
-    )
+    if params.rewrite_angles:
+        new_waypoints = rewrite_gimbals_perpendicular(
+            waypoints=version.waypoints,
+            facades=version.building.facades,
+            max_distance_m=params.max_distance_m,
+            pitch_margin_deg=params.pitch_margin_deg,
+            preserve_heading=params.preserve_heading,
+        )
+    else:
+        # Preserve DJI gimbals exactly — just clone the waypoints so the
+        # downstream speed/rosette edits produce a new version.
+        new_waypoints = [_dc_replace(w) for w in version.waypoints]
 
     # NEN-2767 enrichment: override speed + strip SmartOblique rosette so every
     # waypoint captures a single perpendicular photo. Trajectory stays DJI's.

@@ -189,12 +189,7 @@ function SimulationTab() {
 }
 
 export default function App() {
-  const { result, activeTab, setActiveTab, loading, generate, refreshBuildings, lightMode } = useStore();
-
-  useEffect(() => {
-    refreshBuildings();
-    generate();
-  }, []);
+  const { result, activeTab, setActiveTab, loading, lightMode } = useStore();
 
   useEffect(() => {
     document.documentElement.setAttribute('data-theme', lightMode ? 'light' : 'dark');
