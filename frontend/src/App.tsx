@@ -4,6 +4,7 @@ import { Sidebar } from './components/Sidebar';
 import { Viewer3D } from './components/Viewer3D';
 import { MapView } from './components/MapView';
 import { PerfPanel } from './components/PerfPanel';
+import { PhaseTimingsHud } from './components/PhaseTimingsHud';
 import * as api from './api/client';
 import type { SimulationStatus, ViewerData } from './api/types';
 import './app.css';
@@ -266,6 +267,7 @@ export default function App() {
           {activeTab !== 'sim' && <PerfPanel perf={result?.perf} />}
         </div>
       </main>
+      <PhaseTimingsHud />
     </div>
   );
 }

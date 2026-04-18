@@ -17,6 +17,7 @@ from typing import Optional
 
 import numpy as np
 
+from ._profiling import timed
 from .models import AlgorithmConfig, Building, Facade, meters_per_deg, RoofType
 
 
@@ -670,15 +671,173 @@ def _extract_meshlab(
         os.unlink(tmp_path)
 
 
+# --- Point-cloud native extractor (RANSAC + DBSCAN) ---
+
+
+def _polygon_area_2d(pts: list[tuple[float, float]]) -> float:
+    """Shoelace area of a 2D polygon (vertices in order, not closed)."""
+    n = len(pts)
+    if n < 3:
+        return 0.0
+    s = 0.0
+    for i in range(n):
+        x1, y1 = pts[i]
+        x2, y2 = pts[(i + 1) % n]
+        s += x1 * y2 - x2 * y1
+    return abs(s) * 0.5
+
+
+@timed("extract_facades_from_pointcloud")
+def extract_facades_from_pointcloud(
+    pcd,
+    min_area_m2: float = 1.0,
+    algo: AlgorithmConfig | None = None,
+    voxel_size: float = 0.15,
+    distance_threshold: float = 0.10,
+    ransac_n: int = 3,
+    num_iterations: int = 500,
+    min_plane_inliers: int = 150,
+    max_planes: int = 40,
+    dbscan_eps: float = 0.6,
+    dbscan_min_points: int = 20,
+    reject_horizontal_nz: float = 0.85,
+    **_kwargs: object,
+) -> list[Facade]:
+    """Extract facades directly from a dense point cloud (Open3D PointCloud).
+
+    Iterative RANSAC ``segment_plane`` strips one plane per pass; each plane's
+    inliers are clustered via DBSCAN so disconnected facades on the same plane
+    become separate facades. Planes with |nz| above ``reject_horizontal_nz``
+    are dropped (ground / flat roofs). Pitched roofs are kept.
+
+    No mesh required — this is the fast path for DJI-imported point clouds.
+    """
+    import open3d as o3d
+
+    if len(pcd.points) == 0:
+        return []
+
+    work = pcd.voxel_down_sample(voxel_size) if voxel_size > 0 else pcd
+    facades: list[Facade] = []
+    index = 0
+
+    for _ in range(max_planes):
+        if len(work.points) < min_plane_inliers:
+            break
+        try:
+            plane_model, inlier_idx = work.segment_plane(
+                distance_threshold=distance_threshold,
+                ransac_n=ransac_n,
+                num_iterations=num_iterations,
+            )
+        except Exception:
+            break
+        if len(inlier_idx) < min_plane_inliers:
+            break
+
+        inlier_cloud = work.select_by_index(inlier_idx)
+        work = work.select_by_index(inlier_idx, invert=True)
+
+        a, b, c, _d = plane_model
+        normal = np.array([a, b, c], dtype=np.float64)
+        nrm = float(np.linalg.norm(normal))
+        if nrm < 1e-9:
+            continue
+        normal /= nrm
+        if abs(normal[2]) > reject_horizontal_nz:
+            continue
+
+        try:
+            labels = np.asarray(inlier_cloud.cluster_dbscan(
+                eps=dbscan_eps, min_points=dbscan_min_points, print_progress=False,
+            ))
+        except Exception:
+            continue
+        if labels.size == 0:
+            continue
+
+        pts = np.asarray(inlier_cloud.points)
+        up_guess = np.array([0.0, 0.0, 1.0]) if abs(normal[2]) < 0.9 else np.array([1.0, 0.0, 0.0])
+        u_axis = np.cross(normal, up_guess)
+        u_nrm = float(np.linalg.norm(u_axis))
+        if u_nrm < 1e-9:
+            continue
+        u_axis /= u_nrm
+        v_axis = np.cross(normal, u_axis)
+
+        for label in sorted(set(int(lbl) for lbl in labels)):
+            if label < 0:
+                continue
+            mask = labels == label
+            cluster = pts[mask]
+            if len(cluster) < dbscan_min_points:
+                continue
+            centroid = cluster.mean(axis=0)
+            rel = cluster - centroid
+            u = rel @ u_axis
+            v = rel @ v_axis
+            hull_uv = _convex_hull_2d([(float(uu), float(vv)) for uu, vv in zip(u, v)])
+            if len(hull_uv) < 3:
+                continue
+            if _polygon_area_2d(hull_uv) < min_area_m2:
+                continue
+            hull_3d = np.array([
+                centroid + uu * u_axis + vv * v_axis for uu, vv in hull_uv
+            ])
+            # Orient normal outward (away from the point cloud centroid of the
+            # remaining points — a reasonable proxy for the building interior).
+            if len(work.points) > 0:
+                interior = np.asarray(work.points).mean(axis=0)
+                if np.dot(normal, centroid - interior) < 0:
+                    out_normal = -normal
+                else:
+                    out_normal = normal
+            else:
+                out_normal = normal
+            facades.append(Facade(
+                vertices=hull_3d,
+                normal=out_normal.copy(),
+                label=f"pc_facade_{index}",
+                index=index,
+                component_tag="21.1" if abs(out_normal[2]) < 0.5 else "27.0",
+            ))
+            index += 1
+
+    return facades
+
+
+def _extract_pointcloud_ransac(
+    mesh: "trimesh.Trimesh",
+    min_area_m2: float = 1.0,
+    algo: AlgorithmConfig | None = None,
+    **kwargs: object,
+) -> Optional[list[Facade]]:
+    """Mesh-signature adapter: feed mesh vertices into the RANSAC extractor.
+
+    Loses density compared to feeding the raw photogrammetry point cloud, but
+    lets this method register alongside the existing mesh-based extractors so
+    the UI and build_building_from_mesh can select it uniformly.
+    """
+    import open3d as o3d
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(np.asarray(mesh.vertices, dtype=np.float64))
+    result = extract_facades_from_pointcloud(
+        pcd, min_area_m2=min_area_m2, algo=algo, **kwargs
+    )
+    return result if result else None
+
+
 # --- Modular extraction dispatcher ---
 
 EXTRACTION_METHODS: dict[str, callable] = {
     "region_growing": _extract_region_growing,
     "convex_hull": _extract_convex_hull,
     "meshlab": _extract_meshlab,
+    "pointcloud_ransac": _extract_pointcloud_ransac,
 }
 
 
+@timed("extract_facades")
 def extract_facades(
     mesh: "trimesh.Trimesh",
     method: str = "region_growing",
@@ -700,6 +859,7 @@ def extract_facades(
     return result or []
 
 
+@timed("build_building_from_mesh")
 def build_building_from_mesh(
     mesh_data: bytes,
     file_type: str,
@@ -714,6 +874,7 @@ def build_building_from_mesh(
     method: str = "region_growing",
     algo: AlgorithmConfig | None = None,
     progress_callback: Optional[callable] = None,
+    preserve_position: bool = False,
 ) -> Building:
     """Create a Building from an OBJ/PLY/STL mesh file.
 
@@ -766,9 +927,11 @@ def build_building_from_mesh(
     _progress(0.15, f"Fixing normals ({len(mesh.faces):,} faces)…")
     trimesh.repair.fix_normals(mesh)
 
-    # Center the mesh at origin
-    centroid = mesh.centroid.copy()
-    mesh.vertices -= centroid
+    # KMZ-derived meshes are already in the ENU frame shared with the point cloud
+    # and waypoints; re-centering would offset the facades from everything else.
+    if not preserve_position:
+        centroid = mesh.centroid.copy()
+        mesh.vertices -= centroid
 
     # Get building height from mesh bounding box (Z is up after rotation)
     z_min = float(mesh.vertices[:, 2].min())
@@ -796,7 +959,8 @@ def build_building_from_mesh(
 
     # Recompute after scaling
     z_min = float(mesh.vertices[:, 2].min())
-    mesh.vertices[:, 2] -= z_min  # shift so ground is at z=0
+    if not preserve_position:
+        mesh.vertices[:, 2] -= z_min  # shift so ground is at z=0
 
     name = name or "Mesh building"
 

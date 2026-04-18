@@ -28,10 +28,23 @@ from xml.etree import ElementTree as ET
 
 import numpy as np
 
+from ._profiling import timed
 from .models import meters_per_deg
 
 WPML_NS = "{http://www.dji.com/wpmz/1.0.6}"
 KML_NS = "{http://www.opengis.net/kml/2.2}"
+
+
+@dataclass
+class SmartObliquePose:
+    """One pose of a DJI Smart3D rosette. Yaw is an offset relative to the
+    aircraft heading (DJI always uses ``gimbalHeadingYawBase=aircraft`` inside
+    ``startSmartOblique`` actions). Pitch is absolute from horizon.
+    """
+
+    pitch_deg: float
+    yaw_offset_deg: float
+    roll_deg: float = 0.0
 
 
 @dataclass
@@ -45,6 +58,17 @@ class ParsedWaypoint:
     heading_deg: float         # waypointHeadingAngle, 0=N clockwise
     gimbal_pitch_deg: float    # relative to horizon, negative = looking down
     speed_ms: float = 2.0
+    # Raw gimbal yaw reading from waypointGimbalYawAngle. Interpretation
+    # depends on ``gimbal_yaw_base``: when "aircraft" the value is an offset
+    # from the aircraft heading; when "north" the value is a world-frame angle
+    # (0 = north, clockwise).
+    gimbal_yaw_raw_deg: float = 0.0
+    gimbal_heading_mode: str = "smoothTransition"
+    gimbal_yaw_base: str = "aircraft"  # "aircraft" or "north"
+    # 5-pose SmartOblique rosette attached to this waypoint by the covering
+    # action group (see ``actionGroupStartIndex`` / ``actionGroupEndIndex``).
+    # Empty when the waypoint isn't inside any SmartOblique action group.
+    smart_oblique_poses: list[SmartObliquePose] = field(default_factory=list)
 
 
 @dataclass
@@ -130,10 +154,75 @@ def _parse_template(xml_bytes: bytes) -> tuple[dict, list[tuple[float, float, fl
     return mission_cfg, poly, takeoff
 
 
+def _parse_smart_oblique_groups(
+    root: ET.Element,
+) -> list[tuple[int, int, list[SmartObliquePose]]]:
+    """Scan action groups for ``startSmartOblique`` actions.
+
+    Returns a list of ``(start_index, end_index, poses)`` tuples. Each DJI
+    Smart3D mission ships one or more action groups that cover ranges of
+    waypoints with a 5-pose rosette (pitch/yaw/roll triples). The covered
+    waypoints execute all 5 poses at each station — so a single
+    ``waypointGimbalPitchAngle`` on the placemark is only the *transitional*
+    pose, not the real photo angles.
+    """
+    groups: list[tuple[int, int, list[SmartObliquePose]]] = []
+    for ag in root.iter(f"{WPML_NS}actionGroup"):
+        # Only SmartOblique action groups matter here.
+        if ag.find(f".//{WPML_NS}actionActuatorFunc[.='startSmartOblique']") is None:
+            is_smart = False
+            for func in ag.iter(f"{WPML_NS}actionActuatorFunc"):
+                if (func.text or "").strip() == "startSmartOblique":
+                    is_smart = True
+                    break
+            if not is_smart:
+                continue
+
+        start_el = ag.find(f"{WPML_NS}actionGroupStartIndex")
+        end_el = ag.find(f"{WPML_NS}actionGroupEndIndex")
+        if start_el is None or end_el is None:
+            continue
+        try:
+            start_idx = int((start_el.text or "0").strip())
+            end_idx = int((end_el.text or "0").strip())
+        except ValueError:
+            continue
+
+        poses: list[SmartObliquePose] = []
+        for pt in ag.iter(f"{WPML_NS}smartObliquePoint"):
+            p_el = pt.find(f"{WPML_NS}smartObliqueEulerPitch")
+            y_el = pt.find(f"{WPML_NS}smartObliqueEulerYaw")
+            r_el = pt.find(f"{WPML_NS}smartObliqueEulerRoll")
+            try:
+                pitch = float((p_el.text if p_el is not None else "0").strip())
+                yaw = float((y_el.text if y_el is not None else "0").strip())
+                roll = float((r_el.text.strip() if (r_el is not None and r_el.text) else "0"))
+            except (AttributeError, ValueError):
+                continue
+            poses.append(SmartObliquePose(
+                pitch_deg=pitch, yaw_offset_deg=yaw, roll_deg=roll,
+            ))
+        if poses:
+            groups.append((start_idx, end_idx, poses))
+    return groups
+
+
 def _parse_waylines(xml_bytes: bytes) -> list[ParsedWaypoint]:
     """Parse waylines.wpml into a list of ParsedWaypoint."""
     root = ET.fromstring(xml_bytes)
     waypoints: list[ParsedWaypoint] = []
+
+    # Mission-wide gimbal yaw base comes from the first ``gimbalRotate`` action
+    # we can find. DJI Smart3D photogrammetry missions set this once in a
+    # startActionGroup and leave it for the entire flight. "aircraft" = yaw
+    # relative to aircraft heading; "north" = absolute world-frame yaw.
+    default_yaw_base = "aircraft"
+    for yaw_base_el in root.iter(f"{WPML_NS}gimbalHeadingYawBase"):
+        if yaw_base_el.text:
+            default_yaw_base = yaw_base_el.text.strip() or "aircraft"
+            break
+
+    smart_oblique_groups = _parse_smart_oblique_groups(root)
 
     for placemark in root.iter(f"{KML_NS}Placemark"):
         coords_el = placemark.find(f"{KML_NS}Point/{KML_NS}coordinates")
@@ -170,6 +259,8 @@ def _parse_waylines(xml_bytes: bytes) -> list[ParsedWaypoint]:
                 except ValueError:
                     pass
 
+        gimbal_yaw_raw = 0.0
+        gimbal_heading_mode = "smoothTransition"
         gp = placemark.find(f"{WPML_NS}waypointGimbalHeadingParam")
         if gp is not None:
             p_el = gp.find(f"{WPML_NS}waypointGimbalPitchAngle")
@@ -178,20 +269,41 @@ def _parse_waylines(xml_bytes: bytes) -> list[ParsedWaypoint]:
                     gimbal_pitch = float(p_el.text.strip())
                 except ValueError:
                     pass
+            y_el = gp.find(f"{WPML_NS}waypointGimbalYawAngle")
+            if y_el is not None and y_el.text is not None:
+                try:
+                    gimbal_yaw_raw = float(y_el.text.strip())
+                except ValueError:
+                    pass
+            m_el = gp.find(f"{WPML_NS}waypointGimbalHeadingMode")
+            if m_el is not None and m_el.text is not None:
+                gimbal_heading_mode = m_el.text.strip() or "smoothTransition"
 
         speed = _f("waypointSpeed", 2.0)
 
+        wp_index = _i("index", len(waypoints))
+        poses_for_wp: list[SmartObliquePose] = []
+        for s, e, grp_poses in smart_oblique_groups:
+            if s <= wp_index <= e:
+                poses_for_wp = list(grp_poses)
+                break
+
         waypoints.append(ParsedWaypoint(
-            index=_i("index", len(waypoints)),
+            index=wp_index,
             lon=lon, lat=lat, alt_egm96=alt,
             heading_deg=heading,
             gimbal_pitch_deg=gimbal_pitch,
             speed_ms=speed,
+            gimbal_yaw_raw_deg=gimbal_yaw_raw,
+            gimbal_heading_mode=gimbal_heading_mode,
+            gimbal_yaw_base=default_yaw_base,
+            smart_oblique_poses=poses_for_wp,
         ))
 
     return waypoints
 
 
+@timed("parse_kmz")
 def parse_kmz(data: bytes, name: str = "") -> ImportedKmz:
     """Parse a DJI Smart3D KMZ into its structured pieces.
 
@@ -278,13 +390,44 @@ def waypoints_to_enu(
         x = (wp.lon - ref_lon) * m_per_lon
         y = (wp.lat - ref_lat) * m_per_lat
         z = wp.alt_egm96 - ref_alt
+
+        # Resolve the gimbal yaw to an absolute world-frame angle so downstream
+        # code (gimbal rewrite, 3D viewer arrows) can compare it to facade
+        # normals directly. DJI WPML:
+        #   gimbal_yaw_base="aircraft" → raw yaw is an offset from aircraft heading
+        #   gimbal_yaw_base="north"    → raw yaw is already absolute (0=N, CW)
+        if wp.gimbal_yaw_base == "north":
+            abs_yaw = wp.gimbal_yaw_raw_deg
+        else:
+            abs_yaw = wp.heading_deg + wp.gimbal_yaw_raw_deg
+        # Normalize to [-180, 180]
+        abs_yaw = ((abs_yaw + 180.0) % 360.0) - 180.0
+
+        # Resolve each SmartOblique rosette pose to an absolute world-frame yaw
+        # so the viewer can render ghost arrows without knowing the yaw base.
+        # Inside ``startSmartOblique`` actions DJI always uses aircraft-relative
+        # yaw offsets, so we add the heading regardless of the placemark's yaw
+        # base.
+        poses_abs: list[dict] = []
+        for pose in wp.smart_oblique_poses:
+            pose_yaw = wp.heading_deg + pose.yaw_offset_deg
+            pose_yaw = ((pose_yaw + 180.0) % 360.0) - 180.0
+            poses_abs.append({
+                "pitch": pose.pitch_deg,
+                "yaw": pose_yaw,
+                "yaw_offset": pose.yaw_offset_deg,
+                "roll": pose.roll_deg,
+            })
+
         out.append({
             "x": x, "y": y, "z": z,
             "lat": wp.lat, "lon": wp.lon, "alt": wp.alt_egm96,
             "heading_deg": wp.heading_deg,
             "gimbal_pitch_deg": wp.gimbal_pitch_deg,
+            "gimbal_yaw_deg": abs_yaw,
             "speed_ms": wp.speed_ms,
             "index": wp.index,
+            "smart_oblique_poses": poses_abs,
         })
     return out
 
@@ -308,6 +451,7 @@ def polygon_to_enu(
 # ---------------------------------------------------------------------------
 
 
+@timed("load_pointcloud")
 def load_pointcloud(ply_bytes: bytes) -> "o3d.geometry.PointCloud":  # type: ignore[name-defined]
     """Load PLY bytes into an Open3D point cloud."""
     import open3d as o3d  # deferred: heavy import
@@ -325,6 +469,7 @@ def load_pointcloud(ply_bytes: bytes) -> "o3d.geometry.PointCloud":  # type: ign
     return pcd
 
 
+@timed("pointcloud_to_viewer_arrays")
 def pointcloud_to_viewer_arrays(
     pcd: "o3d.geometry.PointCloud",  # type: ignore[name-defined]
     max_points: int = 250_000,
@@ -372,6 +517,7 @@ def pointcloud_to_viewer_arrays(
     )
 
 
+@timed("pointcloud_to_mesh_ply")
 def pointcloud_to_mesh_ply(
     pcd: "o3d.geometry.PointCloud",  # type: ignore[name-defined]
     alpha: float = 0.5,
@@ -379,6 +525,8 @@ def pointcloud_to_mesh_ply(
     min_voxel_size: float = 0.05,
     max_voxel_size: float = 0.40,
     voxel_size_override: float | None = None,
+    smooth_iterations: int = 12,
+    decimation_ratio: float = 0.35,
 ) -> bytes:
     """Reconstruct a triangle mesh from a point cloud; return PLY bytes.
 
@@ -429,6 +577,35 @@ def pointcloud_to_mesh_ply(
 
     if len(mesh.triangles) == 0:
         raise ValueError("All mesh reconstruction strategies produced an empty mesh")
+
+    # Clean up the raw alpha-shape output before smoothing — Taubin on a mesh
+    # with duplicate or degenerate triangles amplifies noise.
+    mesh.remove_duplicated_vertices()
+    mesh.remove_duplicated_triangles()
+    mesh.remove_degenerate_triangles()
+    mesh.remove_unreferenced_vertices()
+
+    # Taubin (λ=0.5, μ=-0.53) smoothing flattens the jagged alpha-shape walls
+    # into near-planar surfaces without the global shrinkage that plain
+    # Laplacian smoothing causes. 10-15 passes is the sweet spot for
+    # DJI Smart3D clouds: walls become flat enough that region growing
+    # merges them into one facade each.
+    if smooth_iterations > 0:
+        try:
+            mesh = mesh.filter_smooth_taubin(number_of_iterations=int(smooth_iterations))
+        except Exception as e:
+            print(f"[kmz_import] Taubin smoothing skipped: {e}")
+
+    # Quadric decimation collapses coplanar faces after smoothing — this is
+    # what actually lets region growing merge a wall into a single region
+    # (many input faces with the same normal → fewer output faces with the
+    # exact same normal).
+    if 0.0 < decimation_ratio < 1.0 and len(mesh.triangles) > 2000:
+        target = max(2000, int(len(mesh.triangles) * decimation_ratio))
+        try:
+            mesh = mesh.simplify_quadric_decimation(target_number_of_triangles=target)
+        except Exception as e:
+            print(f"[kmz_import] Decimation skipped: {e}")
 
     mesh.compute_vertex_normals()
 

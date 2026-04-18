@@ -381,6 +381,14 @@ class AlgorithmConfig:
     auto_scale_target_height_m: float = 8.0  # rescale target when auto-scaling
     region_growing_angle_deg: float = 15.0  # coplanarity threshold for region growing
 
+    # -- Point-cloud → mesh post-processing (kmz_import.pointcloud_to_mesh_ply) --
+    # Alpha-shape meshes from DJI Smart3D clouds are jagged; without smoothing
+    # each wall becomes dozens of mis-oriented triangles and region growing
+    # splits it into many tiny facades. Taubin smoothing flattens the walls
+    # without shrinkage; quadric decimation then collapses the coplanar faces.
+    mesh_smooth_iterations: int = 12  # Taubin smoothing passes (0 to disable)
+    mesh_decimation_ratio: float = 0.35  # target = ratio × input triangles (1.0 disables)
+
     # -- Surface sampling (geometry.py) --
     surface_sample_count: int = 2000  # target Poisson-disk sample points on mesh
     surface_dedup_radius_m: float = 0.5  # merge cameras closer than this

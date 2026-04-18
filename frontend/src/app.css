@@ -388,33 +388,7 @@ body {
 
 /* Performance panel (bottom-right overlay) */
 .perf-panel {
-  position: absolute; bottom: 12px; right: 12px; z-index: 10;
-  background: rgba(15,17,23,0.92); border-radius: var(--radius);
-  padding: 10px 14px; font-size: 11px; backdrop-filter: blur(8px);
-  border: 1px solid var(--border); width: 200px; color: var(--fg2);
-}
-.perf-header {
-  font-size: 10px; text-transform: uppercase; letter-spacing: 0.5px;
-  color: var(--fg3); margin-bottom: 6px; font-weight: 600;
-}
-.perf-section { margin-bottom: 6px; }
-.perf-section:last-child { margin-bottom: 0; }
-.perf-section-title {
-  font-size: 9px; text-transform: uppercase; letter-spacing: 0.4px;
-  color: var(--fg3); display: block; margin-bottom: 2px; margin-top: 2px;
-}
-.perf-filter-title {
-  font-size: 9px; color: var(--fg3); display: block; margin-top: 2px;
-}
-.perf-row {
-  display: flex; justify-content: space-between; padding: 1px 0; line-height: 1.5;
-}
-.perf-row.dim { color: var(--fg3); }
-.perf-row.warn span:last-child { color: #fca5a5; font-weight: 600; }
-
-/* Performance panel (bottom-right overlay) */
-.perf-panel {
-  position: absolute; bottom: 12px; right: 12px; z-index: 10;
+  position: absolute; bottom: 220px; right: 12px; z-index: 10;
   background: rgba(15,17,23,0.92); border-radius: var(--radius);
   padding: 10px 14px; font-size: 11px; backdrop-filter: blur(8px);
   border: 1px solid var(--border); width: 220px; color: var(--fg2);
@@ -429,10 +403,14 @@ body {
   font-size: 9px; text-transform: uppercase; letter-spacing: 0.4px;
   color: var(--fg3); display: block; margin-bottom: 2px; margin-top: 2px;
 }
+.perf-filter-title {
+  font-size: 9px; color: var(--fg3); display: block; margin-top: 2px;
+}
 .perf-row {
   display: flex; justify-content: space-between; padding: 1px 0; line-height: 1.5;
 }
 .perf-row.dim { color: var(--fg3); font-size: 10px; }
+.perf-row.warn span:last-child { color: #fca5a5; font-weight: 600; }
 .perf-delta { font-size: 9px; font-weight: 600; margin-left: 3px; }
 .perf-delta.up { color: #fbbf24; }
 .perf-delta.down { color: #34d399; }

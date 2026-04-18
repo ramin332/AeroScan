@@ -9,6 +9,22 @@ import { useStore } from '../store';
 // Layers: 0 = base scene + ghost mesh, 1 = drone (hidden from PIP), 3 = solid mesh (PIP only)
 const MESH_SOLID_LAYER = 3;
 
+/** Repositions the camera to frame the scene when the centroid changes. */
+function CameraReframe({ target, radius }: { target: [number, number, number]; radius: number }) {
+  const { camera, controls } = useThree() as { camera: THREE.PerspectiveCamera; controls: { target: THREE.Vector3; update: () => void } | null };
+  useEffect(() => {
+    const d = Math.max(radius * 1.8, 25);
+    camera.position.set(target[0] + d * 0.8, target[1] + d * 0.6, target[2] + d * 0.8);
+    camera.lookAt(target[0], target[1], target[2]);
+    camera.updateProjectionMatrix();
+    if (controls?.target) {
+      controls.target.set(target[0], target[1], target[2]);
+      controls.update();
+    }
+  }, [target[0], target[1], target[2], radius, camera, controls]);
+  return null;
+}
+
 /** Component that enables MESH_SOLID_LAYER on all scene lights so the PIP camera can see lit surfaces */
 function EnableLightLayers() {
   const { scene } = useThree();
@@ -195,6 +211,79 @@ function CameraArrows({ waypoints, color, bright, cameraFov }: { waypoints: Wayp
   return (
     <lineSegments geometry={geometry}>
       <lineBasicMaterial color={color} transparent opacity={bright ? 0.6 : 0.25} />
+    </lineSegments>
+  );
+}
+
+function OriginalGimbalArrows({ waypoints, color }: { waypoints: WaypointData[]; color: string }) {
+  // Match DJI Pilot 2: one camera frustum per waypoint, using the placemark's
+  // waypointGimbalPitchAngle + waypointHeadingAngle. The 5-pose SmartOblique
+  // rosette is an execution-time cycling detail (action group config), not a
+  // per-waypoint plan element — Pilot doesn't render it either.
+  const frustumLen = 2.0;
+  const fovHDeg = 84;
+  const fovVDeg = 56;
+  const halfW = frustumLen * Math.tan((fovHDeg * Math.PI) / 180 / 2) * 0.25;
+  const halfH = frustumLen * Math.tan((fovVDeg * Math.PI) / 180 / 2) * 0.25;
+
+  const { edgeGeo } = useMemo(() => {
+    const edgePositions: number[] = [];
+    for (const wp of waypoints) {
+      const pitch = wp.pitch_before !== undefined ? wp.pitch_before : wp.gimbal_pitch;
+      const yaw = wp.yaw_before !== undefined ? wp.yaw_before : wp.heading;
+      const poses = [{ pitch, yaw }];
+
+      for (const p of poses) {
+        const yr = (p.yaw * Math.PI) / 180;
+        const pr = (p.pitch * Math.PI) / 180;
+        // Forward (look direction) in ENU
+        const fx = Math.sin(yr) * Math.cos(pr);
+        const fy = Math.cos(yr) * Math.cos(pr);
+        const fz = Math.sin(pr);
+        // Right vector (horizontal, perpendicular to forward & world up)
+        const rx = Math.cos(yr);
+        const ry = -Math.sin(yr);
+        const rz = 0;
+        // Up vector = forward × right (ENU)
+        const ux = fy * rz - fz * ry;
+        const uy = fz * rx - fx * rz;
+        const uz = fx * ry - fy * rx;
+
+        // Apex (waypoint) in THREE coords
+        const [ax, ay, az] = enu(wp.x, wp.y, wp.z);
+        // Base center
+        const bcx = wp.x + fx * frustumLen;
+        const bcy = wp.y + fy * frustumLen;
+        const bcz = wp.z + fz * frustumLen;
+        // 4 base corners (TL, TR, BR, BL)
+        const corners: [number, number, number][] = [
+          enu(bcx - rx * halfW + ux * halfH, bcy - ry * halfW + uy * halfH, bcz - rz * halfW + uz * halfH),
+          enu(bcx + rx * halfW + ux * halfH, bcy + ry * halfW + uy * halfH, bcz + rz * halfW + uz * halfH),
+          enu(bcx + rx * halfW - ux * halfH, bcy + ry * halfW - uy * halfH, bcz + rz * halfW - uz * halfH),
+          enu(bcx - rx * halfW - ux * halfH, bcy - ry * halfW - uy * halfH, bcz - rz * halfW - uz * halfH),
+        ];
+        // Apex → each corner (4 edges)
+        for (const c of corners) {
+          edgePositions.push(ax, ay, az, c[0], c[1], c[2]);
+        }
+        // Base rectangle (4 edges)
+        for (let i = 0; i < 4; i++) {
+          const a = corners[i];
+          const b = corners[(i + 1) % 4];
+          edgePositions.push(a[0], a[1], a[2], b[0], b[1], b[2]);
+        }
+      }
+    }
+    if (edgePositions.length === 0) return { edgeGeo: null };
+    const g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.Float32BufferAttribute(edgePositions, 3));
+    return { edgeGeo: g };
+  }, [waypoints, frustumLen, halfW, halfH]);
+
+  if (!edgeGeo) return null;
+  return (
+    <lineSegments geometry={edgeGeo}>
+      <lineBasicMaterial color={color} transparent opacity={0.55} />
     </lineSegments>
   );
 }
@@ -421,6 +510,7 @@ function Scene({ data, onWaypointClick, visitedIndex, viewMode, activeFacades, l
   const toggleCandidate = useStore((s) => s.toggleCandidate);
   const exclusionZones = useStore((s) => s.exclusionZones);
   const updateExclusionZone = useStore((s) => s.updateExclusionZone);
+  const showOriginalGimbals = useStore((s) => s.showOriginalGimbals);
 
   // Separate inspection and transition waypoints
   const { facadeWaypoints, transitionWaypoints } = useMemo(() => {
@@ -565,6 +655,7 @@ function Scene({ data, onWaypointClick, visitedIndex, viewMode, activeFacades, l
             <group key={fi}>
               <WaypointSpheres waypoints={wps} color={isActive ? color : '#1a1a2a'} bright={isActive} />
               {isActive && <CameraArrows waypoints={wps} color={color} bright cameraFov={cameraFov} />}
+              {isActive && showOriginalGimbals && <OriginalGimbalArrows waypoints={wps} color="#ff3344" />}
             </group>
           );
         }
@@ -580,6 +671,7 @@ function Scene({ data, onWaypointClick, visitedIndex, viewMode, activeFacades, l
           <group key={fi}>
             <WaypointSpheres waypoints={wps} color={color} />
             <CameraArrows waypoints={wps} color={color} />
+            {showOriginalGimbals && <OriginalGimbalArrows waypoints={wps} color="#ff3344" />}
           </group>
         );
       })}
@@ -605,8 +697,9 @@ function Scene({ data, onWaypointClick, visitedIndex, viewMode, activeFacades, l
       {/* Imported DJI Smart3D reference point cloud */}
       {data.pointCloud && <PointCloudView data={data.pointCloud} />}
 
-      {/* Imported DJI mission-area polygon (dashed ground outline) */}
-      {data.missionArea && <MissionAreaView data={data.missionArea} />}
+      {/* Mission-area polygon intentionally not drawn in 3D — it clutters the
+          point cloud with an unrelated extruded boundary. Still rendered on the
+          2D map tab via LeafletData.missionAreaPoly. */}
     </group>
   );
 }
@@ -786,6 +879,40 @@ export function Viewer3D({ data, cameraFov, defaultViewMode = 'plan' }: { data: 
     setSnapshot(null);
   }, [data]);
 
+  // Scene centroid + bounding radius in Three.js space. Used to target
+  // OrbitControls and to reframe the camera on data changes so KMZ imports
+  // (where content is offset from the ENU origin) don't leave the camera
+  // staring at empty space.
+  const { sceneCentroid, sceneRadius } = useMemo<{
+    sceneCentroid: [number, number, number];
+    sceneRadius: number;
+  }>(() => {
+    if (!data) return { sceneCentroid: [0, 0, 0], sceneRadius: 30 };
+    const pts: [number, number, number][] = [];
+    for (const wp of data.waypoints) pts.push([wp.x, wp.z, -wp.y]);
+    const pc = data.pointCloud;
+    if (pc && pc.positions.length >= 3) {
+      const step = Math.max(1, Math.floor(pc.positions.length / 3 / 2000));
+      for (let i = 0; i < pc.positions.length; i += 3 * step) {
+        pts.push([pc.positions[i], pc.positions[i + 2], -pc.positions[i + 1]]);
+      }
+    }
+    for (const f of data.facades) {
+      for (const p of f.vertices) pts.push([p[0], p[2], -p[1]]);
+    }
+    if (pts.length === 0) return { sceneCentroid: [0, data.buildingHeight / 2, 0], sceneRadius: 30 };
+    let minX = Infinity, minY = Infinity, minZ = Infinity;
+    let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
+    for (const [x, y, z] of pts) {
+      if (x < minX) minX = x; if (x > maxX) maxX = x;
+      if (y < minY) minY = y; if (y > maxY) maxY = y;
+      if (z < minZ) minZ = z; if (z > maxZ) maxZ = z;
+    }
+    const cx = (minX + maxX) / 2, cy = (minY + maxY) / 2, cz = (minZ + maxZ) / 2;
+    const radius = Math.max(maxX - minX, maxY - minY, maxZ - minZ) / 2;
+    return { sceneCentroid: [cx, cy, cz], sceneRadius: radius };
+  }, [data]);
+
   const handleSnapshot = useCallback((url: string, wpIdx: number, photoNum: number) => {
     setSnapshot({ url, wpIdx, photoNum });
   }, []);
@@ -904,10 +1031,12 @@ export function Viewer3D({ data, cameraFov, defaultViewMode = 'plan' }: { data: 
         <EnableLightLayers />
         <fog attach="fog" args={[lightMode ? '#e8eaef' : '#0f1117', 80, 200]} />
         <OrbitControls
-          target={[0, data.buildingHeight / 2, 0]}
+          makeDefault
+          target={sceneCentroid}
           enableDamping
           dampingFactor={0.08}
         />
+        <CameraReframe target={sceneCentroid} radius={sceneRadius} />
         <Scene data={data} onWaypointClick={setSelectedWp} visitedIndex={playing || progress > 0 ? getVisitedIndex(progress, data.waypoints.length) : -1} viewMode={viewMode} activeFacades={activeFacadeSet} lightMode={lightMode} cameraFov={cameraFov} />
         {(playing || progress > 0) && (
           <DroneMarker waypoints={data.waypoints} progress={progress} cameraFov={cameraFov} timeline={usePhysics ? timeline : undefined} />

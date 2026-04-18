@@ -41,6 +41,81 @@ def _facade_color(normal: list[float]) -> str:
     return DIRECTION_COLORS.get(_facade_direction(normal), DIRECTION_COLORS["other"])
 
 
+def compute_facade_coverage(
+    building: Building,
+    waypoints: list[Waypoint],
+) -> list[dict]:
+    """Per-facade inspection-quality metrics for the coverage diff panel.
+
+    For each facade returns: area, waypoint count, mean |gimbal pitch|,
+    mean perpendicularity (cos of angle between -facade_normal and camera
+    forward; 1.0 = perfectly perpendicular), and mean stand-off distance.
+    """
+    import numpy as _np
+
+    # Group waypoints by facade_index (skip transitions — they have no photo
+    # and their gimbal angle isn't aligned to any facade).
+    wps_by_facade: dict[int, list[Waypoint]] = {}
+    for wp in waypoints:
+        if getattr(wp, "is_transition", False):
+            continue
+        wps_by_facade.setdefault(wp.facade_index, []).append(wp)
+
+    out: list[dict] = []
+    for facade in building.facades:
+        wps = wps_by_facade.get(facade.index, [])
+        area = float(facade.width * facade.height)
+        if not wps:
+            out.append({
+                "facade_index": facade.index,
+                "label": facade.label,
+                "area_m2": round(area, 1),
+                "waypoint_count": 0,
+                "mean_pitch_abs_deg": None,
+                "mean_perpendicularity": None,
+                "mean_distance_m": None,
+            })
+            continue
+
+        normal = _np.asarray(facade.normal, dtype=_np.float64)
+        centroid = _np.asarray(facade.center, dtype=_np.float64)
+        pitch_abs_sum = 0.0
+        perp_sum = 0.0
+        dist_sum = 0.0
+        for wp in wps:
+            h = math.radians(wp.heading_deg)
+            # Camera yaw overrides heading when set; KMZ imports leave
+            # gimbal_yaw_deg=None (camera follows aircraft).
+            if wp.gimbal_yaw_deg is not None:
+                h = math.radians(wp.gimbal_yaw_deg)
+            p = math.radians(wp.gimbal_pitch_deg)
+            # ENU: x=E, y=N. Heading 0 = north = +Y, clockwise.
+            fwd = _np.array([
+                math.sin(h) * math.cos(p),
+                math.cos(h) * math.cos(p),
+                math.sin(p),
+            ])
+            # Perpendicularity: camera forward should oppose facade normal.
+            perp = float(_np.dot(fwd, -normal))
+            perp_sum += perp
+            pitch_abs_sum += abs(wp.gimbal_pitch_deg)
+            # Perpendicular distance from waypoint to facade plane.
+            pos = _np.array([wp.x, wp.y, wp.z])
+            dist_sum += float(abs(_np.dot(pos - centroid, normal)))
+
+        n = len(wps)
+        out.append({
+            "facade_index": facade.index,
+            "label": facade.label,
+            "area_m2": round(area, 1),
+            "waypoint_count": n,
+            "mean_pitch_abs_deg": round(pitch_abs_sum / n, 1),
+            "mean_perpendicularity": round(perp_sum / n, 3),
+            "mean_distance_m": round(dist_sum / n, 1),
+        })
+    return out
+
+
 def _escape_html(text: str) -> str:
     """Escape HTML special characters."""
     return (

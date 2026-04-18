@@ -29,6 +29,23 @@ export const DEFAULT_MISSION: MissionParams = {
   stop_at_waypoint: false,
 };
 
+// NEN-2767 inspection preset: stop-and-shoot, perpendicular gimbal, moderate
+// speed, tight overlap. Applied when regenerating a clean inspection mission
+// from an imported DJI reconnaissance scan.
+export const NEN2767_MISSION: MissionParams = {
+  target_gsd_mm_per_px: 2.0,
+  camera: 'wide',
+  front_overlap: 0.80,
+  side_overlap: 0.70,
+  flight_speed_ms: 3.0,
+  obstacle_clearance_m: 2.0,
+  mission_name: 'NEN-2767 Inspection',
+  gimbal_pitch_margin_deg: 5.0,
+  min_photo_distance_m: 4.0,
+  yaw_rate_deg_per_s: 60.0,
+  stop_at_waypoint: true,
+};
+
 export const DEFAULT_ALGORITHM: AlgorithmParams = {
   // Flight time estimation
   hover_time_per_wp_s: 1.0,
@@ -115,6 +132,7 @@ interface AppState {
   uploading: boolean;
   uploadProgress: number;   // 0-1
   uploadMessage: string;
+  lastPhaseTimings: Array<{ label: string; seconds: number }> | null;
   activeTab: Tab;
 
   // Actions
@@ -139,6 +157,8 @@ interface AppState {
   deleteVersion: (id: string) => Promise<void>;
   deleteAllVersions: () => Promise<void>;
   refreshVersions: () => Promise<void>;
+  rewriteGimbals: () => Promise<void>;
+  generateInspectionMission: () => Promise<void>;
 
   // Theme
   lightMode: boolean;
@@ -150,7 +170,11 @@ interface AppState {
 
   // Building upload actions
   uploadBuilding: (file: File) => Promise<void>;
-  importKmz: (file: File, voxelSize?: number | null) => Promise<void>;
+  importKmz: (file: File, voxelSize?: number | null, mode?: 'raw' | 'facades') => Promise<void>;
+  kmzImportMode: 'raw' | 'facades';
+  setKmzImportMode: (v: 'raw' | 'facades') => void;
+  lastKmzFile: File | null;
+  toggleKmzFacades: () => Promise<void>;
   refineKmz: (voxelSize: number) => Promise<void>;
   optimizeKmz: (buildingId?: string | null) => Promise<void>;
   cancelOptimize: () => void;
@@ -158,6 +182,8 @@ interface AppState {
   kmzOptimizeMessage: string;
   kmzAutoRefine: boolean;
   setKmzAutoRefine: (v: boolean) => void;
+  showOriginalGimbals: boolean;
+  setShowOriginalGimbals: (v: boolean) => void;
   selectBuilding: (id: string) => void;
   deleteBuilding: (id: string) => Promise<void>;
   refreshBuildings: () => Promise<void>;
@@ -198,6 +224,7 @@ export const useStore = create<AppState>()(persist((set, get) => ({
   uploading: false,
   uploadProgress: 0,
   uploadMessage: '',
+  lastPhaseTimings: null,
   activeTab: '3d',
   lightMode: false,
   setLightMode: (v) => set({ lightMode: v }),
@@ -336,6 +363,45 @@ export const useStore = create<AppState>()(persist((set, get) => ({
     }
   },
 
+  rewriteGimbals: async () => {
+    const current = get().result;
+    if (!current?.version_id) return;
+    set({ loading: true });
+    try {
+      const res = await api.rewriteGimbals(current.version_id);
+      await get().loadVersion(res.version_id);
+      await get().refreshVersions();
+    } catch (e) {
+      console.error('Rewrite gimbals failed:', e);
+      set({ loading: false });
+    }
+  },
+
+  generateInspectionMission: async () => {
+    const { selectedBuildingId, building, algorithm, minFacadeArea, extractionMethod, waypointStrategy, disabledFacades, enabledCandidates, exclusionZones } = get();
+    if (!selectedBuildingId) return;
+    set({ loading: true });
+    try {
+      const result = await api.generate({
+        building_id: selectedBuildingId,
+        building,
+        mission: { ...NEN2767_MISSION },
+        algorithm,
+        min_facade_area: minFacadeArea,
+        extraction_method: extractionMethod,
+        waypoint_strategy: waypointStrategy,
+        disabled_facades: disabledFacades.size > 0 ? [...disabledFacades] : undefined,
+        enabled_candidates: enabledCandidates.size > 0 ? [...enabledCandidates] : undefined,
+        exclusion_zones: exclusionZones.length > 0 ? exclusionZones : undefined,
+      });
+      set({ result, mission: { ...NEN2767_MISSION }, loading: false });
+      await get().refreshVersions();
+    } catch (e) {
+      console.error('Generate inspection mission failed:', e);
+      set({ loading: false });
+    }
+  },
+
   // --- Building upload ---
 
   uploadBuilding: async (file: File) => {
@@ -369,8 +435,13 @@ export const useStore = create<AppState>()(persist((set, get) => ({
               const progress = 0.3 + status.progress * 0.7; // 30-100%
               set({ uploadProgress: progress, uploadMessage: status.message });
               if (status.status === 'complete' && status.result) {
+                if (status.phase_timings) {
+                  set({ lastPhaseTimings: status.phase_timings });
+                  console.log('[aeroscan] upload-mesh phase_timings', status.phase_timings);
+                }
                 resolve(status.result);
               } else if (status.status === 'error') {
+                if (status.phase_timings) set({ lastPhaseTimings: status.phase_timings });
                 reject(new Error(status.error || 'Processing failed'));
               } else {
                 setTimeout(poll, 1000);
@@ -440,6 +511,8 @@ export const useStore = create<AppState>()(persist((set, get) => ({
   kmzOptimizeMessage: '',
   kmzAutoRefine: false,
   setKmzAutoRefine: (v: boolean) => set({ kmzAutoRefine: v }),
+  showOriginalGimbals: true,
+  setShowOriginalGimbals: (v: boolean) => set({ showOriginalGimbals: v }),
 
   refineKmz: async (voxelSize: number) => {
     const { selectedBuildingId } = get();
@@ -498,16 +571,28 @@ export const useStore = create<AppState>()(persist((set, get) => ({
     }
   },
 
-  importKmz: async (file: File, voxelSizeArg?: number | null) => {
+  kmzImportMode: 'raw',
+  setKmzImportMode: (v) => set({ kmzImportMode: v }),
+  lastKmzFile: null,
+  toggleKmzFacades: async () => {
+    const { lastKmzFile, result } = get();
+    if (!lastKmzFile) return;
+    const currentSource = result?.summary?.source;
+    const nextMode = currentSource === 'kmz_raw' ? 'facades' : 'raw';
+    await get().importKmz(lastKmzFile, null, nextMode);
+  },
+
+  importKmz: async (file: File, voxelSizeArg?: number | null, modeArg?: 'raw' | 'facades') => {
     const fileSizeMB = (file.size / (1024 * 1024)).toFixed(1);
     const voxelSize = voxelSizeArg ?? null;
-    set({ uploading: true, uploadProgress: 0, uploadMessage: `Uploading ${fileSizeMB} MB KMZ…` });
+    const mode = modeArg ?? get().kmzImportMode;
+    set({ uploading: true, uploadProgress: 0, uploadMessage: `Uploading ${fileSizeMB} MB KMZ…`, lastKmzFile: file });
     try {
       const { task_id } = await api.importKmz(file, voxelSize, (loaded, total) => {
         const pct = total > 0 ? loaded / total : 0;
         const loadedMB = (loaded / (1024 * 1024)).toFixed(1);
         set({ uploadProgress: pct * 0.3, uploadMessage: `Uploading ${loadedMB}/${fileSizeMB} MB…` });
-      });
+      }, mode);
 
       set({ uploadProgress: 0.3, uploadMessage: 'Parsing KMZ…' });
       const result = await new Promise<GenerateResponse & { building_id?: string }>((resolve, reject) => {
@@ -517,8 +602,13 @@ export const useStore = create<AppState>()(persist((set, get) => ({
             const progress = 0.3 + status.progress * 0.7;
             set({ uploadProgress: progress, uploadMessage: status.message });
             if (status.status === 'complete' && status.result) {
+              if (status.phase_timings) {
+                set({ lastPhaseTimings: status.phase_timings });
+                console.log('[aeroscan] import-kmz phase_timings', status.phase_timings);
+              }
               resolve(status.result as GenerateResponse & { building_id?: string });
             } else if (status.status === 'error') {
+              if (status.phase_timings) set({ lastPhaseTimings: status.phase_timings });
               reject(new Error(status.error || 'Import failed'));
             } else {
               setTimeout(poll, 1000);
@@ -544,7 +634,8 @@ export const useStore = create<AppState>()(persist((set, get) => ({
       }
 
       // --- Background optimization chain (fire-and-forget, non-blocking) ---
-      if (get().kmzAutoRefine && result.building_id) {
+      // Raw mode has no mesh to refine, so skip the chain entirely.
+      if (mode === 'facades' && get().kmzAutoRefine && result.building_id) {
         void get().optimizeKmz(result.building_id);
       }
     } catch (e) {

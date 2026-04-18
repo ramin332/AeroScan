@@ -65,6 +65,25 @@ export function kmzDownloadUrl(versionId: string): string {
   return `${BASE}/versions/${versionId}/kmz`;
 }
 
+export async function rewriteGimbals(
+  versionId: string,
+  params?: { max_distance_m?: number; pitch_margin_deg?: number; preserve_heading?: boolean },
+): Promise<{
+  version_id: string;
+  parent_version_id: string;
+  rewritten_count: number;
+  total_waypoints: number;
+  timestamp: string;
+  summary: Record<string, unknown>;
+  viewer_data: { threejs: unknown; leaflet: unknown };
+}> {
+  return request(`/versions/${versionId}/rewrite-gimbals`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(params ?? {}),
+  });
+}
+
 // --- Building CRUD ---
 
 export async function uploadBuilding(req: BuildingUploadRequest): Promise<UploadedBuilding> {
@@ -126,6 +145,7 @@ export function uploadMeshFile(
 export async function getUploadStatus(taskId: string): Promise<{
   status: string; progress: number; message: string;
   result?: UploadedBuilding; error?: string;
+  phase_timings?: Array<{ label: string; seconds: number }>;
 }> {
   return request(`/buildings/upload-status/${taskId}`);
 }
@@ -136,10 +156,12 @@ export function importKmz(
   file: File,
   voxelSize?: number | null,
   onUploadProgress?: (loaded: number, total: number) => void,
+  mode: 'raw' | 'facades' = 'facades',
 ): Promise<{ task_id: string }> {
   const form = new FormData();
   form.append('file', file);
   if (voxelSize && voxelSize > 0) form.append('voxel_size', String(voxelSize));
+  form.append('import_mode', mode);
 
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
@@ -167,6 +189,7 @@ export async function getKmzImportStatus(taskId: string): Promise<{
   status: string; progress: number; message: string;
   result?: GenerateResponse & { building_id?: string; imported_name?: string };
   error?: string;
+  phase_timings?: Array<{ label: string; seconds: number }>;
 }> {
   // Reuses the shared upload-status endpoint
   return request(`/buildings/upload-status/${taskId}`);
@@ -175,11 +198,16 @@ export async function getKmzImportStatus(taskId: string): Promise<{
 export async function refineKmzBuilding(
   buildingId: string,
   voxelSize: number,
+  smoothIterations?: number,
+  decimationRatio?: number,
 ): Promise<{ task_id: string }> {
+  const body: Record<string, number> = { voxel_size: voxelSize };
+  if (smoothIterations !== undefined) body.smooth_iterations = smoothIterations;
+  if (decimationRatio !== undefined) body.decimation_ratio = decimationRatio;
   return request(`/buildings/${buildingId}/refine-kmz`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ voxel_size: voxelSize }),
+    body: JSON.stringify(body),
   });
 }
 

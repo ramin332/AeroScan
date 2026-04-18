@@ -159,6 +159,40 @@ export interface Summary {
     distance_m: number;
     focal_length_mm: number;
   };
+  source?: string;
+  parent_version_id?: string;
+  gimbal_before?: GimbalStats;
+  gimbal_after?: GimbalStats;
+  gimbal_diff?: GimbalDiffEntry[];
+  facade_coverage?: FacadeCoverageEntry[];
+}
+
+export interface FacadeCoverageEntry {
+  facade_index: number;
+  label: string;
+  area_m2: number;
+  waypoint_count: number;
+  mean_pitch_abs_deg: number | null;
+  mean_perpendicularity: number | null;
+  mean_distance_m: number | null;
+}
+
+export interface GimbalStats {
+  count: number;
+  pitch_mean: number;
+  pitch_min: number;
+  pitch_max: number;
+  pitch_median: number;
+  yaw_unique: number;
+}
+
+export interface GimbalDiffEntry {
+  index: number;
+  pitch_before: number;
+  pitch_after: number;
+  yaw_before: number;
+  yaw_after: number;
+  facade_index: number;
 }
 
 // Three.js viewer data
@@ -182,6 +216,9 @@ export interface WaypointData {
   index: number;
   component: string;
   is_transition: boolean;
+  pitch_before?: number;
+  yaw_before?: number;
+  smart_oblique_poses?: { pitch: number; yaw: number }[];
 }
 
 export interface RawMeshData {

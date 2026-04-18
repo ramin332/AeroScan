@@ -1,7 +1,7 @@
-import { useEffect, useRef } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { useStore, PRESETS, DEFAULT_ALGORITHM, DEFAULT_MISSION } from '../store';
 import { kmzDownloadUrl } from '../api/client';
-import type { AlgorithmParams, ExclusionZone } from '../api/types';
+import type { AlgorithmParams, ExclusionZone, GimbalStats, GimbalDiffEntry, FacadeCoverageEntry } from '../api/types';
 import { DroneInfo } from './DroneInfo';
 import { VersionList } from './VersionList';
 
@@ -27,6 +27,7 @@ export function Sidebar() {
     uploadBuilding, importKmz, optimizeKmz, cancelOptimize, selectBuilding, deleteBuilding,
     kmzOptimizing, kmzOptimizeMessage, kmzAutoRefine, setKmzAutoRefine,
     simStatus, simProgress, simMessage, startSimulation,
+    rewriteGimbals, generateInspectionMission, toggleKmzFacades, lastKmzFile,
   } = useStore();
 
   const fileRef = useRef<HTMLInputElement>(null);
@@ -156,6 +157,49 @@ export function Sidebar() {
             </>
           )}
         </div>
+        {result?.version_id && lastKmzFile && (result.summary.source === 'kmz_raw' || result.summary.source === 'kmz_import') && (
+          <button
+            className="btn-secondary"
+            style={{ marginTop: 8, width: '100%', fontSize: 11, padding: '5px 10px' }}
+            onClick={() => toggleKmzFacades()}
+            disabled={uploading}
+            title={result.summary.source === 'kmz_raw'
+              ? 'Run mesh reconstruction + facade extraction on the point cloud. Slower, but enables inspection-grid generation.'
+              : 'Discard facade extraction and show only the raw point cloud + original flight plan.'}
+          >
+            {result.summary.source === 'kmz_raw' ? 'Detect facades' : 'Hide facades (raw view)'}
+          </button>
+        )}
+        {result?.version_id && result.summary.facade_count > 0 && (
+          <>
+            <button
+              className="btn-primary"
+              style={{ marginTop: 8, width: '100%', fontSize: 12, padding: '6px 10px', fontWeight: 600 }}
+              onClick={() => rewriteGimbals()}
+              title="Replace DJI's photogrammetry rosette with facade-perpendicular gimbal angles. Creates a new version."
+            >
+              Rewrite gimbals for NEN-2767
+            </button>
+            {result.summary.source?.startsWith('kmz_') && (
+              <button
+                className="btn-primary"
+                style={{ marginTop: 6, width: '100%', fontSize: 12, padding: '6px 10px', fontWeight: 600 }}
+                onClick={() => generateInspectionMission()}
+                title="Generate a fresh NEN-2767 inspection mission from scratch: perpendicular gimbal, stop-and-shoot, 3 m/s, one photo per waypoint. Creates a new version alongside the original DJI mission."
+              >
+                Generate NEN-2767 inspection mission
+              </button>
+            )}
+            {(result.summary.gimbal_before || result.summary.gimbal_after) && (
+              <GimbalDiff
+                before={result.summary.gimbal_before}
+                after={result.summary.gimbal_after}
+                isRewritten={!!result.summary.parent_version_id}
+                diff={result.summary.gimbal_diff}
+              />
+            )}
+          </>
+        )}
       </div>
 
       {/* Upload mode */}
@@ -306,6 +350,7 @@ export function Sidebar() {
               <option value="region_growing">Region Growing</option>
               <option value="meshlab">MeshLab</option>
               <option value="convex_hull">Convex Hull</option>
+              <option value="pointcloud_ransac">Point Cloud RANSAC</option>
             </select>
           </div>
           <SliderField label="Min surface" value={minFacadeArea}
@@ -749,13 +794,18 @@ export function Sidebar() {
           <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
             {result.viewer_data.threejs.facades.map((f) => {
               const disabled = disabledFacades.has(f.index);
+              const cov = result.summary.facade_coverage?.find((c) => c.facade_index === f.index);
               return (
-                <label key={f.index} style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 11, cursor: 'pointer', opacity: disabled ? 0.5 : 1 }}>
-                  <input type="checkbox" checked={!disabled}
-                    onChange={() => toggleFacade(f.index)} />
-                  <span style={{ width: 10, height: 10, borderRadius: 2, background: f.color, flexShrink: 0 }} />
-                  <span>{f.label}</span>
-                </label>
+                <div key={f.index} style={{ opacity: disabled ? 0.5 : 1 }}>
+                  <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 11, cursor: 'pointer' }}>
+                    <input type="checkbox" checked={!disabled}
+                      onChange={() => toggleFacade(f.index)} />
+                    <span style={{ width: 10, height: 10, borderRadius: 2, background: f.color, flexShrink: 0 }} />
+                    <span style={{ flex: 1 }}>{f.label}</span>
+                    {cov && <span style={{ fontSize: 10, opacity: 0.7 }}>{cov.waypoint_count} wp · {cov.area_m2} m²</span>}
+                  </label>
+                  {cov && cov.waypoint_count > 0 && <FacadeCoverageBar cov={cov} />}
+                </div>
               );
             })}
           </div>
@@ -802,6 +852,142 @@ export function Sidebar() {
         <VersionList />
       </div>
     </aside>
+  );
+}
+
+// --- Per-facade inspection coverage bar ---
+
+function FacadeCoverageBar({ cov }: { cov: FacadeCoverageEntry }) {
+  const perp = cov.mean_perpendicularity;
+  const pct = perp === null ? 0 : Math.max(0, Math.min(100, perp * 100));
+  // Colour: perpendicularity above 0.95 is great (green), 0.7-0.95 is ok
+  // (amber), below 0.7 is poor (red). 0.0 is camera is parallel to wall,
+  // negative values mean camera is pointing AWAY from the wall.
+  const color = perp === null ? '#555' : perp >= 0.95 ? '#22cc55' : perp >= 0.7 ? '#eab308' : '#dc2626';
+  return (
+    <div style={{ marginLeft: 22, marginTop: 1, marginBottom: 2, display: 'flex', alignItems: 'center', gap: 4, fontSize: 9, color: 'var(--muted)' }}>
+      <div style={{ flex: 1, height: 4, background: 'var(--bg-secondary)', borderRadius: 2, overflow: 'hidden' }}>
+        <div style={{ width: `${pct}%`, height: '100%', background: color }} />
+      </div>
+      <span style={{ minWidth: 92, textAlign: 'right' }}>
+        ⟂ {perp === null ? '–' : perp.toFixed(2)} · {cov.mean_pitch_abs_deg === null ? '–' : `${cov.mean_pitch_abs_deg.toFixed(0)}°`} · {cov.mean_distance_m === null ? '–' : `${cov.mean_distance_m.toFixed(1)}m`}
+      </span>
+    </div>
+  );
+}
+
+// --- Gimbal diff ---
+
+function GimbalDiff({ before, after, isRewritten, diff }: {
+  before?: GimbalStats;
+  after?: GimbalStats;
+  isRewritten: boolean;
+  diff?: GimbalDiffEntry[];
+}) {
+  const [showAll, setShowAll] = useState(false);
+  const { showOriginalGimbals, setShowOriginalGimbals } = useStore();
+  const fmt = (v: number | undefined) => v === undefined ? '–' : `${v.toFixed(1)}°`;
+  const delta = (b: number | undefined, a: number | undefined) => {
+    if (b === undefined || a === undefined) return null;
+    const d = a - b;
+    if (Math.abs(d) < 0.05) return null;
+    return <span style={{ color: d > 0 ? '#22cc55' : '#f8a', fontSize: 9, marginLeft: 3 }}>
+      {d > 0 ? '+' : ''}{d.toFixed(1)}°
+    </span>;
+  };
+  const hasBoth = before && after;
+
+  return (
+    <div style={{ marginTop: 8, padding: 6, background: 'var(--bg-secondary)', borderRadius: 4, fontSize: 10 }}>
+      <div style={{ fontWeight: 600, marginBottom: 4, color: 'var(--muted)', textTransform: 'uppercase', letterSpacing: 0.5 }}>
+        Gimbal pitch {isRewritten ? '(rewritten)' : hasBoth ? 'preview' : 'current'}
+      </div>
+      <div style={{ display: 'grid', gridTemplateColumns: hasBoth ? '60px 1fr 1fr' : '60px 1fr', gap: 2, alignItems: 'center' }}>
+        <span style={{ color: 'var(--muted)' }}></span>
+        {hasBoth && <span style={{ color: 'var(--muted)', fontSize: 9 }}>Before</span>}
+        <span style={{ color: 'var(--muted)', fontSize: 9 }}>{hasBoth ? 'After' : ''}</span>
+        <span style={{ color: 'var(--muted)' }}>Mean</span>
+        {hasBoth && <span>{fmt(before?.pitch_mean)}</span>}
+        <span>{fmt(after?.pitch_mean ?? before?.pitch_mean)}{hasBoth && delta(before?.pitch_mean, after?.pitch_mean)}</span>
+        <span style={{ color: 'var(--muted)' }}>Median</span>
+        {hasBoth && <span>{fmt(before?.pitch_median)}</span>}
+        <span>{fmt(after?.pitch_median ?? before?.pitch_median)}{hasBoth && delta(before?.pitch_median, after?.pitch_median)}</span>
+        <span style={{ color: 'var(--muted)' }}>Min</span>
+        {hasBoth && <span>{fmt(before?.pitch_min)}</span>}
+        <span>{fmt(after?.pitch_min ?? before?.pitch_min)}</span>
+        <span style={{ color: 'var(--muted)' }}>Max</span>
+        {hasBoth && <span>{fmt(before?.pitch_max)}</span>}
+        <span>{fmt(after?.pitch_max ?? before?.pitch_max)}</span>
+        <span style={{ color: 'var(--muted)' }}>Yaws</span>
+        {hasBoth && <span>{before?.yaw_unique ?? '–'}</span>}
+        <span>{after?.yaw_unique ?? before?.yaw_unique ?? '–'}</span>
+      </div>
+      {isRewritten && diff && diff.length > 0 && (
+        <div style={{ marginTop: 6 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 4 }}>
+            <label style={{ fontSize: 10, color: 'var(--muted)', cursor: 'pointer' }}>
+              <input
+                type="checkbox"
+                checked={showOriginalGimbals}
+                onChange={(e) => setShowOriginalGimbals(e.target.checked)}
+                style={{ marginRight: 4, verticalAlign: 'middle' }}
+              />
+              Show original gimbal directions (red) in 3D
+            </label>
+          </div>
+          <div style={{ fontWeight: 600, color: 'var(--muted)', fontSize: 9, textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 2 }}>
+            Per-waypoint diff ({diff.length} waypoints)
+          </div>
+          <div style={{
+            maxHeight: showAll ? 240 : 140,
+            overflowY: 'auto',
+            background: 'var(--bg-primary)',
+            borderRadius: 3,
+            padding: '4px 6px',
+            fontFamily: 'var(--font-mono, monospace)',
+            fontSize: 10,
+            lineHeight: 1.35,
+          }}>
+            <div style={{ display: 'grid', gridTemplateColumns: '28px 1fr 1fr', columnGap: 6, color: 'var(--muted)', fontSize: 9, paddingBottom: 2, borderBottom: '1px solid var(--border, #333)' }}>
+              <span>#</span>
+              <span>pitch (° before → after)</span>
+              <span>yaw (° before → after)</span>
+            </div>
+            {(showAll ? diff : diff.slice(0, 15)).map((d) => {
+              const dp = d.pitch_after - d.pitch_before;
+              const dy = ((d.yaw_after - d.yaw_before + 540) % 360) - 180;
+              const dpColor = Math.abs(dp) < 0.1 ? 'var(--muted)' : (dp > 0 ? '#22cc55' : '#f88');
+              const dyColor = Math.abs(dy) < 0.1 ? 'var(--muted)' : (dy > 0 ? '#22cc55' : '#f88');
+              return (
+                <div key={d.index} style={{ display: 'grid', gridTemplateColumns: '28px 1fr 1fr', columnGap: 6, padding: '1px 0' }}>
+                  <span style={{ color: 'var(--muted)' }}>{d.index}</span>
+                  <span>
+                    {d.pitch_before.toFixed(1)} → {d.pitch_after.toFixed(1)}
+                    <span style={{ color: dpColor, marginLeft: 4 }}>
+                      ({dp >= 0 ? '+' : ''}{dp.toFixed(1)})
+                    </span>
+                  </span>
+                  <span>
+                    {d.yaw_before.toFixed(0)} → {d.yaw_after.toFixed(0)}
+                    <span style={{ color: dyColor, marginLeft: 4 }}>
+                      ({dy >= 0 ? '+' : ''}{dy.toFixed(0)})
+                    </span>
+                  </span>
+                </div>
+              );
+            })}
+          </div>
+          {diff.length > 15 && (
+            <button
+              onClick={() => setShowAll(!showAll)}
+              style={{ marginTop: 4, background: 'none', border: 'none', color: 'var(--accent, #6af)', fontSize: 10, cursor: 'pointer', padding: 0 }}
+            >
+              {showAll ? 'Show less' : `Show all ${diff.length}…`}
+            </button>
+          )}
+        </div>
+      )}
+    </div>
   );
 }
 
