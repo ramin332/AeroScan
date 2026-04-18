@@ -27,7 +27,7 @@ export function Sidebar() {
     uploadBuilding, importKmz, optimizeKmz, cancelOptimize, selectBuilding, deleteBuilding,
     kmzOptimizing, kmzOptimizeMessage, kmzAutoRefine, setKmzAutoRefine,
     simStatus, simProgress, simMessage, startSimulation,
-    rewriteGimbals, generateInspectionMission, toggleKmzFacades, lastKmzFile,
+    rewriteGimbals, toggleKmzFacades, lastKmzFile,
   } = useStore();
 
   const fileRef = useRef<HTMLInputElement>(null);
@@ -36,6 +36,10 @@ export function Sidebar() {
   const isUploadMode = buildingSource === 'upload';
   const autoGen = () => {
     const s = useStore.getState();
+    // KMZ-derived missions own their own trajectory (DJI planned it). Filter
+    // changes update UI state only — they must not regenerate a fresh path.
+    // The user explicitly clicks "Rewrite for NEN-2767 inspection" to branch.
+    if (s.result?.summary?.source?.startsWith('kmz_')) return;
     const ok = s.buildingSource !== 'upload' || !!s.selectedBuildingId;
     if (ok) s.generate();
   };
@@ -176,20 +180,10 @@ export function Sidebar() {
               className="btn-primary"
               style={{ marginTop: 8, width: '100%', fontSize: 12, padding: '6px 10px', fontWeight: 600 }}
               onClick={() => rewriteGimbals()}
-              title="Replace DJI's photogrammetry rosette with facade-perpendicular gimbal angles. Creates a new version."
+              title="Keep DJI's trajectory; rewrite gimbals perpendicular to each facade, cap speed to 3 m/s, and strip the SmartOblique rosette so every waypoint takes a single NEN-2767 photo. Creates a new version."
             >
-              Rewrite gimbals for NEN-2767
+              Rewrite for NEN-2767 inspection
             </button>
-            {result.summary.source?.startsWith('kmz_') && (
-              <button
-                className="btn-primary"
-                style={{ marginTop: 6, width: '100%', fontSize: 12, padding: '6px 10px', fontWeight: 600 }}
-                onClick={() => generateInspectionMission()}
-                title="Generate a fresh NEN-2767 inspection mission from scratch: perpendicular gimbal, stop-and-shoot, 3 m/s, one photo per waypoint. Creates a new version alongside the original DJI mission."
-              >
-                Generate NEN-2767 inspection mission
-              </button>
-            )}
             {(result.summary.gimbal_before || result.summary.gimbal_after) && (
               <GimbalDiff
                 before={result.summary.gimbal_before}
@@ -350,7 +344,6 @@ export function Sidebar() {
               <option value="region_growing">Region Growing</option>
               <option value="meshlab">MeshLab</option>
               <option value="convex_hull">Convex Hull</option>
-              <option value="pointcloud_ransac">Point Cloud RANSAC</option>
             </select>
           </div>
           <SliderField label="Min surface" value={minFacadeArea}

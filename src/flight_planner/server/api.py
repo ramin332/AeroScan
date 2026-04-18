@@ -17,6 +17,120 @@ from sqlalchemy import func
 
 from .._profiling import get_recorded as _get_phase_timings, start_recording as _start_phase_recording
 from ..building_import import build_building_from_geojson, build_building_from_mesh, decode_mesh_viewer_data, extract_facades
+
+
+def _kmz_extract_best_facades(clipped_mesh, polygon_enu, points_xyz, *, min_area_m2: float = 5.0):
+    """Extract facades from a clipped KMZ mesh / point cloud.
+
+    Priority chain, best-first for DJI Smart3D data:
+    1. CGAL Efficient-RANSAC (Schnabel 2007) — gold-standard multi-plane
+       detection with connectivity-aware clustering. Native C++ via SWIG.
+    2. Vertical-prior 2D-line RANSAC on the point cloud (our fallback).
+    3. MeshLab plane segmentation on the clipped mesh.
+    4. Mesh region growing.
+    5. Polygon-derived walls (last resort, boxy).
+    """
+    try:
+        from ..kmz_import import facades_from_pointcloud_cgal as _ffc
+        cgal_out = _ffc(points_xyz, polygon_enu)
+        if len(cgal_out) >= 3:
+            print(f"[kmz facades] cgal efficient_RANSAC → {len(cgal_out)} facades")
+            return cgal_out
+    except Exception as _exc:
+        print(f"[kmz facades] cgal efficient_RANSAC raised: {_exc}")
+
+    try:
+        from ..kmz_import import facades_from_pointcloud_ransac as _ffr
+        ransac_out = _ffr(points_xyz, polygon_enu)
+        if len(ransac_out) >= 3:
+            print(f"[kmz facades] pointcloud_ransac → {len(ransac_out)} facades")
+            return ransac_out
+    except Exception as _exc:
+        print(f"[kmz facades] pointcloud_ransac raised: {_exc}")
+
+    for method in ("meshlab", "region_growing"):
+        try:
+            out = extract_facades(clipped_mesh, method=method, min_area_m2=min_area_m2)
+        except Exception as _exc:  # pragma: no cover — optional dep missing
+            print(f"[kmz facades] {method} extraction raised: {_exc}")
+            continue
+        if len(out) >= 3:
+            print(f"[kmz facades] {method} → {len(out)} facades (min_area={min_area_m2})")
+            return out
+    # Last-resort polygon fallback (boxy walls, but guarantees a mission).
+    from ..kmz_import import facades_from_polygon as _ffp
+    facades, _ = _ffp(polygon_enu, points_xyz)
+    print(f"[kmz facades] polygon fallback → {len(facades)} facades")
+    return facades
+
+
+def _waypoint_hull_polygon(waypoints_xy, expand_m: float = 2.0):
+    """Return the convex hull of waypoint XYs, expanded outward by ``expand_m``.
+
+    The DJI mission polygon (``mission_area_wgs84``) declares a scan REGION
+    that's often much larger than where the drone actually flew; for facade
+    filtering we want "where DJI is flying, + a small margin". Hull of
+    waypoint positions is that boundary.
+    """
+    import numpy as _np
+    wp = _np.asarray(waypoints_xy, dtype=float).reshape(-1, 2)
+    if len(wp) < 3:
+        return []
+    try:
+        from scipy.spatial import ConvexHull as _Hull  # type: ignore
+        hull = _Hull(wp)
+        boundary = wp[hull.vertices]
+    except Exception:
+        mn, mx = wp.min(axis=0), wp.max(axis=0)
+        boundary = _np.array([[mn[0], mn[1]], [mx[0], mn[1]], [mx[0], mx[1]], [mn[0], mx[1]]])
+    c = boundary.mean(axis=0)
+    vecs = boundary - c
+    radii = _np.linalg.norm(vecs, axis=1)
+    radii_safe = _np.where(radii < 1e-9, 1.0, radii)
+    expanded = c + vecs / radii_safe[:, None] * (radii + expand_m)[:, None]
+    return [(float(p[0]), float(p[1]), 0.0) for p in expanded]
+
+
+def _filter_facades_by_camera_coverage(facades, polygon_enu):
+    """Drop facades whose XY centroid is outside the given polygon."""
+    import numpy as _np
+    if not facades or not polygon_enu or len(polygon_enu) < 3:
+        return facades
+    poly = _np.asarray(polygon_enu, dtype=float).reshape(-1, 3)[:, :2]
+
+    def _inside(x: float, y: float) -> bool:
+        inside = False
+        n = len(poly)
+        j = n - 1
+        for i in range(n):
+            xi, yi = poly[i]
+            xj, yj = poly[j]
+            if ((yi > y) != (yj > y)) and (x < (xj - xi) * (y - yi) / (yj - yi + 1e-12) + xi):
+                inside = not inside
+            j = i
+        return inside
+
+    kept = []
+    for f in facades:
+        c = _np.asarray(f.vertices).mean(axis=0)
+        if _inside(float(c[0]), float(c[1])):
+            kept.append(f)
+    print(f"[kmz facades] coverage-polygon filter: {len(facades)} → {len(kept)}")
+    return kept
+
+
+def _tighten_clip_polygon(mission_polygon_enu, points_xyz):
+    """Return the tightest polygon to clip the reconstructed mesh against.
+
+    Uses the convex hull of mid-height cloud points when available (tight to
+    the actual walls), else falls back to the loose DJI mission-area polygon.
+    """
+    from ..kmz_import import tight_footprint_from_cloud_xy as _tight
+    tight = _tight(points_xyz)
+    if tight is not None and len(tight) >= 3:
+        print(f"[kmz facades] tight cloud-hull footprint: {len(tight)} verts (mission polygon had {len(mission_polygon_enu)})")
+        return tight
+    return mission_polygon_enu
 from ..reconstruct import delete_task as delete_sim_task, get_task as get_sim_task, get_task_result as get_sim_result, list_tasks as list_sim_tasks, start_simulation_async
 from ..building_presets import (
     l_shaped_block,
@@ -630,6 +744,8 @@ async def import_kmz(
                 load_pointcloud,
                 pointcloud_to_viewer_arrays,
                 pointcloud_to_mesh_ply,
+                facades_from_polygon,
+                clip_mesh_to_polygon_xy,
             )
             from ..models import ActionType, CameraAction, CameraName as _CameraName, MissionConfig
 
@@ -718,14 +834,22 @@ async def import_kmz(
                 building.label = parsed.name
                 building_id = cached.id
 
-                _set_upload_progress(task_id, 0.82, "Extracting real facades (region growing)…")
+                _set_upload_progress(task_id, 0.82, "Tight-clipping mesh to building + extracting facades…")
+                area_enu_cached = polygon_to_enu(
+                    parsed.mission_area_wgs84, parsed.ref_lat, parsed.ref_lon, parsed.ref_alt,
+                )
                 import io as _io
-                _mesh_for_facades = trimesh.load(
-                    _io.BytesIO(mesh_bytes), file_type="ply", force="mesh", process=False,
+                import numpy as _np_cached
+                pc_xyz_cached = _np_cached.asarray(pc_positions, dtype=_np_cached.float32).reshape(-1, 3)
+                clip_poly_cached = _tighten_clip_polygon(area_enu_cached, pc_xyz_cached)
+                clipped_bytes = clip_mesh_to_polygon_xy(mesh_bytes, clip_poly_cached)
+                _mesh_clipped = trimesh.load(
+                    _io.BytesIO(clipped_bytes), file_type="ply", force="mesh", process=False,
                 )
-                building.facades = extract_facades(
-                    _mesh_for_facades, method="region_growing", min_area_m2=1.0,
-                )
+                building.facades = _kmz_extract_best_facades(_mesh_clipped, clip_poly_cached, pc_xyz_cached)
+                _enu_wps_c = waypoints_to_enu(parsed.waypoints, parsed.ref_lat, parsed.ref_lon, parsed.ref_alt)
+                _hull_poly_c = _waypoint_hull_polygon([(w["x"], w["y"]) for w in _enu_wps_c], expand_m=2.0)
+                building.facades = _filter_facades_by_camera_coverage(building.facades, _hull_poly_c)
             else:
                 _set_upload_progress(task_id, 0.15, f"Loading point cloud ({len(parsed.point_cloud_ply)//1024} KB)…")
                 pcd = load_pointcloud(parsed.point_cloud_ply)
@@ -748,15 +872,23 @@ async def import_kmz(
                 building.label = parsed.name
                 building_id = None
 
-                _set_upload_progress(task_id, 0.80, "Extracting real facades (region growing)…")
+                _set_upload_progress(task_id, 0.80, "Tight-clipping mesh to building + extracting facades…")
+                area_enu_fresh = polygon_to_enu(
+                    parsed.mission_area_wgs84, parsed.ref_lat, parsed.ref_lon, parsed.ref_alt,
+                )
                 import io as _io
                 import trimesh as _trimesh2
-                _mesh_for_facades = _trimesh2.load(
-                    _io.BytesIO(mesh_bytes), file_type="ply", force="mesh", process=False,
+                import numpy as _np_fresh
+                pc_xyz_fresh = _np_fresh.asarray(pcd.points, dtype=_np_fresh.float32)
+                clip_poly_fresh = _tighten_clip_polygon(area_enu_fresh, pc_xyz_fresh)
+                clipped_bytes = clip_mesh_to_polygon_xy(mesh_bytes, clip_poly_fresh)
+                _mesh_clipped = _trimesh2.load(
+                    _io.BytesIO(clipped_bytes), file_type="ply", force="mesh", process=False,
                 )
-                building.facades = extract_facades(
-                    _mesh_for_facades, method="region_growing", min_area_m2=1.0,
-                )
+                building.facades = _kmz_extract_best_facades(_mesh_clipped, clip_poly_fresh, pc_xyz_fresh)
+                _enu_wps_f = waypoints_to_enu(parsed.waypoints, parsed.ref_lat, parsed.ref_lon, parsed.ref_alt)
+                _hull_poly_f = _waypoint_hull_polygon([(w["x"], w["y"]) for w in _enu_wps_f], expand_m=2.0)
+                building.facades = _filter_facades_by_camera_coverage(building.facades, _hull_poly_f)
 
             _set_upload_progress(task_id, 0.88, "Saving imported building…")
 
@@ -1147,15 +1279,45 @@ def refine_kmz_building(building_id: str, req: RefineKmzRequest):
             )
             building.label = name
 
-            _set_upload_progress(task_id, 0.78, "Extracting real facades (region growing)…")
+            _set_upload_progress(task_id, 0.78, "Tight-clipping mesh to building + extracting facades…")
+            from ..kmz_import import (
+                polygon_to_enu as _polygon_to_enu,
+                clip_mesh_to_polygon_xy as _clip_mesh_to_polygon_xy,
+            )
+            mission_area_wgs84 = [tuple(p) for p in props.get("mission_area_wgs84", [])]
+            area_enu_refine = _polygon_to_enu(mission_area_wgs84, ref_lat, ref_lon, ref_alt)
             import io as _io
             import trimesh as _trimesh3
-            _mesh_for_facades = _trimesh3.load(
-                _io.BytesIO(mesh_bytes), file_type="ply", force="mesh", process=False,
+            import numpy as _np_ref
+            pc_xyz_ref = _np_ref.asarray(pcd.points, dtype=_np_ref.float32)
+            clip_poly_ref = _tighten_clip_polygon(area_enu_refine, pc_xyz_ref)
+            clipped_bytes_ref = _clip_mesh_to_polygon_xy(mesh_bytes, clip_poly_ref)
+            _mesh_clipped_ref = _trimesh3.load(
+                _io.BytesIO(clipped_bytes_ref), file_type="ply", force="mesh", process=False,
             )
-            building.facades = extract_facades(
-                _mesh_for_facades, method="region_growing", min_area_m2=1.0,
-            )
+            building.facades = _kmz_extract_best_facades(_mesh_clipped_ref, clip_poly_ref, pc_xyz_ref)
+            # Restrict to facades inside the DJI flight envelope (waypoint hull + 2 m margin)
+            from ..kmz_import import ParsedWaypoint as _ParsedWaypoint_ref, waypoints_to_enu as _wp_enu_ref
+            _waypoints_raw_ref = props.get("waypoints_raw", [])
+            if _waypoints_raw_ref:
+                _parsed_wps_ref = [
+                    _ParsedWaypoint_ref(
+                        index=int(w.get("index", i)),
+                        lon=float(w["lon"]), lat=float(w["lat"]),
+                        alt_egm96=float(w["alt_egm96"]),
+                        heading_deg=float(w["heading_deg"]),
+                        gimbal_pitch_deg=float(w["gimbal_pitch_deg"]),
+                        speed_ms=float(w.get("speed_ms", 2.0)),
+                        gimbal_yaw_raw_deg=float(w.get("gimbal_yaw_raw_deg", 0.0)),
+                        gimbal_heading_mode=str(w.get("gimbal_heading_mode", "smoothTransition")),
+                        gimbal_yaw_base=str(w.get("gimbal_yaw_base", "aircraft")),
+                        smart_oblique_poses=[],
+                    )
+                    for i, w in enumerate(_waypoints_raw_ref)
+                ]
+                _enu_wps_r = _wp_enu_ref(_parsed_wps_ref, ref_lat, ref_lon, ref_alt)
+                _hull_poly_r = _waypoint_hull_polygon([(w["x"], w["y"]) for w in _enu_wps_r], expand_m=2.0)
+                building.facades = _filter_facades_by_camera_coverage(building.facades, _hull_poly_r)
 
             # --- Persist updated mesh_viewer back onto the BuildingRecord ---
             _set_upload_progress(task_id, 0.85, "Updating building record…")
@@ -1920,6 +2082,10 @@ class RewriteGimbalsRequest(BaseModel):
     max_distance_m: float = Field(default=60.0, gt=0.0, le=500.0)
     pitch_margin_deg: float = Field(default=2.0, ge=0.0, le=20.0)
     preserve_heading: bool = True
+    # NEN-2767 enrichment: cap flight speed + collapse SmartOblique rosette to
+    # a single per-waypoint photo. Null/False means keep the DJI defaults.
+    flight_speed_ms: float | None = Field(default=3.0, ge=0.5, le=15.0)
+    strip_smart_oblique: bool = True
 
 
 @router.post("/versions/{version_id}/rewrite-gimbals")
@@ -1953,6 +2119,16 @@ def rewrite_gimbals(version_id: str, req: RewriteGimbalsRequest | None = None):
         pitch_margin_deg=params.pitch_margin_deg,
         preserve_heading=params.preserve_heading,
     )
+
+    # NEN-2767 enrichment: override speed + strip SmartOblique rosette so every
+    # waypoint captures a single perpendicular photo. Trajectory stays DJI's.
+    if params.flight_speed_ms is not None or params.strip_smart_oblique:
+        from ..models import ActionType as _ActionType, CameraAction as _CameraAction, CameraName as _CameraName
+        for w in new_waypoints:
+            if params.flight_speed_ms is not None:
+                w.speed_ms = float(params.flight_speed_ms)
+            if params.strip_smart_oblique:
+                w.actions = [_CameraAction(action_type=_ActionType.TAKE_PHOTO, camera=_CameraName.WIDE)]
 
     threejs_data = prepare_threejs_data(version.building, new_waypoints)
     # Preserve the original point cloud + mission area if they were attached.

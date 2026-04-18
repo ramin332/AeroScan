@@ -29,7 +29,7 @@ from xml.etree import ElementTree as ET
 import numpy as np
 
 from ._profiling import timed
-from .models import meters_per_deg
+from .models import Facade, meters_per_deg
 
 WPML_NS = "{http://www.dji.com/wpmz/1.0.6}"
 KML_NS = "{http://www.opengis.net/kml/2.2}"
@@ -446,6 +446,874 @@ def polygon_to_enu(
     ]
 
 
+def tight_footprint_from_cloud_xy(
+    points_xyz: np.ndarray,
+    low_pct: float = 30.0,
+    high_pct: float = 70.0,
+) -> list[tuple[float, float, float]] | None:
+    """Convex hull of mid-height cloud points → tight building footprint.
+
+    DJI mission polygons are generous (often 10–20 m larger than the building
+    in each direction) so clipping the reconstructed mesh against the polygon
+    still leaves a lot of terrain. Mid-height points almost exclusively live
+    on building walls — their 2D convex hull gives us a much tighter clip
+    region. Returns a CCW-oriented (x,y,0) polygon, or None if the cloud is
+    too sparse.
+    """
+    pts = np.asarray(points_xyz, dtype=float).reshape(-1, 3)
+    if len(pts) < 3:
+        return None
+    z_lo = float(np.percentile(pts[:, 2], low_pct))
+    z_hi = float(np.percentile(pts[:, 2], high_pct))
+    mid = pts[(pts[:, 2] > z_lo) & (pts[:, 2] < z_hi)]
+    if len(mid) < 3:
+        mid = pts
+    try:
+        from scipy.spatial import ConvexHull
+        hull = ConvexHull(mid[:, :2])
+    except Exception as exc:
+        print(f"[kmz_import] tight_footprint_from_cloud_xy hull failed: {exc}")
+        return None
+    poly_xy = mid[hull.vertices, :2]
+    sa = 0.5 * float(np.sum(
+        poly_xy[:, 0] * np.roll(poly_xy[:, 1], -1)
+        - np.roll(poly_xy[:, 0], -1) * poly_xy[:, 1]
+    ))
+    if sa < 0:
+        poly_xy = poly_xy[::-1]
+    return [(float(x), float(y), 0.0) for x, y in poly_xy]
+
+
+def _points_in_polygon_xy(points_xy: np.ndarray, polygon_xy: np.ndarray) -> np.ndarray:
+    """Vectorised even-odd ray-cast. ``points_xy`` (N,2), ``polygon_xy`` (M,2)."""
+    n_pts = len(points_xy)
+    inside = np.zeros(n_pts, dtype=bool)
+    m = len(polygon_xy)
+    for i in range(m):
+        p1 = polygon_xy[i]
+        p2 = polygon_xy[(i + 1) % m]
+        y_between = (p1[1] > points_xy[:, 1]) != (p2[1] > points_xy[:, 1])
+        if not y_between.any():
+            continue
+        dy = p2[1] - p1[1]
+        if abs(dy) < 1e-12:
+            continue
+        x_cross = p1[0] + (p2[0] - p1[0]) * (points_xy[:, 1] - p1[1]) / dy
+        crosses = y_between & (points_xy[:, 0] < x_cross)
+        inside ^= crosses
+    return inside
+
+
+@timed("clip_mesh_to_polygon_xy")
+def clip_mesh_to_polygon_xy(
+    mesh_bytes: bytes,
+    polygon_enu: list[tuple[float, float, float]],
+    margin_m: float = 1.0,
+) -> bytes:
+    """Remove mesh faces whose centroid falls outside the mission-area polygon.
+
+    The DJI mission polygon encloses exactly the building we care about. Faces
+    outside (sidewalks, neighbouring structures, reconstruction noise) just
+    confuse region-growing. A small outward ``margin_m`` keeps edge-wall
+    triangles when the polygon is drawn tight against the building.
+
+    Returns PLY bytes of the clipped mesh. Falls back to the input mesh if
+    clipping would leave fewer than 100 triangles (polygon likely mis-scaled).
+    """
+    import io
+    import trimesh
+
+    poly = np.array(polygon_enu, dtype=float)
+    if len(poly) > 1 and np.allclose(poly[0, :2], poly[-1, :2]):
+        poly = poly[:-1]
+    poly_xy = poly[:, :2]
+    if len(poly_xy) < 3:
+        return mesh_bytes
+
+    # Expand outward by margin_m from the polygon centroid so border faces
+    # aren't clipped off (simple Minkowski-style scale; good enough for roughly
+    # convex mission polygons).
+    center = poly_xy.mean(axis=0)
+    vecs = poly_xy - center
+    scales = 1.0 + margin_m / np.maximum(np.linalg.norm(vecs, axis=1), 0.1)
+    poly_xy_expanded = center + vecs * scales[:, None]
+
+    m = trimesh.load(io.BytesIO(mesh_bytes), file_type="ply", force="mesh", process=False)
+    if len(m.faces) == 0:
+        return mesh_bytes
+    centroids_xy = m.triangles.mean(axis=1)[:, :2]
+    keep = _points_in_polygon_xy(centroids_xy, poly_xy_expanded)
+    n_keep = int(keep.sum())
+    print(f"[kmz_import] clip_mesh_to_polygon_xy: {len(m.faces)} → {n_keep} triangles")
+    if n_keep < 100:
+        return mesh_bytes  # polygon probably wrong frame; don't clip
+
+    clipped = trimesh.Trimesh(vertices=m.vertices, faces=m.faces[keep], process=False)
+    clipped.remove_unreferenced_vertices()
+    return clipped.export(file_type="ply")
+
+
+# ---------------------------------------------------------------------------
+# Point-cloud RANSAC plane segmentation (DJI photogrammetry-aware)
+# ---------------------------------------------------------------------------
+
+
+@timed("facades_from_pointcloud_cgal")
+def facades_from_pointcloud_cgal(
+    points_enu: np.ndarray,
+    polygon_enu: list[tuple[float, float, float]] | None,
+    *,
+    algorithm: str = "region_growing",
+    min_points: int = 40,
+    epsilon: float = 0.05,
+    cluster_epsilon: float = 0.25,
+    normal_threshold: float = 0.92,
+    probability: float = 0.002,
+    rg_k_neighbors: int = 12,
+    wall_normal_z_max: float = 0.35,
+    roof_normal_z_min: float = 0.70,
+    min_wall_length_m: float = 0.6,
+    min_wall_area_m2: float = 0.5,
+    min_roof_area_m2: float = 0.5,
+    min_tilted_area_m2: float = 0.4,
+    ground_skip_m: float = 1.0,
+    jet_neighbors: int = 18,
+    min_density_per_m2: float = 25.0,
+    bbox_percentile: float = 5.0,
+    enable_coplanar_merge: bool = False,
+) -> list[Facade]:
+    """Extract facades using CGAL Shape Detection + Verdie parallel-snap.
+
+    Multi-plane segmentation tuned for **NEN-2767 building inspection** —
+    biased toward many small facets (dormers, sills, balconies, parapets)
+    over few large planes, because the inspection gimbal needs to square
+    up on small defect targets, not just the main walls.
+
+    Algorithms (via ``CGAL::Shape_detection``):
+      * ``algorithm="region_growing"`` (default) — grows regions locally
+        from high-planarity seeds, k-nearest neighbors, stopping when a
+        candidate point fails the ε / normal-agreement test. Each point
+        belongs to at most one region. By construction this produces
+        many small, connected, non-overlapping facets. This is CGAL's
+        native answer to "many small local surfaces."
+      * ``algorithm="efficient_RANSAC"`` — **Schnabel et al. 2007**,
+        greedy global detection. Faster on huge clouds but biased toward
+        a few large dominant planes. Use for LOD-style reconstruction.
+
+    Post-processing:
+      * **Parallel-snap** (Verdie et al. 2015, "LOD Generation for Urban
+        Scenes") — planes whose normals agree within 5° share one refit
+        normal, weighted by inlier count. Fixes slight misalignment that
+        would otherwise make rectangles slice through each other. CGAL's
+        C++ ``regularize_planes`` isn't in the Python bindings, so the
+        snap is done in numpy. Companion coplanar-merge is OFF by default
+        because it consolidates spatially-separated small facets — the
+        opposite of what the inspection gimbal needs.
+      * **PCA-oriented rectangle** per region — each plane's bounding
+        rectangle is built in its own plane frame (5/95 percentile clamp
+        on PCA u/v axes), so pitched roofs, dormers, chamfers, and
+        canopies keep their real tilt instead of being axis-aligned.
+      * **Density gate** — ghost planes with < ``min_density_per_m2``
+        inlier density are dropped.
+      * Classification into wall / roof / tilted is only for tagging
+        and gimbal-pitch selection — geometry uses each plane's own
+        normal, not a forced vertical/horizontal.
+
+    Pipeline:
+      1. Clip cloud to ``polygon_enu`` (XY).
+      2. Drop bottom ``ground_skip_m`` of Z range (street/terrain).
+      3. Insert into ``CGAL::Point_set_3``, estimate normals with
+         ``jet_estimate_normals``.
+      4. Run region-growing (or efficient-RANSAC).
+      5. Fit plane per region via SVD.
+      6. Parallel-snap regularization.
+      7. Density gate + PCA-oriented rectangle + classification.
+    """
+    try:
+        from CGAL.CGAL_Kernel import Point_3
+        from CGAL.CGAL_Point_set_3 import Point_set_3
+        from CGAL.CGAL_Shape_detection import efficient_RANSAC, region_growing
+        from CGAL.CGAL_Point_set_processing_3 import jet_estimate_normals
+    except ImportError as e:
+        raise RuntimeError(f"CGAL Python bindings not available: {e}")
+
+    import re as _re
+
+    pts_all = np.asarray(points_enu, dtype=np.float64).reshape(-1, 3)
+    if len(pts_all) < min_points * 2:
+        return []
+
+    if polygon_enu is not None and len(polygon_enu) >= 3:
+        poly = np.asarray(polygon_enu, dtype=float)
+        if len(poly) > 1 and np.allclose(poly[0, :2], poly[-1, :2]):
+            poly = poly[:-1]
+        mask = _points_in_polygon_xy(pts_all[:, :2], poly[:, :2])
+        pts_all = pts_all[mask]
+        if len(pts_all) < min_points * 2:
+            return []
+
+    ground_z = float(np.percentile(pts_all[:, 2], 5.0))
+    top_z = float(np.percentile(pts_all[:, 2], 98.0))
+    pts_all = pts_all[pts_all[:, 2] >= ground_z + ground_skip_m]
+    if len(pts_all) < min_points * 2:
+        return []
+
+    ps = Point_set_3()
+    ps.add_normal_map()
+    for p in pts_all:
+        ps.insert(Point_3(float(p[0]), float(p[1]), float(p[2])))
+    jet_estimate_normals(ps, jet_neighbors)
+
+    shape_map = ps.add_int_map("aeroscan_shape")
+    algo_name = algorithm.lower().strip()
+    if algo_name == "region_growing":
+        # CGAL region_growing — grows regions locally from high-planarity
+        # seeds. Each point belongs to at most one region; regions stop
+        # at the first neighbor that doesn't match (distance +
+        # normal-agreement). Produces many small connected regions by
+        # design — the native answer to "many small facets" without
+        # manual subdivision.
+        n_regions = region_growing(
+            ps, shape_map,
+            min_points=int(min_points),
+            epsilon=float(epsilon),
+            cluster_epsilon=float(cluster_epsilon),
+            normal_treshold=float(normal_threshold),  # sic: CGAL typo
+            k=int(rg_k_neighbors),
+        )
+        descriptions = [f"region {i}" for i in range(int(n_regions))]
+    else:
+        # Efficient-RANSAC (Schnabel 2007) — greedy global detection.
+        # Faster on huge clouds but biased toward a few large dominant
+        # planes. Keep as an alternative for LOD-style reconstruction.
+        descriptions = efficient_RANSAC(
+            ps, shape_map,
+            min_points=int(min_points),
+            epsilon=float(epsilon),
+            cluster_epsilon=float(cluster_epsilon),
+            normal_threshold=float(normal_threshold),
+            probability=float(probability),
+            planes=True,
+        )
+
+    # Bucket point indices by shape/region id.
+    n_pts = ps.number_of_points()
+    buckets: dict[int, list[int]] = {}
+    for i in range(n_pts):
+        sid = shape_map.get(i)
+        if sid < 0:
+            continue
+        buckets.setdefault(sid, []).append(i)
+
+    # Fit a plane per bucket via SVD (works for both algorithms; region
+    # growing doesn't return plane equations, and efficient_RANSAC's
+    # parser was fragile on non-English locales).
+    plane_params: dict[int, tuple[np.ndarray, float]] = {}
+    for sid, idxs in buckets.items():
+        if len(idxs) < 3:
+            continue
+        pts_sub = pts_all[np.asarray(idxs, dtype=np.int64)]
+        centroid = pts_sub.mean(axis=0)
+        _, _, vh = np.linalg.svd(pts_sub - centroid, full_matrices=False)
+        normal = vh[2]
+        normal /= float(np.linalg.norm(normal)) or 1.0
+        d = float(np.dot(normal, centroid))
+        plane_params[sid] = (normal, d)
+
+    # ---- Plane regularization (Verdie et al. 2015, LOD-Generation) ----
+    # CGAL's C++ regularize_planes isn't exposed in the Python bindings,
+    # so we do the two most visually-important steps here:
+    #   (1) Orientation clustering + parallel snap — planes whose normals
+    #       agree within `parallel_tol_deg` share one refit normal
+    #       (weighted mean by inlier count).
+    #   (2) Coplanar merge — within an orientation cluster, planes whose
+    #       signed-distance d values agree within `coplanar_tol_m` pool
+    #       their inliers. This removes duplicate hypotheses fit to the
+    #       same wall with a 5 mm offset (the "plates through each other"
+    #       artifact of raw Schnabel RANSAC).
+    parallel_cos = float(np.cos(np.radians(5.0)))
+    coplanar_tol = max(0.10, float(epsilon) * 1.5)
+
+    # Keep only buckets that actually received inliers.
+    live = [sid for sid, ix in buckets.items() if len(ix) >= min_points]
+
+    # Group shape ids by normal similarity (greedy union-find).
+    groups: list[list[int]] = []
+    assigned: set[int] = set()
+    for sid in live:
+        if sid in assigned:
+            continue
+        n_a, _ = plane_params[sid]
+        grp = [sid]
+        assigned.add(sid)
+        for sid_b in live:
+            if sid_b in assigned:
+                continue
+            n_b, _ = plane_params[sid_b]
+            if abs(float(np.dot(n_a, n_b))) >= parallel_cos:
+                grp.append(sid_b)
+                assigned.add(sid_b)
+        groups.append(grp)
+
+    # For each group: (1) snap to common normal, (2) merge coplanar subs.
+    regularized: dict[int, tuple[np.ndarray, float, list[int]]] = {}
+    for grp in groups:
+        weights = np.array([len(buckets[s]) for s in grp], dtype=float)
+        # Flip normals inside the group to align before averaging.
+        n0 = plane_params[grp[0]][0]
+        aligned_normals = []
+        for s in grp:
+            n_s = plane_params[s][0].copy()
+            if float(np.dot(n_s, n0)) < 0:
+                n_s = -n_s
+            aligned_normals.append(n_s)
+        nstack = np.stack(aligned_normals)
+        common_n = (nstack * weights[:, None]).sum(axis=0)
+        cnl = float(np.linalg.norm(common_n))
+        if cnl > 1e-9:
+            common_n = common_n / cnl
+        else:
+            common_n = n0
+
+        # Signed-distance (plane eq: n·x = d) per sub-plane using the
+        # common normal, computed from inliers for robustness.
+        sub_entries = []
+        for s in grp:
+            inl = pts_all[np.asarray(buckets[s], dtype=np.int64)]
+            d_s = float(np.mean(inl @ common_n))
+            sub_entries.append((d_s, s))
+
+        # Coplanar merge is OFF by default — we *want* many small facets
+        # (NEN-2767 inspection targets). The merge step consolidates
+        # spatially-separated facets on the same wall plane into one big
+        # plane, which is the opposite of what the gimbal needs. Enable
+        # only when the goal is LOD-style reconstruction.
+        sub_entries.sort(key=lambda t: t[0])
+        if enable_coplanar_merge:
+            merged: list[tuple[float, list[int]]] = []
+            for d_s, s in sub_entries:
+                if merged and abs(merged[-1][0] - d_s) <= coplanar_tol:
+                    prev_d, prev_ids = merged[-1]
+                    prev_w = sum(len(buckets[pid]) for pid in prev_ids)
+                    new_w = len(buckets[s])
+                    new_d = (prev_d * prev_w + d_s * new_w) / (prev_w + new_w)
+                    prev_ids.append(s)
+                    merged[-1] = (new_d, prev_ids)
+                else:
+                    merged.append((d_s, [s]))
+        else:
+            merged = [(d_s, [s]) for d_s, s in sub_entries]
+
+        # Emit one regularized plane per merged cluster.
+        for d_final, ids in merged:
+            pooled: list[int] = []
+            for s in ids:
+                pooled.extend(buckets[s])
+            # Pick a representative sid (biggest sub-plane gets to own it).
+            rep = max(ids, key=lambda x: len(buckets[x]))
+            regularized[rep] = (common_n, d_final, pooled)
+
+    merged_count = len(live) - len(regularized)
+    if merged_count > 0:
+        print(
+            f"[cgal facades] regularization: {len(live)} raw planes → "
+            f"{len(regularized)} after parallel-snap + coplanar-merge "
+            f"({merged_count} merged; Verdie 2015)"
+        )
+
+    cloud_centroid = pts_all.mean(axis=0)
+    facades: list[Facade] = []
+    wall_index = 0
+    roof_index = 0
+    tilted_index = 0
+    rejected_small = 0
+
+    for sid, (reg_normal, _reg_d, pooled_idxs) in regularized.items():
+        if len(pooled_idxs) < min_points:
+            continue
+        inl_pts = pts_all[np.asarray(pooled_idxs, dtype=np.int64)]
+        normal = reg_normal.copy()
+        nlen = float(np.linalg.norm(normal))
+        if nlen < 1e-9:
+            continue
+        normal = normal / nlen
+        nz = abs(float(normal[2]))
+
+        # Orient normal outward (away from cloud centroid).
+        plane_centroid = inl_pts.mean(axis=0)
+        if np.dot(normal, plane_centroid - cloud_centroid) < 0:
+            normal = -normal
+
+        # Build an in-plane orthonormal basis (u_dir, v_dir).
+        # For near-vertical walls prefer u_dir horizontal (X-Y plane) so v_dir
+        # stays close to world-up — keeps "wall rectangles" upright.
+        # For anything tilted/horizontal fall back to a PCA basis on the plane.
+        world_up = np.array([0.0, 0.0, 1.0])
+        horiz = np.array([normal[1], -normal[0], 0.0])
+        hnorm = float(np.linalg.norm(horiz))
+        if nz <= wall_normal_z_max and hnorm > 1e-6:
+            u_dir = horiz / hnorm
+            v_dir = np.cross(normal, u_dir)
+            v_dir /= float(np.linalg.norm(v_dir)) or 1.0
+        else:
+            # Project inliers into the plane and PCA for best in-plane axes.
+            centered = inl_pts - plane_centroid
+            centered = centered - np.outer(centered @ normal, normal)
+            if len(centered) >= 3:
+                _, _, vh = np.linalg.svd(centered, full_matrices=False)
+                u_dir = vh[0]
+                u_dir = u_dir - float(np.dot(u_dir, normal)) * normal
+                u_len = float(np.linalg.norm(u_dir))
+                if u_len < 1e-6:
+                    continue
+                u_dir /= u_len
+            else:
+                ref = world_up if abs(normal[2]) < 0.9 else np.array([1.0, 0.0, 0.0])
+                u_dir = np.cross(normal, ref)
+                u_dir /= float(np.linalg.norm(u_dir)) or 1.0
+            v_dir = np.cross(normal, u_dir)
+            v_dir /= float(np.linalg.norm(v_dir)) or 1.0
+
+        # Oriented bounding rectangle in the plane frame — tight percentile
+        # clamp suppresses straggler inliers that would otherwise stretch
+        # the rectangle across the whole scene.
+        rel = inl_pts - plane_centroid
+        us = rel @ u_dir
+        vs = rel @ v_dir
+        pct_lo = float(bbox_percentile)
+        pct_hi = 100.0 - pct_lo
+        u_min, u_max = float(np.percentile(us, pct_lo)), float(np.percentile(us, pct_hi))
+        v_min, v_max = float(np.percentile(vs, pct_lo)), float(np.percentile(vs, pct_hi))
+        width = u_max - u_min
+        height = v_max - v_min
+        area = max(width * height, 1e-6)
+
+        # Density gate: reject "ghost planes" where a handful of inliers
+        # got spread across a huge rectangle floating in the air. Only
+        # keep planes with enough inliers per m² to be a real surface.
+        inlier_density = len(inl_pts) / area
+        if inlier_density < min_density_per_m2:
+            rejected_small += 1
+            continue
+
+        # Classify + size gate.
+        if nz <= wall_normal_z_max:
+            # Min-dimension check uses the smaller of (min_wall_length,
+            # 0.4m floor) so we keep small sills, balconies, dormer
+            # walls — all targets for the inspection gimbal.
+            min_dim = min(min_wall_length_m, 0.4)
+            if (
+                min(width, height) < min_dim
+                or max(width, height) < min_wall_length_m
+                or area < min_wall_area_m2
+            ):
+                rejected_small += 1
+                continue
+            tag, label_pref = "21.1", f"wall_{wall_index}"
+            wall_index += 1
+        elif nz >= roof_normal_z_min:
+            if area < min_roof_area_m2:
+                rejected_small += 1
+                continue
+            tag, label_pref = "27.1", f"roof_{roof_index}"
+            roof_index += 1
+        else:
+            # Tilted plane (dormer, pitched roof slope, canopy, chamfer).
+            if area < min_tilted_area_m2:
+                rejected_small += 1
+                continue
+            tag, label_pref = "27.2", f"tilted_{tilted_index}"
+            tilted_index += 1
+
+        base = plane_centroid + u_min * u_dir + v_min * v_dir
+        corners = np.array([
+            base,
+            base + width * u_dir,
+            base + width * u_dir + height * v_dir,
+            base + height * v_dir,
+        ])
+        facades.append(Facade(
+            vertices=corners,
+            normal=normal,
+            component_tag=tag,
+            label=label_pref,
+            index=len(facades),
+        ))
+
+    print(
+        f"[cgal facades] {algo_name} detected {len(descriptions)} shapes → "
+        f"{len(regularized)} regularized → {len(facades)} facets "
+        f"({wall_index} walls + {roof_index} roofs + {tilted_index} tilted; "
+        f"{rejected_small} rejected) from {len(pts_all)} pts "
+        f"(ε={epsilon}, cluster_ε={cluster_epsilon}, k={rg_k_neighbors})"
+    )
+    return facades
+
+
+def _ransac_2d_lines(
+    points_xy: np.ndarray,
+    *,
+    distance_threshold: float = 0.25,
+    min_inliers: int = 250,
+    max_lines: int = 20,
+    iters_per_line: int = 400,
+    seed: int = 42,
+) -> list[tuple[np.ndarray, np.ndarray, np.ndarray]]:
+    """Iteratively fit 2D lines via RANSAC; returns [(inlier_idx, centroid, direction), ...].
+
+    ``direction`` is a unit 2D tangent; the implicit line passes through
+    ``centroid`` with normal perpendicular to ``direction``.
+    """
+    rng = np.random.default_rng(seed)
+    n = len(points_xy)
+    if n < min_inliers:
+        return []
+    alive = np.ones(n, dtype=bool)
+    results: list[tuple[np.ndarray, np.ndarray, np.ndarray]] = []
+    for _line_i in range(max_lines):
+        active_idx = np.where(alive)[0]
+        if len(active_idx) < min_inliers:
+            break
+        active_pts = points_xy[active_idx]
+        best_inl: np.ndarray | None = None
+        best_normal: np.ndarray | None = None
+        best_centroid: np.ndarray | None = None
+        for _ in range(iters_per_line):
+            i0, i1 = rng.choice(len(active_pts), size=2, replace=False)
+            p0 = active_pts[i0]
+            p1 = active_pts[i1]
+            d = p1 - p0
+            dl = float(np.linalg.norm(d))
+            if dl < 1e-6:
+                continue
+            d /= dl
+            norm = np.array([-d[1], d[0]])
+            dist = np.abs((active_pts - p0) @ norm)
+            inl = np.where(dist <= distance_threshold)[0]
+            if best_inl is None or len(inl) > len(best_inl):
+                best_inl = inl
+                best_normal = norm
+                best_centroid = p0
+        if best_inl is None or len(best_inl) < min_inliers:
+            break
+        # SVD refinement on inlier set
+        inl_pts = active_pts[best_inl]
+        c = inl_pts.mean(axis=0)
+        _, _, vh = np.linalg.svd(inl_pts - c, full_matrices=False)
+        line_dir = vh[0]
+        norm_ref = np.array([-line_dir[1], line_dir[0]])
+        dist = np.abs((active_pts - c) @ norm_ref)
+        inl_refined = np.where(dist <= distance_threshold)[0]
+        if len(inl_refined) < min_inliers:
+            break
+        global_inl = active_idx[inl_refined]
+        results.append((global_inl, c, line_dir))
+        alive[global_inl] = False
+    return results
+
+
+@timed("facades_from_pointcloud_ransac")
+def facades_from_pointcloud_ransac(
+    points_enu: np.ndarray,
+    polygon_enu: list[tuple[float, float, float]] | None,
+    *,
+    wall_distance_threshold: float = 0.25,
+    wall_min_inliers: int = 300,
+    max_walls: int = 20,
+    wall_slice_low_frac: float = 0.25,
+    wall_slice_high_frac: float = 0.90,
+    roof_distance_threshold: float = 0.30,
+    roof_min_inliers: int = 500,
+    roof_normal_z_min: float = 0.85,
+    ground_skip_m: float = 1.0,
+    min_wall_length_m: float = 2.0,
+    min_wall_area_m2: float = 6.0,
+    min_roof_area_m2: float = 8.0,
+    num_iterations: int = 500,
+) -> list[Facade]:
+    """Extract facades via vertical-prior RANSAC on a DJI point cloud.
+
+    Walls are treated as 2D line fits on a top-down projection of a
+    mid-height Z slice — exploits the vertical-wall prior, so the fit is
+    low-DOF and robust to photogrammetric noise. Roofs come from one
+    horizontal-plane 3D RANSAC on the upper part of the cloud.
+
+    Pipeline:
+      1. Clip cloud to ``polygon_enu`` (XY).
+      2. Compute ground_z / top_z percentiles; drop points below
+         ``ground_z + ground_skip_m``.
+      3. Wall pass: take points with Z in
+         [low_frac, high_frac] × (top_z - ground_z). Project to XY, run
+         iterative 2D-line RANSAC. Each line becomes a wall extruded from
+         ground_z to top_z.
+      4. Roof pass: run 3D plane RANSAC on points with Z > high_frac;
+         accept only if |n_z| ≥ ``roof_normal_z_min``.
+    """
+    import open3d as o3d  # deferred: heavy import
+
+    pts_all = np.asarray(points_enu, dtype=np.float64).reshape(-1, 3)
+    if len(pts_all) < wall_min_inliers * 2:
+        return []
+
+    if polygon_enu is not None and len(polygon_enu) >= 3:
+        poly = np.asarray(polygon_enu, dtype=float)
+        if len(poly) > 1 and np.allclose(poly[0, :2], poly[-1, :2]):
+            poly = poly[:-1]
+        mask = _points_in_polygon_xy(pts_all[:, :2], poly[:, :2])
+        pts_all = pts_all[mask]
+        if len(pts_all) < wall_min_inliers * 2:
+            return []
+
+    ground_z = float(np.percentile(pts_all[:, 2], 5.0))
+    top_z = float(np.percentile(pts_all[:, 2], 98.0))
+    height_range = max(1.0, top_z - ground_z)
+    pts_all = pts_all[pts_all[:, 2] >= ground_z + ground_skip_m]
+    if len(pts_all) < wall_min_inliers * 2:
+        return []
+
+    facades: list[Facade] = []
+
+    # --- Wall pass: 2D line RANSAC on mid-height slice ----------------------
+    z_low = ground_z + wall_slice_low_frac * height_range
+    z_high = ground_z + wall_slice_high_frac * height_range
+    slice_mask = (pts_all[:, 2] >= z_low) & (pts_all[:, 2] <= z_high)
+    slice_xyz = pts_all[slice_mask]
+    wall_index = 0
+    if len(slice_xyz) >= wall_min_inliers:
+        slice_xy = slice_xyz[:, :2]
+        cloud_centroid_xy = slice_xy.mean(axis=0)
+        lines = _ransac_2d_lines(
+            slice_xy,
+            distance_threshold=wall_distance_threshold,
+            min_inliers=wall_min_inliers,
+            max_lines=max_walls,
+            iters_per_line=num_iterations,
+        )
+        for inl_idx, line_c, line_dir in lines:
+            inl_pts = slice_xy[inl_idx]
+            # Project onto line to get length extent
+            proj = (inl_pts - line_c) @ line_dir
+            p_min = float(np.percentile(proj, 2))
+            p_max = float(np.percentile(proj, 98))
+            length = p_max - p_min
+            if length < min_wall_length_m:
+                continue
+            h = top_z - ground_z
+            if length * h < min_wall_area_m2:
+                continue
+            # Outward normal: away from cloud centroid
+            normal_xy = np.array([-line_dir[1], line_dir[0]])
+            if np.dot(normal_xy, line_c - cloud_centroid_xy) < 0:
+                normal_xy = -normal_xy
+            normal = np.array([float(normal_xy[0]), float(normal_xy[1]), 0.0])
+            end0 = line_c + p_min * line_dir
+            end1 = line_c + p_max * line_dir
+            corners = np.array([
+                [end0[0], end0[1], ground_z],
+                [end1[0], end1[1], ground_z],
+                [end1[0], end1[1], top_z],
+                [end0[0], end0[1], top_z],
+            ])
+            facades.append(Facade(
+                vertices=corners,
+                normal=normal,
+                component_tag="21.1",
+                label=f"wall_{wall_index}",
+                index=len(facades),
+            ))
+            wall_index += 1
+
+    # --- Roof pass: one 3D horizontal plane at the top ---------------------
+    roof_mask = pts_all[:, 2] >= ground_z + wall_slice_high_frac * height_range
+    roof_xyz = pts_all[roof_mask]
+    roof_index = 0
+    if len(roof_xyz) >= roof_min_inliers:
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(roof_xyz)
+        try:
+            (a, b, c, _d), inl = pcd.segment_plane(
+                distance_threshold=roof_distance_threshold,
+                ransac_n=3,
+                num_iterations=num_iterations,
+            )
+            if len(inl) >= roof_min_inliers:
+                nrm = np.array([a, b, c], dtype=float)
+                nrm_len = float(np.linalg.norm(nrm))
+                if nrm_len > 1e-6:
+                    nrm /= nrm_len
+                    if abs(nrm[2]) >= roof_normal_z_min:
+                        roof_pts = np.asarray(pcd.points)[inl]
+                        x_min, x_max = float(np.percentile(roof_pts[:, 0], 2)), float(np.percentile(roof_pts[:, 0], 98))
+                        y_min, y_max = float(np.percentile(roof_pts[:, 1], 2)), float(np.percentile(roof_pts[:, 1], 98))
+                        if (x_max - x_min) * (y_max - y_min) >= min_roof_area_m2:
+                            z_mean = float(np.mean(roof_pts[:, 2]))
+                            corners = np.array([
+                                [x_min, y_min, z_mean],
+                                [x_max, y_min, z_mean],
+                                [x_max, y_max, z_mean],
+                                [x_min, y_max, z_mean],
+                            ])
+                            facades.append(Facade(
+                                vertices=corners,
+                                normal=np.array([0.0, 0.0, 1.0]),
+                                component_tag="27.1",
+                                label=f"roof_{roof_index}",
+                                index=len(facades),
+                            ))
+                            roof_index += 1
+        except Exception as e:
+            print(f"[ransac facades] roof plane fit failed: {e}")
+
+    print(
+        f"[ransac facades] extracted {len(facades)} facades "
+        f"({wall_index} walls + {roof_index} roofs) from {len(pts_all)} pts"
+    )
+    return facades
+
+
+# ---------------------------------------------------------------------------
+# Polygon → Facade synthesis (validated against reference point cloud)
+# ---------------------------------------------------------------------------
+
+
+@timed("facades_from_polygon")
+def facades_from_polygon(
+    polygon_enu: list[tuple[float, float, float]],
+    points_enu: np.ndarray,
+    *,
+    slab_depth_m: float = 5.0,
+    sample_step_m: float = 1.0,
+    min_hit_fraction: float = 0.40,
+    min_edge_length_m: float = 1.5,
+    z_top_pct: float = 95.0,
+    z_ground_pct: float = 5.0,
+) -> tuple[list[Facade], dict]:
+    """Build wall + flat-roof Facade objects from the DJI mission-area polygon.
+
+    The polygon comes from the WPML template and encloses the area DJI already
+    decided to scan — so its edges correspond to real building walls. Each
+    polygon edge is validated against the reference point cloud:
+
+    - Sample points along the edge at ``sample_step_m`` intervals.
+    - For each sample, count cloud points in a slab extending inward by
+      ``slab_depth_m`` (i.e. into the building), above ground level.
+    - Edges with a hit rate below ``min_hit_fraction`` are dropped — that's
+      typically a polygon side that cuts across a courtyard or open space.
+
+    Returns (facades, diagnostics). The diagnostics include per-edge hit
+    rates so the UI can surface "this edge of the polygon has no wall".
+    """
+    pts = np.asarray(points_enu, dtype=float).reshape(-1, 3)
+    if len(pts) == 0 or len(polygon_enu) < 3:
+        return [], {"edges": [], "ground_z": 0.0, "top_z": 0.0, "height": 0.0}
+
+    poly = np.array(polygon_enu, dtype=float)
+    if len(poly) > 1 and np.allclose(poly[0, :2], poly[-1, :2]):
+        poly = poly[:-1]
+    poly_xy = poly[:, :2]
+
+    # Force CCW winding (signed area > 0 when viewed from +Z).
+    signed_area = 0.5 * float(np.sum(
+        poly_xy[:, 0] * np.roll(poly_xy[:, 1], -1)
+        - np.roll(poly_xy[:, 0], -1) * poly_xy[:, 1]
+    ))
+    if signed_area < 0:
+        poly_xy = poly_xy[::-1].copy()
+
+    # Height from the full cloud (DJI-scanned cloud is already focused on the
+    # building; no need for strict point-in-polygon filtering).
+    ground_z = float(np.percentile(pts[:, 2], z_ground_pct))
+    top_z = float(np.percentile(pts[:, 2], z_top_pct))
+    height = max(3.0, top_z - ground_z)
+
+    facades: list[Facade] = []
+    edge_diags: list[dict] = []
+    n = len(poly_xy)
+
+    for i in range(n):
+        p1 = poly_xy[i]
+        p2 = poly_xy[(i + 1) % n]
+        edge_vec = p2 - p1
+        L = float(np.linalg.norm(edge_vec))
+        if L < min_edge_length_m:
+            edge_diags.append({"edge": i, "length": L, "hit_rate": 0.0, "dropped": True})
+            continue
+
+        direction = edge_vec / L
+        inward = np.array([-direction[1], direction[0]])  # CCW → left of direction is inside
+        outward = -inward
+
+        n_samples = max(2, int(round(L / sample_step_m)))
+        step = L / n_samples
+        hits = 0
+        inward_distances: list[float] = []
+        # Exclude ground clutter but keep near-ground wall bases. 20% up from
+        # the lowest point is generous enough to keep the first story of a wall.
+        z_lo = ground_z + 0.2 * max(height, 1.0)
+        above_ground = (pts[:, 2] > z_lo) & (pts[:, 2] < top_z + 1.0)
+        for k in range(n_samples):
+            sample_xy = p1 + (k + 0.5) * step * direction
+            rel = pts[:, :2] - sample_xy
+            d_in = rel @ inward
+            d_tan = rel @ direction
+            mask = (
+                (d_in > -0.5) & (d_in < slab_depth_m)
+                & (np.abs(d_tan) < 0.6 * step)
+                & above_ground
+            )
+            if mask.any():
+                hits += 1
+                inward_distances.append(float(np.median(d_in[mask])))
+
+        hit_rate = hits / n_samples
+        edge_diags.append({
+            "edge": i,
+            "length": L,
+            "hit_rate": hit_rate,
+            "mean_inward_m": float(np.mean(inward_distances)) if inward_distances else None,
+        })
+
+        if hit_rate < min_hit_fraction:
+            continue
+
+        normal_3d = np.array([outward[0], outward[1], 0.0])
+        normal_3d /= max(float(np.linalg.norm(normal_3d)), 1e-9)
+        # Four corners, CCW viewed from outside: p1_bot, p2_bot, p2_top, p1_top.
+        verts = np.array([
+            [p1[0], p1[1], ground_z],
+            [p2[0], p2[1], ground_z],
+            [p2[0], p2[1], top_z],
+            [p1[0], p1[1], top_z],
+        ])
+        facades.append(Facade(
+            vertices=verts,
+            normal=normal_3d,
+            component_tag="21.1",
+            label=f"wall_{len(facades):02d}",
+            index=len(facades),
+        ))
+
+    # Flat roof covering the polygon interior at the measured top Z.
+    roof_verts = np.column_stack([poly_xy, np.full(len(poly_xy), top_z)])
+    facades.append(Facade(
+        vertices=roof_verts,
+        normal=np.array([0.0, 0.0, 1.0]),
+        component_tag="27.1",
+        label="roof",
+        index=len(facades),
+    ))
+
+    diagnostics = {
+        "edges": edge_diags,
+        "ground_z": ground_z,
+        "top_z": top_z,
+        "height": float(height),
+        "dropped": sum(1 for d in edge_diags if d.get("hit_rate", 0.0) < min_hit_fraction),
+        "wall_count": len(facades) - 1,
+    }
+    return facades, diagnostics
+
+
 # ---------------------------------------------------------------------------
 # Point cloud handling (Open3D)
 # ---------------------------------------------------------------------------
@@ -517,19 +1385,87 @@ def pointcloud_to_viewer_arrays(
     )
 
 
+@timed("pointcloud_to_mesh_cgal_alpha_wrap")
+def pointcloud_to_mesh_cgal_alpha_wrap(
+    points: np.ndarray,
+    *,
+    alpha: float = 0.3,
+    offset: float = 0.08,
+) -> bytes:
+    """Reconstruct a watertight mesh via CGAL ``alpha_wrap_3``.
+
+    Unlike Open3D's ``create_from_point_cloud_alpha_shape`` — which spews
+    "invalid tetra in TetraMesh" warnings on noisy DJI clouds and produces
+    a non-manifold jagged surface — ``alpha_wrap_3`` is the modern CGAL
+    recommendation: it shrink-wraps the point set producing a watertight,
+    orientable, 2-manifold surface that's ready to use without smoothing
+    or manual repair.
+
+    Parameters
+    ----------
+    alpha : distance between consecutive wrap probes. Smaller = more
+        detail but also more shrink-wrap hugging of noise.
+    offset : how far the wrap stays away from the input points (tolerance
+        to noise). Typical rule of thumb: offset ≈ point spacing × 1.5.
+    """
+    from CGAL.CGAL_Alpha_wrap_3 import alpha_wrap_3, Point_3_Vector
+    from CGAL.CGAL_Kernel import Point_3
+    from CGAL.CGAL_Polyhedron_3 import Polyhedron_3
+    import tempfile
+    import trimesh
+
+    pts = Point_3_Vector()
+    for p in points:
+        pts.append(Point_3(float(p[0]), float(p[1]), float(p[2])))
+
+    poly = Polyhedron_3()
+    alpha_wrap_3(pts, float(alpha), float(offset), poly)
+
+    with tempfile.NamedTemporaryFile(suffix=".off", delete=False) as tf:
+        off_path = tf.name
+    try:
+        poly.write_to_file(off_path)
+        mesh = trimesh.load(off_path, force="mesh")
+        if not isinstance(mesh, trimesh.Trimesh) or len(mesh.faces) == 0:
+            raise RuntimeError(
+                f"alpha_wrap_3 produced empty mesh (alpha={alpha}, offset={offset})"
+            )
+        ply_bytes = mesh.export(file_type="ply")
+    finally:
+        try:
+            os.unlink(off_path)
+        except OSError:
+            pass
+
+    print(
+        f"[kmz_import] alpha_wrap_3: {len(points)} pts → "
+        f"{len(mesh.vertices)}V / {len(mesh.faces)}F "
+        f"(α={alpha}, offset={offset}, watertight={mesh.is_watertight})"
+    )
+    return ply_bytes
+
+
 @timed("pointcloud_to_mesh_ply")
 def pointcloud_to_mesh_ply(
     pcd: "o3d.geometry.PointCloud",  # type: ignore[name-defined]
     alpha: float = 0.5,
-    target_points: int = 40_000,
-    min_voxel_size: float = 0.05,
-    max_voxel_size: float = 0.40,
+    target_points: int = 120_000,
+    min_voxel_size: float = 0.03,
+    max_voxel_size: float = 0.20,
     voxel_size_override: float | None = None,
     smooth_iterations: int = 12,
     decimation_ratio: float = 0.35,
+    use_cgal_alpha_wrap: bool = True,
 ) -> bytes:
     """Reconstruct a triangle mesh from a point cloud; return PLY bytes.
 
+    With ``use_cgal_alpha_wrap=True`` (default), dispatches to
+    :func:`pointcloud_to_mesh_cgal_alpha_wrap` — a watertight, manifold
+    shrink-wrap that doesn't need smoothing or decimation. Falls back
+    silently to the legacy Open3D alpha-shape path if CGAL isn't
+    available.
+
+    Legacy Open3D path (``use_cgal_alpha_wrap=False``):
     Uses **alpha-shape** reconstruction (not Poisson). Open3D's Poisson
     implementation hard-aborts the process on noisy DJI Smart3D clouds
     ("Failed to close loop" → SIGABRT in the C++ layer), so we can't catch
@@ -555,14 +1491,40 @@ def pointcloud_to_mesh_ply(
         voxel_size = max(min_voxel_size, min(max_voxel_size, voxel_size))
         pcd = pcd.voxel_down_sample(voxel_size=voxel_size)
         print(f"[kmz_import] {n_in} → {len(pcd.points)} points (voxel={voxel_size:.3f}m, auto)")
+    else:
+        voxel_size = float(min_voxel_size)
     pcd, _ = pcd.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.0)
+
+    # Prefer CGAL alpha_wrap_3: watertight, manifold, no warning spam, no
+    # need for Taubin + decimation afterward. Alpha/offset are scaled from
+    # the chosen voxel size so denser clouds get proportionally finer detail.
+    if use_cgal_alpha_wrap:
+        try:
+            pts = np.asarray(pcd.points, dtype=np.float64)
+            if len(pts) < 50:
+                raise RuntimeError("not enough points after downsample")
+            # alpha ≈ 2× voxel spacing (finer probe keeps small features
+            # like sills, dormers, parapets); offset ≈ 1× voxel spacing
+            # (tight wrap so the mesh hugs geometry, not noise haze).
+            aw_alpha = max(0.06, min(0.60, voxel_size * 2.0))
+            aw_offset = max(0.03, min(0.20, voxel_size * 1.0))
+            return pointcloud_to_mesh_cgal_alpha_wrap(
+                pts, alpha=aw_alpha, offset=aw_offset,
+            )
+        except Exception as e:
+            print(f"[kmz_import] CGAL alpha_wrap_3 unavailable ({e}); falling back to Open3D alpha shape")
 
     if not pcd.has_normals():
         pcd.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=0.5, max_nn=30))
 
     mesh = None
+    # Open3D's alpha-shape routine spams "invalid tetra in TetraMesh" warnings
+    # on every borderline tetrahedron in noisy DJI Smart3D clouds — they're
+    # informational (the offending tetra is discarded), not errors. Silence
+    # them at the C++ verbosity level so the log stays readable.
     try:
-        mesh = o3d.geometry.TriangleMesh.create_from_point_cloud_alpha_shape(pcd, alpha)
+        with o3d.utility.VerbosityContextManager(o3d.utility.VerbosityLevel.Error):
+            mesh = o3d.geometry.TriangleMesh.create_from_point_cloud_alpha_shape(pcd, alpha)
         if len(mesh.triangles) == 0:
             mesh = None
     except Exception as e:
@@ -606,6 +1568,23 @@ def pointcloud_to_mesh_ply(
             mesh = mesh.simplify_quadric_decimation(target_number_of_triangles=target)
         except Exception as e:
             print(f"[kmz_import] Decimation skipped: {e}")
+
+    # Fill small holes — alpha-shape reconstructions leave window-sized gaps
+    # that fragment walls into several region-growing components. Use trimesh
+    # (pure Python) rather than Open3D's tensor fill_holes, which can SIGABRT
+    # on malformed meshes from noisy Smart3D clouds.
+    try:
+        import trimesh as _tm
+        verts = np.asarray(mesh.vertices)
+        faces = np.asarray(mesh.triangles)
+        if len(verts) > 0 and len(faces) > 0:
+            tm_mesh = _tm.Trimesh(vertices=verts, faces=faces, process=False)
+            tm_mesh.fill_holes()
+            if len(tm_mesh.faces) > len(faces):
+                mesh.vertices = o3d.utility.Vector3dVector(np.asarray(tm_mesh.vertices))
+                mesh.triangles = o3d.utility.Vector3iVector(np.asarray(tm_mesh.faces))
+    except Exception as e:
+        print(f"[kmz_import] Hole filling skipped: {e}")
 
     mesh.compute_vertex_normals()
 

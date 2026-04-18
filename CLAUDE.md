@@ -125,3 +125,44 @@ The mesh → facade → waypoint pipeline has multiple safety layers:
 
 ### Mesh containment
 The old `mesh.convex_hull.contains()` approach failed for non-convex buildings (concave regions were incorrectly classified as "inside"). Open3D ray-parity (`count_intersections`, odd = inside) correctly handles all geometries including non-watertight photogrammetry meshes. `mesh.contains()` from trimesh still requires watertight meshes — avoid it.
+
+## DJI KMZ Import & Facade Detection on Raw Point Clouds
+
+DJI Smart3D / AutoExplore KMZ missions ship a point cloud (sparse, noisy) plus a `mission_area_wgs84` polygon. The inspection pipeline has to produce NEN-2767-grade facades from this. `src/flight_planner/kmz_import.py` handles it:
+
+### Pipeline (raw KMZ → facades)
+
+1. **Point cloud clip** — keep only points inside `mission_area_wgs84`; drop the bottom ~1m of Z to strip terrain.
+2. **Mesh reconstruction** (`pointcloud_to_mesh_ply`) — default is **CGAL `alpha_wrap_3`** (Cohen-Steiner et al.), which produces a **watertight, orientable, 2-manifold** shrink-wrap in a single call. No smoothing or decimation pass needed afterward. Open3D `create_from_point_cloud_alpha_shape` is retained as a fallback but silenced to verbosity level Error (it spams "invalid tetra in TetraMesh" warnings on noisy DJI clouds). Tuning: `alpha ≈ 2× voxel_size` and `offset ≈ 1× voxel_size` — tight wrap preserves small features like sills, dormers, and parapets. Coarser ratios smooth those away.
+3. **CGAL Shape Detection** (`facades_from_pointcloud_cgal`). Default `algorithm="region_growing"` via `CGAL::Shape_detection::region_growing` — grows regions locally from high-planarity seeds using k-nearest neighbors, stopping at the first neighbor that fails the ε / normal-agreement test. Each point belongs to at most one region, so regions are connected and non-overlapping — CGAL's native answer to "many small facets." `algorithm="efficient_RANSAC"` (Schnabel et al. 2007, "Efficient RANSAC for Point-Cloud Shape Detection") remains as an alternative for LOD-style reconstruction where fewer/bigger dominant planes are wanted. In both cases, normals are estimated upstream via `jet_estimate_normals` and the per-region plane equation is refit via SVD on its inliers.
+4. **Parallel-snap regularization** — Verdie et al. 2015 ("LOD Generation for Urban Scenes"). CGAL's C++ `regularize_planes` isn't exposed in the Python bindings, so the parallel-snap step is done inline in numpy: planes whose normals agree within 5° share one refit normal (weighted by inlier count). Fixes the "plates slicing through each other" artifact where slightly-misaligned regions would otherwise render as overlapping rectangles. Coplanar-merge (the companion step) is OFF by default — for NEN-2767 inspection we *want* spatially-separated facets on the same wall plane to stay separate, so the gimbal can square up on each one.
+5. **Density gate** — reject any plane with inlier density < `min_density_per_m2` (default 25). Kills "ghost planes" where scattered inliers span a huge floating rectangle.
+6. **PCA-oriented rectangle** — each region's bounding rectangle is built in its own plane frame (PCA u/v axes, 5/95 percentile clamp), so pitched roofs, dormers, chamfers, and canopies keep their real tilt instead of being flattened to an axis-aligned XY box.
+7. **Camera-coverage filter** — `_filter_facades_by_camera_coverage` drops any facade whose XY centroid falls outside the waypoint-convex-hull + 2m margin. The DJI KMZ already declares where the drone photographed; facades outside that envelope are terrain noise by definition.
+
+### Why region_growing over efficient_RANSAC for inspection
+
+`efficient_RANSAC` extracts the largest plane first and claims all its inliers before moving on, so a noisy wall tends to steal all its neighbors' points and get fit as one giant rectangle. The natural lever to "get more facets" on the RANSAC side is to reduce `cluster_epsilon`, but that often just produces the same giant plane split at noise gaps. Region growing gives the locality guarantee for free: a region stops where the surface bends, where the inliers thin out, or where the k-NN neighborhood runs out of good candidates. Small connected surfaces become small regions; the inspection gimbal gets a separate target per facet. This is why we avoided manual grid-subdivision — the CGAL API already handles it.
+
+### Small-feature bias (NEN-2767)
+
+Defaults are tuned for **many small facets over few big ones** because the inspection gimbal has to square up on small defect targets (window ledges, balcony panels, dormer walls), not just whole walls:
+
+- `min_points=40`, `epsilon=0.05m`, `cluster_epsilon=0.25m` — fine-grained plane extraction.
+- `min_wall_area_m2=0.5`, `min_roof_area_m2=0.5`, `min_tilted_area_m2=0.4` — accept small facets.
+- Wall dim floor: one edge ≥ 0.4m, longest ≥ 0.6m (sills, parapets survive).
+- `min_density_per_m2=25` — tight enough to kill floaters but loose enough to keep small dense facets.
+
+### Voxel / alpha_wrap / RANSAC must agree on scale
+
+These knobs are interlocked. For reasonable DJI Smart3D clouds:
+
+| knob | default | rule of thumb |
+|---|---|---|
+| voxel_size (auto) | 0.03–0.20m | adaptive to target 120K points |
+| alpha_wrap α | 2 × voxel | smaller = more detail, noisier |
+| alpha_wrap offset | 1 × voxel | tighter = hugs noise; looser = smoother |
+| ransac ε | ≈ voxel | plane-fit tolerance |
+| ransac cluster_ε | ≈ 4–5 × voxel | max inlier gap |
+| regularize parallel_tol | 5° | snap near-parallel to exact |
+| regularize coplanar_tol | 1.5 × ε | merge near-coplanar |

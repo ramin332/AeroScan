@@ -158,7 +158,6 @@ interface AppState {
   deleteAllVersions: () => Promise<void>;
   refreshVersions: () => Promise<void>;
   rewriteGimbals: () => Promise<void>;
-  generateInspectionMission: () => Promise<void>;
 
   // Theme
   lightMode: boolean;
@@ -377,30 +376,6 @@ export const useStore = create<AppState>()(persist((set, get) => ({
     }
   },
 
-  generateInspectionMission: async () => {
-    const { selectedBuildingId, building, algorithm, minFacadeArea, extractionMethod, waypointStrategy, disabledFacades, enabledCandidates, exclusionZones } = get();
-    if (!selectedBuildingId) return;
-    set({ loading: true });
-    try {
-      const result = await api.generate({
-        building_id: selectedBuildingId,
-        building,
-        mission: { ...NEN2767_MISSION },
-        algorithm,
-        min_facade_area: minFacadeArea,
-        extraction_method: extractionMethod,
-        waypoint_strategy: waypointStrategy,
-        disabled_facades: disabledFacades.size > 0 ? [...disabledFacades] : undefined,
-        enabled_candidates: enabledCandidates.size > 0 ? [...enabledCandidates] : undefined,
-        exclusion_zones: exclusionZones.length > 0 ? exclusionZones : undefined,
-      });
-      set({ result, mission: { ...NEN2767_MISSION }, loading: false });
-      await get().refreshVersions();
-    } catch (e) {
-      console.error('Generate inspection mission failed:', e);
-      set({ loading: false });
-    }
-  },
 
   // --- Building upload ---
 
