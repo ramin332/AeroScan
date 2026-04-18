@@ -34,7 +34,7 @@ def _kmz_extract_best_facades(clipped_mesh, polygon_enu, points_xyz, *, min_area
         from ..kmz_import import facades_from_pointcloud_cgal as _ffc
         cgal_out = _ffc(points_xyz, polygon_enu)
         if len(cgal_out) >= 3:
-            print(f"[kmz facades] cgal efficient_RANSAC → {len(cgal_out)} facades")
+            print(f"[kmz facades] cgal region_growing → {len(cgal_out)} facades")
             return cgal_out
     except Exception as _exc:
         print(f"[kmz facades] cgal efficient_RANSAC raised: {_exc}")

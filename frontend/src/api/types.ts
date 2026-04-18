@@ -358,7 +358,10 @@ export interface GenerateResponse {
     disabled_facades?: number[];
     enabled_candidates?: number[];
     exclusion_zones?: ExclusionZone[];
+    building_id?: string;
   };
+  building_id?: string;
+  imported_name?: string;
 }
 
 export interface VersionSummary {

@@ -27,7 +27,7 @@ export function Sidebar() {
     uploadBuilding, importKmz, optimizeKmz, cancelOptimize, selectBuilding, deleteBuilding,
     kmzOptimizing, kmzOptimizeMessage, kmzAutoRefine, setKmzAutoRefine,
     simStatus, simProgress, simMessage, startSimulation,
-    rewriteGimbals, toggleKmzFacades, lastKmzFile,
+    rewriteGimbals, generateInspectionMission, toggleKmzFacades, lastKmzFile,
   } = useStore();
 
   const fileRef = useRef<HTMLInputElement>(null);
@@ -182,8 +182,26 @@ export function Sidebar() {
               onClick={() => rewriteGimbals()}
               title="Keep DJI's trajectory; rewrite gimbals perpendicular to each facade, cap speed to 3 m/s, and strip the SmartOblique rosette so every waypoint takes a single NEN-2767 photo. Creates a new version."
             >
-              Rewrite for NEN-2767 inspection
+              Rewrite gimbals (keep DJI path)
             </button>
+            {(result.summary.source?.startsWith('kmz_')) &&
+             (result.building_id || result.config_snapshot?.building_id) && (
+              <button
+                className="btn-primary"
+                style={{
+                  marginTop: 6,
+                  width: '100%',
+                  fontSize: 12,
+                  padding: '6px 10px',
+                  fontWeight: 600,
+                  background: 'linear-gradient(135deg, #3b82f6 0%, #06b6d4 100%)',
+                }}
+                onClick={() => generateInspectionMission()}
+                title="Generate a FRESH NEN-2767 inspection mission from the detected facades — discards DJI's trajectory entirely and builds a per-facade boustrophedon grid with perpendicular gimbals, stop-and-shoot, and inspection-grade GSD."
+              >
+                Generate NEN-2767 flight (fresh path)
+              </button>
+            )}
             {(result.summary.gimbal_before || result.summary.gimbal_after) && (
               <GimbalDiff
                 before={result.summary.gimbal_before}

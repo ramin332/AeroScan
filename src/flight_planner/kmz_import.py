@@ -19,6 +19,7 @@ from __future__ import annotations
 import io
 import json
 import math
+import os
 import tempfile
 import zipfile
 from dataclasses import dataclass, field

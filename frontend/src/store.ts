@@ -158,6 +158,7 @@ interface AppState {
   deleteAllVersions: () => Promise<void>;
   refreshVersions: () => Promise<void>;
   rewriteGimbals: () => Promise<void>;
+  generateInspectionMission: () => Promise<void>;
 
   // Theme
   lightMode: boolean;
@@ -372,6 +373,38 @@ export const useStore = create<AppState>()(persist((set, get) => ({
       await get().refreshVersions();
     } catch (e) {
       console.error('Rewrite gimbals failed:', e);
+      set({ loading: false });
+    }
+  },
+
+  // Generate a fresh NEN-2767 inspection mission from the KMZ-imported
+  // building's facades — does NOT reuse DJI's trajectory. Produces a new
+  // per-facade boustrophedon grid with stop-and-shoot, perpendicular
+  // gimbals, and inspection-grade GSD. Leaves the original version for
+  // side-by-side comparison.
+  generateInspectionMission: async () => {
+    const current = get().result;
+    const buildingId = current?.building_id ?? current?.config_snapshot?.building_id;
+    if (!buildingId) {
+      console.error('No building_id on current result — cannot generate inspection mission');
+      return;
+    }
+    const { building, algorithm, disabledFacades, enabledCandidates, exclusionZones } = get();
+    set({ loading: true });
+    try {
+      const result = await api.generate({
+        building_id: buildingId,
+        building,
+        mission: { ...NEN2767_MISSION },
+        algorithm,
+        disabled_facades: disabledFacades.size > 0 ? [...disabledFacades] : undefined,
+        enabled_candidates: enabledCandidates.size > 0 ? [...enabledCandidates] : undefined,
+        exclusion_zones: exclusionZones.length > 0 ? exclusionZones : undefined,
+      });
+      set({ result, mission: { ...NEN2767_MISSION }, loading: false });
+      await get().refreshVersions();
+    } catch (e) {
+      console.error('Generate inspection mission failed:', e);
       set({ loading: false });
     }
   },
