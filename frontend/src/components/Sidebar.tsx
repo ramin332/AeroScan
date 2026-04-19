@@ -851,13 +851,13 @@ export function Sidebar() {
             label="Camera frustums"
             value={showOriginalGimbals}
             onChange={setShowOriginalGimbals}
-            tooltip="One pyramid per waypoint showing the planned camera pose."
+            tooltip="Per-photo camera pyramid. Smart Auto Explore captures multiple photos per waypoint so expect clusters at each apex."
           />
           <ToggleField
-            label="Expand rosette (5 poses)"
+            label="Expand SmartOblique rosette"
             value={showRosettePoses}
             onChange={setShowRosettePoses}
-            tooltip="When on, draws all 5 SmartOblique poses per waypoint instead of one. Default off — matches DJI's one-per-point display."
+            tooltip="Draws all 5 poses per waypoint (1 nadir + 4 obliques). Turn OFF to see only the planned aircraft pose (~-90° nadir) — useful for debugging but hides the oblique coverage that reconstruction actually uses."
           />
           {result.summary.camera && (() => {
             const cam = result.summary.camera;
