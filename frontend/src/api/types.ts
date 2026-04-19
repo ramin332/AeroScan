@@ -243,6 +243,18 @@ export interface MissionAreaData {
   vertices: number[][]; // [[x,y,z], ...] in ENU meters
 }
 
+/** DJI 3D-Tiles Mapping OBB in local ENU (meters). Axes are half-extent
+ *  vectors — not necessarily axis-aligned. Emitted only for DJI Smart3D
+ *  KMZ imports whose archive ships `wpmz/res/ply/<name>/points/tileset.json`. */
+export interface MappingBox {
+  center: [number, number, number];
+  axes: [
+    [number, number, number],
+    [number, number, number],
+    [number, number, number],
+  ];
+}
+
 export interface ThreeJSData {
   facades: FacadeData[];
   candidateFacades?: FacadeData[];
@@ -253,6 +265,7 @@ export interface ThreeJSData {
   rawMesh?: RawMeshData | null;
   pointCloud?: PointCloudData;
   missionArea?: MissionAreaData;
+  mappingBox?: MappingBox;
 }
 
 // Leaflet viewer data

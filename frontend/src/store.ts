@@ -201,6 +201,8 @@ interface AppState {
   stripRosetteOnly: () => Promise<void>;
   showOriginalGimbals: boolean;
   setShowOriginalGimbals: (v: boolean) => void;
+  showMappingBox: boolean;
+  setShowMappingBox: (v: boolean) => void;
 
   // Simulation / reconstruction
   simTaskId: string | null;
@@ -579,6 +581,8 @@ export const useStore = create<AppState>()(persist((set, get) => ({
   },
   showOriginalGimbals: true,
   setShowOriginalGimbals: (v: boolean) => set({ showOriginalGimbals: v }),
+  showMappingBox: false,
+  setShowMappingBox: (v: boolean) => set({ showMappingBox: v }),
 
   refineKmz: async (voxelSize: number) => {
     const s = get();

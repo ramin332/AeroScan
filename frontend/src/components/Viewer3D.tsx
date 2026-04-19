@@ -2,7 +2,7 @@ import { useRef, useMemo, useState, useCallback, useEffect } from 'react';
 import { Canvas, useThree, useFrame, type ThreeEvent } from '@react-three/fiber';
 import { OrbitControls, Line, PivotControls } from '@react-three/drei';
 import * as THREE from 'three';
-import type { MissionAreaData, PointCloudData, RawMeshData, ThreeJSData, WaypointData } from '../api/types';
+import type { MappingBox, MissionAreaData, PointCloudData, RawMeshData, ThreeJSData, WaypointData } from '../api/types';
 import { DroneMarker, getVisitedIndex, DRONE_LAYER } from './DroneAnimation';
 import { useStore } from '../store';
 
@@ -310,6 +310,44 @@ function FlightPath({ waypoints }: { waypoints: WaypointData[] }) {
   );
 }
 
+/** Renders the DJI tileset OBB as a semi-transparent block (matches DJI's
+ *  Smart 3D Capture Quality Report "Mapping" toggle). Inputs are in ENU; we
+ *  swizzle to Three.js (x=E, y=Up, z=-N) for center and each half-axis. */
+function MappingBoxView({ box }: { box: MappingBox }) {
+  const { position, matrix } = useMemo(() => {
+    const enuToThree = (v: readonly [number, number, number]) =>
+      new THREE.Vector3(v[0], v[2], -v[1]);
+    const center = enuToThree(box.center);
+    // Full-axis vectors (unit box is 2×2×2, so columns are full axes, not halves)
+    const ax = enuToThree(box.axes[0]);
+    const ay = enuToThree(box.axes[1]);
+    const az = enuToThree(box.axes[2]);
+    const m = new THREE.Matrix4().makeBasis(ax, ay, az);
+    return { position: center, matrix: m };
+  }, [box]);
+
+  return (
+    <group position={position}>
+      <group matrixAutoUpdate={false} matrix={matrix}>
+        <mesh>
+          <boxGeometry args={[2, 2, 2]} />
+          <meshBasicMaterial
+            color="#4aa3ff"
+            transparent
+            opacity={0.18}
+            side={THREE.DoubleSide}
+            depthWrite={false}
+          />
+        </mesh>
+        <lineSegments>
+          <edgesGeometry args={[new THREE.BoxGeometry(2, 2, 2)]} />
+          <lineBasicMaterial color="#7ec4ff" transparent opacity={0.8} />
+        </lineSegments>
+      </group>
+    </group>
+  );
+}
+
 function RawMeshView({ mesh, dimmed }: { mesh: RawMeshData; dimmed?: boolean }) {
   const solidRef = useRef<THREE.Mesh>(null);
   const [geometry, setGeometry] = useState<THREE.BufferGeometry | null>(null);
@@ -511,6 +549,7 @@ function Scene({ data, onWaypointClick, visitedIndex, viewMode, activeFacades, l
   const exclusionZones = useStore((s) => s.exclusionZones);
   const updateExclusionZone = useStore((s) => s.updateExclusionZone);
   const showOriginalGimbals = useStore((s) => s.showOriginalGimbals);
+  const showMappingBox = useStore((s) => s.showMappingBox);
 
   // Separate inspection and transition waypoints
   const { facadeWaypoints, transitionWaypoints } = useMemo(() => {
@@ -697,6 +736,9 @@ function Scene({ data, onWaypointClick, visitedIndex, viewMode, activeFacades, l
       {/* Imported DJI Smart3D reference point cloud */}
       {data.pointCloud && <PointCloudView data={data.pointCloud} />}
 
+      {/* DJI tileset oriented bounding box (Mapping layer). Default off. */}
+      {showMappingBox && data.mappingBox && <MappingBoxView box={data.mappingBox} />}
+
       {/* Mission-area polygon intentionally not drawn in 3D — it clutters the
           point cloud with an unrelated extruded boundary. Still rendered on the
           2D map tab via LeafletData.missionAreaPoly. */}
@@ -879,24 +921,28 @@ export function Viewer3D({ data, cameraFov, defaultViewMode = 'plan' }: { data: 
     setSnapshot(null);
   }, [data]);
 
-  // Scene centroid + bounding radius in Three.js space. Used to target
-  // OrbitControls and to reframe the camera on data changes so KMZ imports
-  // (where content is offset from the ENU origin) don't leave the camera
-  // staring at empty space.
+  // Scene centroid + bounding radius in Three.js space. For DJI KMZ imports
+  // we drive framing from the authoritative tileset OBB; otherwise fall back
+  // to the waypoint/facade extent so uploaded-mesh scenes still frame.
   const { sceneCentroid, sceneRadius } = useMemo<{
     sceneCentroid: [number, number, number];
     sceneRadius: number;
   }>(() => {
     if (!data) return { sceneCentroid: [0, 0, 0], sceneRadius: 30 };
+    if (data.mappingBox) {
+      const { center, axes } = data.mappingBox;
+      // ENU → Three.js (x=E, y=Up=ENU.z, z=-N)
+      const cx = center[0], cy = center[2], cz = -center[1];
+      // axes are full half-axis vectors; diagonal half-length bounds the box.
+      const diag = Math.sqrt(
+        axes[0].reduce((s, v) => s + v * v, 0) +
+        axes[1].reduce((s, v) => s + v * v, 0) +
+        axes[2].reduce((s, v) => s + v * v, 0),
+      );
+      return { sceneCentroid: [cx, cy, cz], sceneRadius: diag };
+    }
     const pts: [number, number, number][] = [];
     for (const wp of data.waypoints) pts.push([wp.x, wp.z, -wp.y]);
-    const pc = data.pointCloud;
-    if (pc && pc.positions.length >= 3) {
-      const step = Math.max(1, Math.floor(pc.positions.length / 3 / 2000));
-      for (let i = 0; i < pc.positions.length; i += 3 * step) {
-        pts.push([pc.positions[i], pc.positions[i + 2], -pc.positions[i + 1]]);
-      }
-    }
     for (const f of data.facades) {
       for (const p of f.vertices) pts.push([p[0], p[2], -p[1]]);
     }
