@@ -926,6 +926,7 @@ async def import_kmz(
                 facades_from_polygon,
                 clip_mesh_to_polygon_xy,
                 mapping_bbox_to_enu,
+                resolve_capture_intrinsics,
             )
             from ..models import ActionType, CameraAction, CameraName as _CameraName, MissionConfig
 
@@ -1170,6 +1171,7 @@ async def import_kmz(
                         ],
                         "mission_config_raw": parsed.mission_config_raw,
                         "mapping_bbox_raw": parsed.mapping_bbox_raw,
+                        "camera_intrinsics": camera_intrinsics,
                         "voxel_size": effective_voxel,
                     }),
                 )
@@ -1248,25 +1250,20 @@ async def import_kmz(
                 dz = waypoints[i].z - waypoints[i - 1].z
                 total_path_m += math.sqrt(dx * dx + dy * dy + dz * dz)
             est_time_s = total_path_m / max(config.flight_speed_ms, 0.1)
+            camera_intrinsics = resolve_capture_intrinsics(parsed)
             summary = {
                 "waypoint_count": len(waypoints),
                 "inspection_waypoints": len(waypoints),
                 "transition_waypoints": 0,
                 "photo_count": len(waypoints),
                 "facade_count": len(building.facades),
-                "camera_distance_m": 0.0,
+                "camera_distance_m": camera_intrinsics["distance_m"],
                 "photo_footprint_m": [0.0, 0.0],
                 "total_path_m": round(total_path_m, 1),
                 "estimated_flight_time_s": round(est_time_s),
                 "facade_waypoint_counts": {},
                 "transitions": [],
-                "camera": {
-                    "name": "wide",
-                    "fov_h_deg": 0.0,
-                    "fov_v_deg": 0.0,
-                    "distance_m": 0.0,
-                    "focal_length_mm": 0.0,
-                },
+                "camera": camera_intrinsics,
                 "source": record_source_type,
                 "facade_coverage": compute_facade_coverage(building, waypoints),
             }
@@ -1718,25 +1715,36 @@ def refine_kmz_building(building_id: str, req: RefineKmzRequest):
                 dy = waypoints[i].y - waypoints[i-1].y
                 dz = waypoints[i].z - waypoints[i-1].z
                 total_path_m += math.sqrt(dx*dx + dy*dy + dz*dz)
+
+            from ..kmz_import import (
+                ImportedKmz as _ImportedKmz,
+                mapping_bbox_to_enu as _mbox_to_enu,
+                resolve_capture_intrinsics as _resolve_intr,
+            )
+            refine_intrinsics = _resolve_intr(_ImportedKmz(
+                name=name, ref_lat=ref_lat, ref_lon=ref_lon, ref_alt=ref_alt,
+                waypoints=parsed_wps, mission_area_wgs84=mission_area_wgs84,
+                mission_config_raw=mission_cfg_raw, point_cloud_ply=None,
+                mapping_bbox_raw=props.get("mapping_bbox_raw"),
+            ))
             summary = {
                 "waypoint_count": len(waypoints),
                 "inspection_waypoints": len(waypoints),
                 "transition_waypoints": 0,
                 "photo_count": len(waypoints),
                 "facade_count": len(building.facades),
-                "camera_distance_m": 0.0,
+                "camera_distance_m": refine_intrinsics["distance_m"],
                 "photo_footprint_m": [0.0, 0.0],
                 "total_path_m": round(total_path_m, 1),
                 "estimated_flight_time_s": round(total_path_m / max(config.flight_speed_ms, 0.1)),
                 "facade_waypoint_counts": {},
                 "transitions": [],
-                "camera": {"name": "wide", "fov_h_deg": 0.0, "fov_v_deg": 0.0, "distance_m": 0.0, "focal_length_mm": 0.0},
+                "camera": refine_intrinsics,
                 "source": "kmz_refine",
                 "voxel_size": voxel_size,
                 "facade_coverage": compute_facade_coverage(building, waypoints),
             }
 
-            from ..kmz_import import mapping_bbox_to_enu as _mbox_to_enu
             threejs_data = prepare_threejs_data(
                 building, waypoints,
                 point_cloud={"positions": pc_positions, "colors": pc_colors},
