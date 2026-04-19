@@ -201,8 +201,16 @@ interface AppState {
   stripRosetteOnly: () => Promise<void>;
   showOriginalGimbals: boolean;
   setShowOriginalGimbals: (v: boolean) => void;
+  // When false, one frustum per waypoint (planned pose) — matches DJI's
+  // Capture Quality Report. When true, all 5 rosette poses are drawn.
+  showRosettePoses: boolean;
+  setShowRosettePoses: (v: boolean) => void;
   showMappingBox: boolean;
   setShowMappingBox: (v: boolean) => void;
+  // 'polygon' = mission-area polygon extent (matches RC Plus on-controller);
+  // 'tileset' = 3D-Tiles root OBB (whole reconstructed cloud extent).
+  mappingBoxSource: 'polygon' | 'tileset';
+  setMappingBoxSource: (v: 'polygon' | 'tileset') => void;
   // Per-field overrides for the camera intrinsics used to draw frustums.
   // Null keys mean "use summary.camera value verbatim"; set by the sidebar to
   // let operators dial the frustum without re-importing.
@@ -587,8 +595,12 @@ export const useStore = create<AppState>()(persist((set, get) => ({
   },
   showOriginalGimbals: true,
   setShowOriginalGimbals: (v: boolean) => set({ showOriginalGimbals: v }),
+  showRosettePoses: false,
+  setShowRosettePoses: (v: boolean) => set({ showRosettePoses: v }),
   showMappingBox: false,
   setShowMappingBox: (v: boolean) => set({ showMappingBox: v }),
+  mappingBoxSource: 'polygon',
+  setMappingBoxSource: (v) => set({ mappingBoxSource: v }),
   cameraFovOverride: { fov_h_deg: null, fov_v_deg: null, distance_m: null },
   setCameraFovOverride: (patch) => set((s) => ({
     cameraFovOverride: { ...s.cameraFovOverride, ...patch },

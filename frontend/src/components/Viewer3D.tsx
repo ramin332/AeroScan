@@ -215,11 +215,10 @@ function CameraArrows({ waypoints, color, bright, cameraFov }: { waypoints: Wayp
   );
 }
 
-function OriginalGimbalArrows({ waypoints, color, cameraFov }: { waypoints: WaypointData[]; color: string; cameraFov?: CameraFOV }) {
-  // Match DJI's Smart 3D Capture Quality Report: one frustum per photo,
-  // which means one per pose in the SmartOblique rosette — typically 5 per
-  // waypoint (1 nadir + 4 obliques). Falls back to the placemark's planned
-  // pitch/yaw for waypoints without a rosette (e.g. plain waylines).
+function OriginalGimbalArrows({ waypoints, color, cameraFov, showRosette }: { waypoints: WaypointData[]; color: string; cameraFov?: CameraFOV; showRosette?: boolean }) {
+  // Default: one frustum per waypoint (planned pose) — matches DJI's Capture
+  // Quality Report "one per point" display. When showRosette is true, all 5
+  // SmartOblique poses per waypoint are drawn instead.
   // Use real camera intrinsics from summary.camera when available; otherwise
   // fall back to M4E wide defaults.
   const fovHDeg = cameraFov?.fov_h_deg ?? 71.5;
@@ -236,7 +235,7 @@ function OriginalGimbalArrows({ waypoints, color, cameraFov }: { waypoints: Wayp
     for (const wp of waypoints) {
       const plannedPitch = wp.pitch_before !== undefined ? wp.pitch_before : wp.gimbal_pitch;
       const plannedYaw = wp.yaw_before !== undefined ? wp.yaw_before : wp.heading;
-      const poses = wp.smart_oblique_poses && wp.smart_oblique_poses.length > 0
+      const poses = (showRosette && wp.smart_oblique_poses && wp.smart_oblique_poses.length > 0)
         ? wp.smart_oblique_poses
         : [{ pitch: plannedPitch, yaw: plannedYaw }];
 
@@ -285,7 +284,7 @@ function OriginalGimbalArrows({ waypoints, color, cameraFov }: { waypoints: Wayp
     const g = new THREE.BufferGeometry();
     g.setAttribute('position', new THREE.Float32BufferAttribute(edgePositions, 3));
     return { edgeGeo: g };
-  }, [waypoints, frustumLen, halfW, halfH]);
+  }, [waypoints, frustumLen, halfW, halfH, showRosette]);
 
   if (!edgeGeo) return null;
   return (
@@ -320,6 +319,55 @@ function FlightPath({ waypoints }: { waypoints: WaypointData[] }) {
 /** Renders the DJI tileset OBB as a semi-transparent block (matches DJI's
  *  Smart 3D Capture Quality Report "Mapping" toggle). Inputs are in ENU; we
  *  swizzle to Three.js (x=E, y=Up, z=-N) for center and each half-axis. */
+/** Axis-aligned box from the mission-area polygon XY extent + waypoint Z
+ *  extent. Matches the bounding volume DJI's RC Plus renders on-controller
+ *  (a subset of the full tileset OBB, because the polygon declares where the
+ *  scan actually flew). */
+function PolygonBoxView({
+  polygon,
+  waypoints,
+}: {
+  polygon: number[][]; // [[x,y,z], ...] in ENU meters
+  waypoints: WaypointData[];
+}) {
+  const { center, size } = useMemo(() => {
+    if (polygon.length === 0) return { center: null, size: null };
+    let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+    for (const [x, y] of polygon) {
+      if (x < minX) minX = x;
+      if (x > maxX) maxX = x;
+      if (y < minY) minY = y;
+      if (y > maxY) maxY = y;
+    }
+    let minZ = Infinity, maxZ = -Infinity;
+    for (const wp of waypoints) {
+      if (wp.z < minZ) minZ = wp.z;
+      if (wp.z > maxZ) maxZ = wp.z;
+    }
+    if (!isFinite(minZ)) { minZ = 0; maxZ = 10; }
+    const c: [number, number, number] = [(minX + maxX) / 2, (minY + maxY) / 2, (minZ + maxZ) / 2];
+    const s: [number, number, number] = [maxX - minX, maxY - minY, maxZ - minZ];
+    return { center: c, size: s };
+  }, [polygon, waypoints]);
+
+  if (!center || !size) return null;
+  // ENU (x,y,z) → Three.js (x, z, -y)
+  const position: [number, number, number] = [center[0], center[2], -center[1]];
+  const dims: [number, number, number] = [size[0], size[2], size[1]];
+  return (
+    <group position={position}>
+      <mesh>
+        <boxGeometry args={dims} />
+        <meshBasicMaterial color="#4aa3ff" transparent opacity={0.18} side={THREE.DoubleSide} depthWrite={false} />
+      </mesh>
+      <lineSegments>
+        <edgesGeometry args={[new THREE.BoxGeometry(...dims)]} />
+        <lineBasicMaterial color="#7ec4ff" transparent opacity={0.8} />
+      </lineSegments>
+    </group>
+  );
+}
+
 function MappingBoxView({ box }: { box: MappingBox }) {
   const { position, matrix } = useMemo(() => {
     const enuToThree = (v: readonly [number, number, number]) =>
@@ -556,7 +604,9 @@ function Scene({ data, onWaypointClick, visitedIndex, viewMode, activeFacades, l
   const exclusionZones = useStore((s) => s.exclusionZones);
   const updateExclusionZone = useStore((s) => s.updateExclusionZone);
   const showOriginalGimbals = useStore((s) => s.showOriginalGimbals);
+  const showRosettePoses = useStore((s) => s.showRosettePoses);
   const showMappingBox = useStore((s) => s.showMappingBox);
+  const mappingBoxSource = useStore((s) => s.mappingBoxSource);
 
   // Separate inspection and transition waypoints
   const { facadeWaypoints, transitionWaypoints } = useMemo(() => {
@@ -701,7 +751,7 @@ function Scene({ data, onWaypointClick, visitedIndex, viewMode, activeFacades, l
             <group key={fi}>
               <WaypointSpheres waypoints={wps} color={isActive ? color : '#1a1a2a'} bright={isActive} />
               {isActive && <CameraArrows waypoints={wps} color={color} bright cameraFov={cameraFov} />}
-              {isActive && showOriginalGimbals && <OriginalGimbalArrows waypoints={wps} color="#ff3344" cameraFov={cameraFov} />}
+              {isActive && showOriginalGimbals && <OriginalGimbalArrows waypoints={wps} color="#ff3344" cameraFov={cameraFov} showRosette={showRosettePoses} />}
             </group>
           );
         }
@@ -717,7 +767,7 @@ function Scene({ data, onWaypointClick, visitedIndex, viewMode, activeFacades, l
           <group key={fi}>
             <WaypointSpheres waypoints={wps} color={color} />
             <CameraArrows waypoints={wps} color={color} />
-            {showOriginalGimbals && <OriginalGimbalArrows waypoints={wps} color="#ff3344" cameraFov={cameraFov} />}
+            {showOriginalGimbals && <OriginalGimbalArrows waypoints={wps} color="#ff3344" cameraFov={cameraFov} showRosette={showRosettePoses} />}
           </group>
         );
       })}
@@ -743,8 +793,15 @@ function Scene({ data, onWaypointClick, visitedIndex, viewMode, activeFacades, l
       {/* Imported DJI Smart3D reference point cloud */}
       {data.pointCloud && <PointCloudView data={data.pointCloud} />}
 
-      {/* DJI tileset oriented bounding box (Mapping layer). Default off. */}
-      {showMappingBox && data.mappingBox && <MappingBoxView box={data.mappingBox} />}
+      {/* Mapping volume. Default source is the mission-polygon extent (matches
+          RC Plus on-controller). 'tileset' uses the full 3D-Tiles OBB which is
+          larger — includes terrain around the scanned area. */}
+      {showMappingBox && mappingBoxSource === 'polygon' && data.missionArea && (
+        <PolygonBoxView polygon={data.missionArea.vertices} waypoints={data.waypoints} />
+      )}
+      {showMappingBox && mappingBoxSource === 'tileset' && data.mappingBox && (
+        <MappingBoxView box={data.mappingBox} />
+      )}
 
       {/* Mission-area polygon intentionally not drawn in 3D — it clutters the
           point cloud with an unrelated extruded boundary. Still rendered on the

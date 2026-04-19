@@ -43,7 +43,9 @@ export function Sidebar() {
     rewriteGimbals, generateInspectionMission, toggleKmzFacades, lastKmzFile,
     triggerMissionUpdate,
     showMappingBox, setShowMappingBox,
+    mappingBoxSource, setMappingBoxSource,
     showOriginalGimbals, setShowOriginalGimbals,
+    showRosettePoses, setShowRosettePoses,
     cameraFovOverride, setCameraFovOverride, resetCameraFovOverride,
   } = useStore();
 
@@ -814,21 +816,48 @@ export function Sidebar() {
             3D viewer overlays and camera-frustum geometry.
           </div>
           <ToggleField
-            label="Mapping box (tileset OBB)"
+            label="Mapping box"
             value={showMappingBox}
             onChange={setShowMappingBox}
-            tooltip="Draws the 3D-Tiles bounding box from the DJI KMZ tileset.json. Only visible when the import carries a tileset."
+            tooltip="Draws the mapping bounding volume. Default source = mission-area polygon extent (what RC Plus shows on the controller)."
           />
+          {showMappingBox && (
+            <div style={{ display: 'flex', gap: 6, margin: '-2px 0 6px 2px' }}>
+              <button
+                type="button"
+                className={`btn ${mappingBoxSource === 'polygon' ? 'btn-primary' : 'btn-ghost'}`}
+                style={{ flex: 1, fontSize: 11 }}
+                onClick={() => setMappingBoxSource('polygon')}
+              >
+                Polygon (RC Plus)
+              </button>
+              <button
+                type="button"
+                className={`btn ${mappingBoxSource === 'tileset' ? 'btn-primary' : 'btn-ghost'}`}
+                style={{ flex: 1, fontSize: 11 }}
+                onClick={() => setMappingBoxSource('tileset')}
+                disabled={!result.viewer_data.threejs.mappingBox}
+              >
+                Tileset OBB
+              </button>
+            </div>
+          )}
           <div style={{ fontSize: 10, color: 'var(--muted)', margin: '-2px 0 6px 2px' }}>
-            Source: {result.viewer_data.threejs.mappingBox
-              ? 'tileset.json (authoritative)'
-              : 'none — this KMZ has no tileset'}
+            {mappingBoxSource === 'polygon'
+              ? (result.viewer_data.threejs.missionArea ? 'mission-area polygon (subset)' : 'no polygon in this import')
+              : (result.viewer_data.threejs.mappingBox ? 'tileset.json (full tile extent)' : 'no tileset in this import')}
           </div>
           <ToggleField
-            label="Original-pose frustums"
+            label="Camera frustums"
             value={showOriginalGimbals}
             onChange={setShowOriginalGimbals}
-            tooltip="Renders one pyramid per photo. For KMZ imports this expands the 5-pose SmartOblique rosette."
+            tooltip="One pyramid per waypoint showing the planned camera pose."
+          />
+          <ToggleField
+            label="Expand rosette (5 poses)"
+            value={showRosettePoses}
+            onChange={setShowRosettePoses}
+            tooltip="When on, draws all 5 SmartOblique poses per waypoint instead of one. Default off — matches DJI's one-per-point display."
           />
           {result.summary.camera && (() => {
             const cam = result.summary.camera;
