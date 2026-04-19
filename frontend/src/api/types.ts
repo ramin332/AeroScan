@@ -123,6 +123,8 @@ export interface UploadedBuilding {
   heading_deg: number;
   properties: Record<string, unknown>;
   created_at: string;
+  available_modes?: Array<'dji' | 'inspection'>;
+  active_mode?: 'dji' | 'inspection' | null;
 }
 
 export interface BuildingUploadRequest {

@@ -348,6 +348,172 @@ def _facade_cache_put(key: str, value) -> None:
         db.close()
 
 
+SNAPSHOT_MODES = ("dji", "inspection")
+
+
+# ---- Smart recomputation cache for the refine-KMZ slider loop ----
+#
+# Refine has two expensive phases:
+#   1. Mesh reconstruction (alpha_wrap_3): depends on voxel + aw_alpha + aw_offset
+#   2. CGAL Shape-Detection: depends on mesh + fd_* params
+#
+# The user often tweaks one phase's params without touching the other. Keying
+# each phase separately lets a slider change in phase 2 hit the cache for
+# phase 1 (and vice versa), so only the changed stage re-runs.
+_kmz_mesh_cache: dict[tuple, object] = {}
+_kmz_mesh_cache_lock = threading.Lock()
+_KMZ_MESH_CACHE_MAX = 6   # per-building × a few slider settings ≈ plenty
+
+_kmz_facade_runtime_cache: dict[tuple, object] = {}
+_kmz_facade_runtime_cache_lock = threading.Lock()
+_KMZ_FACADE_RUNTIME_CACHE_MAX = 16
+
+
+def _kmz_mesh_key(building_id: str, voxel_size: float, aw_alpha, aw_offset) -> tuple:
+    return (
+        building_id,
+        round(float(voxel_size), 4),
+        None if aw_alpha is None else round(float(aw_alpha), 4),
+        None if aw_offset is None else round(float(aw_offset), 4),
+    )
+
+
+def _kmz_facade_runtime_key(mesh_key: tuple, fd: dict) -> tuple:
+    def _r(v, nd=4):
+        return None if v is None else round(float(v), nd)
+    return (
+        mesh_key,
+        _r(fd.get("epsilon")),
+        _r(fd.get("cluster_epsilon")),
+        None if fd.get("min_points") is None else int(fd["min_points"]),
+        _r(fd.get("min_wall_area_m2")),
+        _r(fd.get("min_roof_area_m2")),
+        _r(fd.get("min_density_per_m2")),
+        _r(fd.get("normal_threshold")),
+    )
+
+
+def _kmz_mesh_cache_get(key):
+    with _kmz_mesh_cache_lock:
+        return _kmz_mesh_cache.get(key)
+
+
+def _kmz_mesh_cache_put(key, value):
+    with _kmz_mesh_cache_lock:
+        if key in _kmz_mesh_cache:
+            del _kmz_mesh_cache[key]
+        _kmz_mesh_cache[key] = value
+        while len(_kmz_mesh_cache) > _KMZ_MESH_CACHE_MAX:
+            _kmz_mesh_cache.pop(next(iter(_kmz_mesh_cache)))
+
+
+def _kmz_mesh_cache_invalidate(building_id: str):
+    with _kmz_mesh_cache_lock:
+        for k in [k for k in _kmz_mesh_cache if k[0] == building_id]:
+            del _kmz_mesh_cache[k]
+
+
+def _kmz_facade_runtime_cache_get(key):
+    with _kmz_facade_runtime_cache_lock:
+        return _kmz_facade_runtime_cache.get(key)
+
+
+def _kmz_facade_runtime_cache_put(key, value):
+    with _kmz_facade_runtime_cache_lock:
+        if key in _kmz_facade_runtime_cache:
+            del _kmz_facade_runtime_cache[key]
+        _kmz_facade_runtime_cache[key] = value
+        while len(_kmz_facade_runtime_cache) > _KMZ_FACADE_RUNTIME_CACHE_MAX:
+            _kmz_facade_runtime_cache.pop(next(iter(_kmz_facade_runtime_cache)))
+
+
+def _kmz_facade_runtime_cache_invalidate(building_id: str):
+    with _kmz_facade_runtime_cache_lock:
+        for k in [k for k in _kmz_facade_runtime_cache if k[0][0] == building_id]:
+            del _kmz_facade_runtime_cache[k]
+
+
+def _snapshot_encode_response(response: dict) -> str | None:
+    """Gzip+b64 encode a GenerateResponse-shaped dict for DB storage."""
+    import base64
+    import gzip
+    try:
+        return base64.b64encode(
+            gzip.compress(json.dumps(response).encode("utf-8"))
+        ).decode("ascii")
+    except (TypeError, ValueError):
+        return None
+
+
+def _snapshot_decode_response(gz_b64: str) -> dict | None:
+    import base64
+    import gzip
+    try:
+        return json.loads(gzip.decompress(base64.b64decode(gz_b64)))
+    except (ValueError, OSError, json.JSONDecodeError):
+        return None
+
+
+def _snapshots_get(props: dict) -> dict:
+    """Return (and migrate) the snapshots dict from a BuildingRecord's props.
+
+    Old format stored ``last_response_gz_b64`` / ``last_settings`` flat. When
+    we see that, fold it into ``snapshots['dji']`` so existing records light
+    up the new mode system without a migration script.
+    """
+    snapshots = dict(props.get("snapshots") or {})
+    if not snapshots and props.get("last_response_gz_b64"):
+        snapshots["dji"] = {
+            "response_gz_b64": props["last_response_gz_b64"],
+            "settings": props.get("last_settings") or {},
+            "version_id": props.get("last_version_id"),
+        }
+    return snapshots
+
+
+def _snapshot_save(
+    building_id: str,
+    mode: str,
+    response: dict,
+    settings: dict,
+    version_id: str,
+    *,
+    extra_props: dict | None = None,
+) -> None:
+    """Write ``snapshots[mode]`` into the BuildingRecord. Atomic, one DB trip."""
+    if mode not in SNAPSHOT_MODES:
+        raise ValueError(f"Unknown snapshot mode: {mode!r}")
+    gz_b64 = _snapshot_encode_response(response)
+    if gz_b64 is None:
+        return
+    db = get_db()
+    try:
+        rec = db.query(BuildingRecord).filter_by(id=building_id).first()
+        if rec is None:
+            return
+        props = json.loads(rec.properties_json or "{}")
+        snapshots = _snapshots_get(props)
+        snapshots[mode] = {
+            "response_gz_b64": gz_b64,
+            "settings": settings,
+            "version_id": version_id,
+        }
+        props["snapshots"] = snapshots
+        props["active_mode"] = mode
+        # Keep the flat last_* keys in sync with the dji snapshot for back-
+        # compat with any code still reading them. Drop them for other modes.
+        if mode == "dji":
+            props["last_response_gz_b64"] = gz_b64
+            props["last_settings"] = settings
+            props["last_version_id"] = version_id
+        if extra_props:
+            props.update(extra_props)
+        rec.properties_json = json.dumps(props)
+        db.commit()
+    finally:
+        db.close()
+
+
 def _facade_cache_invalidate(building_id: str) -> None:
     """Drop all cached entries for a building (called when it's deleted or refined)."""
     with _facade_cache_lock:
@@ -1172,6 +1338,14 @@ async def import_kmz(
                 "imported_name": parsed.name,
             }
 
+            # Persist as the initial DJI snapshot so "Open" / "switch to DJI"
+            # later hits the fast load path without needing a refine first.
+            if building_id:
+                try:
+                    _snapshot_save(building_id, "dji", response, {}, version.version_id)
+                except Exception as _snap_exc:
+                    print(f"[kmz import] snapshot save failed: {_snap_exc}")
+
             with _upload_lock:
                 _upload_tasks[task_id].update(
                     status="complete", progress=1.0, message="Import complete", result=response,
@@ -1193,11 +1367,96 @@ async def import_kmz(
 
 @router.get("/buildings")
 def list_buildings():
-    """List all uploaded buildings."""
+    """List all uploaded buildings, with lightweight snapshot metadata."""
     db = get_db()
     try:
         records = db.query(BuildingRecord).order_by(BuildingRecord.created_at.desc()).all()
-        return {"buildings": [r.to_dict() for r in records]}
+        out = []
+        for r in records:
+            d = r.to_dict()
+            # Re-parse heavy props to derive snapshot availability without
+            # shipping the blobs back to the client.
+            try:
+                heavy = json.loads(r.properties_json or "{}")
+            except (json.JSONDecodeError, TypeError):
+                heavy = {}
+            snaps = _snapshots_get(heavy)
+            d["available_modes"] = sorted(
+                m for m in snaps if snaps[m].get("response_gz_b64")
+            )
+            d["active_mode"] = heavy.get("active_mode") or (
+                d["available_modes"][0] if d["available_modes"] else None
+            )
+            out.append(d)
+        return {"buildings": out}
+    finally:
+        db.close()
+
+
+class SaveSnapshotRequest(BaseModel):
+    version_id: str
+    settings: dict | None = None
+
+
+@router.post("/buildings/{building_id}/snapshots/{mode}")
+def save_building_snapshot(building_id: str, mode: str, req: SaveSnapshotRequest):
+    """Persist a MissionVersion as the named-mode snapshot for a building.
+
+    The frontend calls this after a generate / rewrite completes so the mode
+    can be re-loaded instantly later. Fetches the version's response shape
+    out of the in-memory ``session`` store, compresses, and writes.
+    """
+    if mode not in SNAPSHOT_MODES:
+        raise HTTPException(status_code=400, detail=f"Unknown mode: {mode!r}")
+    version = session.get(req.version_id)
+    if version is None:
+        raise HTTPException(status_code=404, detail="Version not found")
+
+    # Reconstruct the GenerateResponse-shaped dict from the in-memory version.
+    response = {
+        "version_id": version.version_id,
+        "timestamp": version.timestamp,
+        "summary": version.summary,
+        "viewer_data": version.viewer_data,
+        "validation": [],
+        "can_export": True,
+        "config_snapshot": {
+            "building_id": building_id,
+            "building": version.building_params,
+            "mission": version.mission_params,
+        },
+        "building_id": building_id,
+    }
+    _snapshot_save(
+        building_id, mode, response, req.settings or {}, version.version_id,
+    )
+    return {"ok": True, "mode": mode, "version_id": version.version_id}
+
+
+@router.delete("/buildings/{building_id}/snapshots/{mode}")
+def delete_building_snapshot(building_id: str, mode: str):
+    """Drop one named snapshot (e.g. discard the inspection path)."""
+    if mode not in SNAPSHOT_MODES:
+        raise HTTPException(status_code=400, detail=f"Unknown mode: {mode!r}")
+    db = get_db()
+    try:
+        rec = db.query(BuildingRecord).filter_by(id=building_id).first()
+        if rec is None:
+            raise HTTPException(status_code=404, detail="Building not found")
+        props = json.loads(rec.properties_json or "{}")
+        snaps = _snapshots_get(props)
+        removed = snaps.pop(mode, None)
+        props["snapshots"] = snaps
+        if mode == "dji":
+            props.pop("last_response_gz_b64", None)
+            props.pop("last_settings", None)
+            props.pop("last_version_id", None)
+        if props.get("active_mode") == mode:
+            remaining = [m for m in snaps if snaps[m].get("response_gz_b64")]
+            props["active_mode"] = remaining[0] if remaining else None
+        rec.properties_json = json.dumps(props)
+        db.commit()
+        return {"ok": True, "removed": bool(removed)}
     finally:
         db.close()
 
@@ -1276,49 +1535,63 @@ def refine_kmz_building(building_id: str, req: RefineKmzRequest):
 
             ply_bytes = gzip.decompress(base64.b64decode(props["ply_b64"]))
 
-            _set_upload_progress(task_id, 0.10, "Loading point cloud…")
-            pcd = load_pointcloud(ply_bytes)
-
-            _set_upload_progress(task_id, 0.25, f"Reconstructing at voxel={voxel_size:.3f}m…")
-            mesh_bytes = pointcloud_to_mesh_ply(
-                pcd,
-                voxel_size_override=voxel_size,
-                aw_alpha_override=(float(req.aw_alpha) if req.aw_alpha else None),
-                aw_offset_override=(float(req.aw_offset) if req.aw_offset else None),
-            )
-
-            _set_upload_progress(task_id, 0.55, "Subsampling point cloud for viewer…")
-            pc_positions, pc_colors = pointcloud_to_viewer_arrays(pcd, max_points=250_000)
-
             ref_lat = float(props.get("ref_lat", record.lat))
             ref_lon = float(props.get("ref_lon", record.lon))
             ref_alt = float(props.get("ref_alt", 0.0))
             name = record.name
 
-            _set_upload_progress(task_id, 0.65, "Building footprint from mesh…")
-            building = build_building_from_mesh(
-                mesh_data=mesh_bytes, file_type="ply",
-                lat=ref_lat, lon=ref_lon, name=name,
-                preserve_position=True,
-            )
-            building.label = name
+            # --- PHASE 1: mesh reconstruction (cached on voxel + aw_* params) ---
+            mesh_key = _kmz_mesh_key(building_id, voxel_size, req.aw_alpha, req.aw_offset)
+            cached_mesh = _kmz_mesh_cache_get(mesh_key)
+            if cached_mesh is not None:
+                (mesh_bytes, pcd, pc_positions, pc_colors, building,
+                 clip_poly_ref, clipped_mesh_trimesh, pc_xyz_ref) = cached_mesh
+                _set_upload_progress(task_id, 0.70, "Mesh cache hit — skipping reconstruction.")
+            else:
+                _set_upload_progress(task_id, 0.10, "Loading point cloud…")
+                pcd = load_pointcloud(ply_bytes)
 
-            _set_upload_progress(task_id, 0.78, "Tight-clipping mesh to building + extracting facades…")
-            from ..kmz_import import (
-                polygon_to_enu as _polygon_to_enu,
-                clip_mesh_to_polygon_xy as _clip_mesh_to_polygon_xy,
-            )
-            mission_area_wgs84 = [tuple(p) for p in props.get("mission_area_wgs84", [])]
-            area_enu_refine = _polygon_to_enu(mission_area_wgs84, ref_lat, ref_lon, ref_alt)
-            import io as _io
-            import trimesh as _trimesh3
-            import numpy as _np_ref
-            pc_xyz_ref = _np_ref.asarray(pcd.points, dtype=_np_ref.float32)
-            clip_poly_ref = _tighten_clip_polygon(area_enu_refine, pc_xyz_ref)
-            clipped_bytes_ref = _clip_mesh_to_polygon_xy(mesh_bytes, clip_poly_ref)
-            _mesh_clipped_ref = _trimesh3.load(
-                _io.BytesIO(clipped_bytes_ref), file_type="ply", force="mesh", process=False,
-            )
+                _set_upload_progress(task_id, 0.25, f"Reconstructing at voxel={voxel_size:.3f}m…")
+                mesh_bytes = pointcloud_to_mesh_ply(
+                    pcd,
+                    voxel_size_override=voxel_size,
+                    aw_alpha_override=(float(req.aw_alpha) if req.aw_alpha else None),
+                    aw_offset_override=(float(req.aw_offset) if req.aw_offset else None),
+                )
+
+                _set_upload_progress(task_id, 0.55, "Subsampling point cloud for viewer…")
+                pc_positions, pc_colors = pointcloud_to_viewer_arrays(pcd, max_points=250_000)
+
+                _set_upload_progress(task_id, 0.65, "Building footprint from mesh…")
+                building = build_building_from_mesh(
+                    mesh_data=mesh_bytes, file_type="ply",
+                    lat=ref_lat, lon=ref_lon, name=name,
+                    preserve_position=True,
+                )
+                building.label = name
+
+                _set_upload_progress(task_id, 0.72, "Tight-clipping mesh to building…")
+                from ..kmz_import import (
+                    polygon_to_enu as _polygon_to_enu,
+                    clip_mesh_to_polygon_xy as _clip_mesh_to_polygon_xy,
+                )
+                mission_area_wgs84_cache = [tuple(p) for p in props.get("mission_area_wgs84", [])]
+                area_enu_refine = _polygon_to_enu(mission_area_wgs84_cache, ref_lat, ref_lon, ref_alt)
+                import io as _io
+                import trimesh as _trimesh3
+                import numpy as _np_ref
+                pc_xyz_ref = _np_ref.asarray(pcd.points, dtype=_np_ref.float32)
+                clip_poly_ref = _tighten_clip_polygon(area_enu_refine, pc_xyz_ref)
+                clipped_bytes_ref = _clip_mesh_to_polygon_xy(mesh_bytes, clip_poly_ref)
+                clipped_mesh_trimesh = _trimesh3.load(
+                    _io.BytesIO(clipped_bytes_ref), file_type="ply", force="mesh", process=False,
+                )
+                _kmz_mesh_cache_put(mesh_key, (
+                    mesh_bytes, pcd, pc_positions, pc_colors, building,
+                    clip_poly_ref, clipped_mesh_trimesh, pc_xyz_ref,
+                ))
+
+            # --- PHASE 2: facade extraction (cached on fd_* params + mesh_key) ---
             fd_overrides_refine = {
                 "epsilon": req.fd_epsilon,
                 "cluster_epsilon": req.fd_cluster_epsilon,
@@ -1328,10 +1601,18 @@ def refine_kmz_building(building_id: str, req: RefineKmzRequest):
                 "min_density_per_m2": req.fd_min_density_per_m2,
                 "normal_threshold": req.fd_normal_threshold,
             }
-            building.facades = _kmz_extract_best_facades(
-                _mesh_clipped_ref, clip_poly_ref, pc_xyz_ref,
-                fd_overrides=fd_overrides_refine,
-            )
+            facade_key = _kmz_facade_runtime_key(mesh_key, fd_overrides_refine)
+            cached_facades = _kmz_facade_runtime_cache_get(facade_key)
+            if cached_facades is not None:
+                _set_upload_progress(task_id, 0.82, "Facade cache hit — skipping CGAL.")
+                building.facades = cached_facades
+            else:
+                _set_upload_progress(task_id, 0.78, "Extracting facades (CGAL)…")
+                building.facades = _kmz_extract_best_facades(
+                    clipped_mesh_trimesh, clip_poly_ref, pc_xyz_ref,
+                    fd_overrides=fd_overrides_refine,
+                )
+                _kmz_facade_runtime_cache_put(facade_key, building.facades)
             # Restrict to facades inside the DJI flight envelope (waypoint hull + 2 m margin)
             from ..kmz_import import ParsedWaypoint as _ParsedWaypoint_ref, waypoints_to_enu as _wp_enu_ref
             _waypoints_raw_ref = props.get("waypoints_raw", [])
@@ -1503,7 +1784,7 @@ def refine_kmz_building(building_id: str, req: RefineKmzRequest):
                 "voxel_size": voxel_size,
             }
 
-            last_settings = {
+            dji_settings = {
                 "voxel_size": voxel_size,
                 "aw_alpha": float(req.aw_alpha) if req.aw_alpha is not None else None,
                 "aw_offset": float(req.aw_offset) if req.aw_offset is not None else None,
@@ -1516,35 +1797,26 @@ def refine_kmz_building(building_id: str, req: RefineKmzRequest):
                 "fd_normal_threshold": float(req.fd_normal_threshold) if req.fd_normal_threshold is not None else None,
             }
 
-            # Persist the full response + settings so selectBuilding can load
-            # instantly without re-running alpha_wrap + CGAL extraction.
-            new_props = dict(props)
-            new_props["mesh_viewer"] = getattr(building, "_mesh_viewer_data", None)
-            new_props["pc_b64"] = pc_b64
-            new_props["voxel_size"] = voxel_size
-            new_props["width"] = building.width
-            new_props["depth"] = building.depth
-            new_props["auto_height"] = building.height
-            new_props["last_settings"] = last_settings
-            new_props["last_version_id"] = version.version_id
-            # Gzip the response so SQLite row stays manageable. mesh_viewer is
-            # already stored separately; compress the combined payload once.
-            try:
-                resp_bytes = json.dumps(response).encode("utf-8")
-                new_props["last_response_gz_b64"] = base64.b64encode(
-                    gzip.compress(resp_bytes)
-                ).decode("ascii")
-            except (TypeError, ValueError):
-                new_props.pop("last_response_gz_b64", None)
-
+            # Also persist mesh / point-cloud / geometry alongside the snapshot,
+            # and sync the record's height field.
+            extra = {
+                "mesh_viewer": getattr(building, "_mesh_viewer_data", None),
+                "pc_b64": pc_b64,
+                "voxel_size": voxel_size,
+                "width": building.width,
+                "depth": building.depth,
+                "auto_height": building.height,
+            }
+            _snapshot_save(
+                building_id, "dji", response, dji_settings, version.version_id,
+                extra_props=extra,
+            )
             db2 = get_db()
             try:
                 rec = db2.query(BuildingRecord).filter_by(id=building_id).first()
-                if rec is None:
-                    raise ValueError("BuildingRecord disappeared during refine")
-                rec.height = building.height
-                rec.properties_json = json.dumps(new_props)
-                db2.commit()
+                if rec is not None:
+                    rec.height = building.height
+                    db2.commit()
             finally:
                 db2.close()
 
@@ -1566,18 +1838,16 @@ def refine_kmz_building(building_id: str, req: RefineKmzRequest):
 
 
 @router.post("/buildings/{building_id}/load")
-def load_building(building_id: str):
-    """Instantly re-hydrate a saved building's last viewer state + settings.
+def load_building(building_id: str, mode: str | None = None):
+    """Instantly re-hydrate a saved building's snapshot for the given mode.
 
-    Reads the gzipped ``last_response`` and ``last_settings`` blobs written by
-    ``refine_kmz_building``. Skips alpha_wrap and CGAL extraction entirely —
-    mesh + facades come back exactly as they were when this building was last
-    refined. Emits a fresh ``MissionVersion`` so the existing KMZ / rewrite
-    endpoints work against the loaded state.
+    ``mode`` picks which path to restore — ``dji`` (DJI original trajectory
+    with tuned facades) or ``inspection`` (generated NEN-2767 boustrophedon).
+    When omitted, uses the record's ``active_mode`` (falls back to ``dji``).
+
+    Emits a fresh ``MissionVersion`` so the existing KMZ / rewrite endpoints
+    work against the loaded state.
     """
-    import base64
-    import gzip
-
     db = get_db()
     try:
         record = db.query(BuildingRecord).filter_by(id=building_id).first()
@@ -1590,20 +1860,21 @@ def load_building(building_id: str):
     finally:
         db.close()
 
-    resp_gz_b64 = props.get("last_response_gz_b64")
-    if not resp_gz_b64:
+    snapshots = _snapshots_get(props)
+    resolved_mode = mode or props.get("active_mode") or "dji"
+    if resolved_mode not in SNAPSHOT_MODES:
+        raise HTTPException(status_code=400, detail=f"Unknown mode: {resolved_mode!r}")
+
+    snap = snapshots.get(resolved_mode)
+    if not snap or not snap.get("response_gz_b64"):
         raise HTTPException(
             status_code=409,
-            detail="No cached response for this building — run a refine first.",
+            detail=f"No '{resolved_mode}' snapshot for this building — generate it first.",
         )
 
-    try:
-        stored_response = json.loads(gzip.decompress(base64.b64decode(resp_gz_b64)))
-    except (ValueError, OSError, json.JSONDecodeError) as exc:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Cached response corrupt: {exc}",
-        )
+    stored_response = _snapshot_decode_response(snap["response_gz_b64"])
+    if stored_response is None:
+        raise HTTPException(status_code=500, detail="Cached snapshot corrupt")
 
     # Re-emit as a fresh MissionVersion so downstream endpoints (KMZ download,
     # rewrite-gimbals) have a live version_id to target. Waypoints + building
@@ -1694,9 +1965,24 @@ def load_building(building_id: str):
     response["config_snapshot"] = config_snap
     response["building_id"] = building_id
 
+    # Persist the newly-active mode so next reload defaults to it.
+    if props.get("active_mode") != resolved_mode:
+        db2 = get_db()
+        try:
+            rec = db2.query(BuildingRecord).filter_by(id=building_id).first()
+            if rec is not None:
+                p2 = json.loads(rec.properties_json or "{}")
+                p2["active_mode"] = resolved_mode
+                rec.properties_json = json.dumps(p2)
+                db2.commit()
+        finally:
+            db2.close()
+
     return {
         "result": response,
-        "settings": props.get("last_settings", {}),
+        "settings": snap.get("settings") or {},
+        "mode": resolved_mode,
+        "available_modes": sorted(m for m in snapshots if snapshots[m].get("response_gz_b64")),
     }
 
 
@@ -1711,6 +1997,8 @@ def delete_building(building_id: str):
         db.delete(record)
         db.commit()
         _facade_cache_invalidate(building_id)
+        _kmz_mesh_cache_invalidate(building_id)
+        _kmz_facade_runtime_cache_invalidate(building_id)
         return {"deleted": building_id}
     finally:
         db.close()
@@ -2305,14 +2593,17 @@ def rewrite_gimbals(version_id: str, req: RewriteGimbalsRequest | None = None):
     version = session.get(version_id)
     if not version:
         raise HTTPException(status_code=404, detail="Version not found")
-    if not version.building.facades:
+
+    params = req or RewriteGimbalsRequest()
+    # Facades are only required when rewriting angles. Strip-rosette-only
+    # (rewrite_angles=False) just clones the waypoints and edits actions/speed,
+    # so a raw-KMZ version without extracted facades is fine.
+    if params.rewrite_angles and not version.building.facades:
         raise HTTPException(
             status_code=400,
             detail="Source version has no facades. Run facade extraction first "
                    "(re-import the KMZ in Facades mode, or run /generate).",
         )
-
-    params = req or RewriteGimbalsRequest()
     if params.rewrite_angles:
         new_waypoints = rewrite_gimbals_perpendicular(
             waypoints=version.waypoints,

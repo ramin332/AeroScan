@@ -154,6 +154,9 @@ interface AppState {
   toggleKmzFacades: () => Promise<void>;
   refineKmz: (voxelSize: number) => Promise<void>;
   triggerRefine: () => void;
+  triggerMissionUpdate: () => void;
+  missionUpdateRunning: boolean;
+  missionUpdatePending: boolean;
   refineRunning: boolean;
   refinePending: boolean;
   optimizeKmz: (buildingId?: string | null) => Promise<void>;
@@ -192,8 +195,9 @@ interface AppState {
   // Saved buildings (persisted on backend sqlite). Displayed as "Saved buildings" list.
   buildings: import('./api/types').UploadedBuilding[];
   refreshBuildings: () => Promise<void>;
-  selectBuilding: (id: string) => Promise<void>;
+  selectBuilding: (id: string, mode?: 'dji' | 'inspection') => Promise<void>;
   deleteBuilding: (id: string) => Promise<void>;
+  switchMode: (mode: 'dji' | 'inspection') => Promise<void>;
   stripRosetteOnly: () => Promise<void>;
   showOriginalGimbals: boolean;
   setShowOriginalGimbals: (v: boolean) => void;
@@ -345,7 +349,17 @@ export const useStore = create<AppState>()(persist((set, get) => ({
     try {
       const res = await api.rewriteGimbals(current.version_id);
       await get().loadVersion(res.version_id);
-      await get().refreshVersions();
+      // Persist the tweaked DJI path as the new dji snapshot.
+      const buildingId = get().result?.building_id ?? get().selectedBuildingId;
+      const mode = get().kmzMode;
+      if (buildingId && (mode === 'dji' || mode === 'inspection')) {
+        try {
+          await api.saveBuildingSnapshot(buildingId, mode, res.version_id);
+        } catch (snapErr) {
+          console.warn('Persist snapshot after rewrite failed:', snapErr);
+        }
+      }
+      await Promise.all([get().refreshVersions(), get().refreshBuildings()]);
     } catch (e) {
       console.error('Rewrite gimbals failed:', e);
       set({ loading: false });
@@ -364,20 +378,31 @@ export const useStore = create<AppState>()(persist((set, get) => ({
       console.error('No building_id on current result — cannot generate inspection mission');
       return;
     }
+    // First-time entry to inspection mode seeds the NEN-2767 preset; afterwards
+    // the current mission params (driven by the sidebar sliders) are used so
+    // GSD/overlap/speed/camera changes actually re-render the path.
+    const wasInspection = get().kmzMode === 'inspection';
+    const seedMission: MissionParams = wasInspection ? get().mission : { ...NEN2767_MISSION };
     const { building, algorithm, disabledFacades, enabledCandidates, exclusionZones } = get();
-    set({ loading: true });
+    set({ loading: true, mission: seedMission, kmzMode: 'inspection' });
     try {
       const result = await api.generate({
         building_id: buildingId,
         building,
-        mission: { ...NEN2767_MISSION },
+        mission: seedMission,
         algorithm,
         disabled_facades: disabledFacades.size > 0 ? [...disabledFacades] : undefined,
         enabled_candidates: enabledCandidates.size > 0 ? [...enabledCandidates] : undefined,
         exclusion_zones: exclusionZones.length > 0 ? exclusionZones : undefined,
       });
-      set({ result, mission: { ...NEN2767_MISSION }, loading: false, kmzMode: 'inspection' });
-      await get().refreshVersions();
+      set({ result, loading: false });
+      // Persist the inspection snapshot so switching modes later is instant.
+      try {
+        await api.saveBuildingSnapshot(buildingId, 'inspection', result.version_id, { ...seedMission });
+      } catch (snapErr) {
+        console.warn('Persist inspection snapshot failed:', snapErr);
+      }
+      await Promise.all([get().refreshVersions(), get().refreshBuildings()]);
     } catch (e) {
       console.error('Generate inspection mission failed:', e);
       set({ loading: false });
@@ -415,15 +440,16 @@ export const useStore = create<AppState>()(persist((set, get) => ({
       console.error('Refresh buildings failed:', e);
     }
   },
-  selectBuilding: async (id) => {
-    // Fast path: hit /buildings/{id}/load which returns the gzipped response
-    // from the last refine plus the exact settings that produced it. No
-    // alpha_wrap, no CGAL extraction — instant. Falls back to refine only if
-    // the building has never been refined (409 from backend).
+  selectBuilding: async (id, mode) => {
+    // Fast path: hit /buildings/{id}/load which returns the gzipped snapshot
+    // for the requested mode plus the exact settings that produced it. No
+    // alpha_wrap, no CGAL extraction — instant. Falls back to DJI refine only
+    // if nothing is cached (409 from backend).
     set({ selectedBuildingId: id, loading: true });
     try {
-      const { result, settings } = await api.loadBuilding(id);
-      const patch: Partial<AppState> = { result, loading: false };
+      const resp = await api.loadBuilding(id, mode);
+      const { result, settings, mode: loadedMode } = resp;
+      const patch: Partial<AppState> = { result, loading: false, kmzMode: loadedMode };
       if (settings.voxel_size != null) patch.kmzOptimizeMin = settings.voxel_size;
       if ('aw_alpha' in settings) patch.kmzAwAlpha = settings.aw_alpha ?? null;
       if ('aw_offset' in settings) patch.kmzAwOffset = settings.aw_offset ?? null;
@@ -439,7 +465,21 @@ export const useStore = create<AppState>()(persist((set, get) => ({
     } catch (e) {
       console.warn('Fast load failed, falling back to refine:', e);
       set({ loading: false });
-      get().triggerRefine();
+      if (!mode || mode === 'dji') get().triggerRefine();
+    }
+  },
+  switchMode: async (mode) => {
+    // Mode toggle: load the requested snapshot. If not yet generated,
+    // surface the failure so the UI can offer the appropriate generate
+    // button (triggerRefine for dji, generateInspectionMission for inspection).
+    const id = get().selectedBuildingId;
+    set({ kmzMode: mode });
+    if (!id) return;
+    try {
+      await get().selectBuilding(id, mode);
+      await get().refreshBuildings();
+    } catch (e) {
+      console.warn('Mode switch failed:', e);
     }
   },
   deleteBuilding: async (id) => {
@@ -472,7 +512,15 @@ export const useStore = create<AppState>()(persist((set, get) => ({
         strip_smart_oblique: true,
       });
       await get().loadVersion(res.version_id);
-      await get().refreshVersions();
+      const buildingId = get().result?.building_id ?? get().selectedBuildingId;
+      if (buildingId) {
+        try {
+          await api.saveBuildingSnapshot(buildingId, 'dji', res.version_id);
+        } catch (snapErr) {
+          console.warn('Persist snapshot after strip failed:', snapErr);
+        }
+      }
+      await Promise.all([get().refreshVersions(), get().refreshBuildings()]);
     } catch (e) {
       console.error('Strip rosette failed:', e);
       set({ loading: false });
@@ -480,6 +528,33 @@ export const useStore = create<AppState>()(persist((set, get) => ({
   },
   refineRunning: false,
   refinePending: false,
+  missionUpdateRunning: false,
+  missionUpdatePending: false,
+  triggerMissionUpdate: () => {
+    // Coalescing fire-and-forget wrapper for mission-param changes (GSD,
+    // overlap, flight_speed, camera, etc.). In inspection mode we regenerate
+    // the NEN-2767 path; in dji mode there's nothing to regenerate from the
+    // current sliders (DJI path comes from the imported KMZ), so it's a no-op.
+    const run = async () => {
+      if (get().missionUpdateRunning) {
+        set({ missionUpdatePending: true });
+        return;
+      }
+      set({ missionUpdateRunning: true, missionUpdatePending: false });
+      try {
+        if (get().kmzMode === 'inspection') {
+          await get().generateInspectionMission();
+        }
+      } catch (e) {
+        console.error('[triggerMissionUpdate] failed:', e);
+      } finally {
+        const pending = get().missionUpdatePending;
+        set({ missionUpdateRunning: false, missionUpdatePending: false });
+        if (pending) run();
+      }
+    };
+    void run();
+  },
   triggerRefine: () => {
     // Coalescing fire-and-forget wrapper. If a refine is in flight, mark
     // the next one as pending; when the in-flight one finishes we kick off

@@ -37,10 +37,11 @@ export function Sidebar() {
     kmzFdEpsilon, kmzFdClusterEpsilon, kmzFdMinPoints,
     kmzFdMinWallArea, kmzFdMinRoofArea, kmzFdMinDensity, kmzFdNormalThreshold,
     setKmzFacadeParams,
-    kmzMode, setKmzMode,
+    kmzMode, switchMode,
     buildings, refreshBuildings, selectBuilding, deleteBuilding, stripRosetteOnly,
     simStatus, simProgress, simMessage, startSimulation,
     rewriteGimbals, generateInspectionMission, toggleKmzFacades, lastKmzFile,
+    triggerMissionUpdate,
   } = useStore();
 
   useEffect(() => { void refreshBuildings(); }, [refreshBuildings]);
@@ -50,9 +51,11 @@ export function Sidebar() {
 
   const kmzRef = useRef<HTMLInputElement>(null);
 
-  // Every mission in this app is KMZ-derived; there's no auto-regenerate
-  // for raw building params any more. Buttons trigger explicit actions.
-  const autoGen = () => {};
+  // Mission-param sliders (GSD, overlap, speed, camera, gimbal margin, …)
+  // feed into the coalescing mission-update trigger. In inspection mode this
+  // re-runs generateInspectionMission with the latest params; in DJI mode it
+  // is a no-op (the DJI path comes straight from the imported KMZ).
+  const autoGen = () => { triggerMissionUpdate(); };
 
   const handleDragOver = (e: React.DragEvent) => {
     e.preventDefault();
@@ -134,51 +137,14 @@ export function Sidebar() {
             {result.summary.source === 'kmz_raw' ? 'Detect facades' : 'Hide facades (raw view)'}
           </button>
         )}
-        {result?.version_id && result.summary.facade_count > 0 && (
-          <>
-            <button
-              className="btn-primary"
-              style={{ marginTop: 8, width: '100%', fontSize: 12, padding: '6px 10px', fontWeight: 600 }}
-              onClick={() => rewriteGimbals()}
-              title="Keep DJI's trajectory; rewrite gimbals perpendicular to each facade, cap speed to 3 m/s, and strip the SmartOblique rosette so every waypoint takes a single NEN-2767 photo. Creates a new version."
-            >
-              Rewrite gimbals (keep DJI path)
-            </button>
-            <button
-              className="btn-secondary"
-              style={{ marginTop: 6, width: '100%', fontSize: 12, padding: '6px 10px' }}
-              onClick={() => stripRosetteOnly()}
-              title="Keep DJI gimbals EXACTLY as they are. Only strip the SmartOblique 5-pose rosette so every waypoint takes 1 photo toward the facade, and cap speed to 3 m/s."
-            >
-              Strip rosette only (keep DJI gimbals)
-            </button>
-            {(result.summary.source?.startsWith('kmz_')) &&
-             (result.building_id || result.config_snapshot?.building_id) && (
-              <button
-                className="btn-primary"
-                style={{
-                  marginTop: 6,
-                  width: '100%',
-                  fontSize: 12,
-                  padding: '6px 10px',
-                  fontWeight: 600,
-                  background: 'linear-gradient(135deg, #3b82f6 0%, #06b6d4 100%)',
-                }}
-                onClick={() => generateInspectionMission()}
-                title="Generate a FRESH NEN-2767 inspection mission from the detected facades — discards DJI's trajectory entirely and builds a per-facade boustrophedon grid with perpendicular gimbals, stop-and-shoot, and inspection-grade GSD."
-              >
-                Generate NEN-2767 flight (fresh path)
-              </button>
-            )}
-            {(result.summary.gimbal_before || result.summary.gimbal_after) && (
-              <GimbalDiff
-                before={result.summary.gimbal_before}
-                after={result.summary.gimbal_after}
-                isRewritten={!!result.summary.parent_version_id}
-                diff={result.summary.gimbal_diff}
-              />
-            )}
-          </>
+        {result?.version_id && result.summary.facade_count > 0 &&
+         (result.summary.gimbal_before || result.summary.gimbal_after) && (
+          <GimbalDiff
+            before={result.summary.gimbal_before}
+            after={result.summary.gimbal_after}
+            isRewritten={!!result.summary.parent_version_id}
+            diff={result.summary.gimbal_diff}
+          />
         )}
       </div>
 
@@ -197,6 +163,7 @@ export function Sidebar() {
           <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
             {buildings.map((b) => {
               const isActive = selectedBuildingId === b.id;
+              const modes = b.available_modes ?? [];
               return (
                 <div
                   key={b.id}
@@ -224,11 +191,22 @@ export function Sidebar() {
                     }}>
                       {b.name}
                     </span>
-                    <span style={{ fontSize: 10, color: 'var(--text-dim)', display: 'flex', gap: 8 }}>
+                    <span style={{ fontSize: 10, color: 'var(--text-dim)', display: 'flex', gap: 6, alignItems: 'center' }}>
                       <span>{b.source_type}</span>
                       <span>·</span>
                       <span>{new Date(b.created_at).toLocaleDateString()}</span>
-                      {isActive && <span style={{ color: 'rgb(96,165,250)' }}>· loaded</span>}
+                      {modes.includes('dji') && (
+                        <span style={{
+                          background: 'rgba(59,130,246,0.25)', color: 'rgb(147,197,253)',
+                          padding: '1px 5px', borderRadius: 3, fontSize: 9, fontWeight: 600,
+                        }}>DJI</span>
+                      )}
+                      {modes.includes('inspection') && (
+                        <span style={{
+                          background: 'rgba(6,182,212,0.25)', color: 'rgb(103,232,249)',
+                          padding: '1px 5px', borderRadius: 3, fontSize: 9, fontWeight: 600,
+                        }}>NEN</span>
+                      )}
                     </span>
                   </button>
                   <button
@@ -253,29 +231,116 @@ export function Sidebar() {
         </div>
       )}
 
-      {/* ======== MODE TOGGLE (KMZ only) ======== */}
-      {isKmz && selectedBuildingId && (
-        <div className="section" style={{ display: 'flex', gap: 6, padding: 8 }}>
-          <button
-            className={kmzMode === 'dji' ? 'btn-primary' : 'btn-secondary'}
-            style={{ flex: 1, fontSize: 12, padding: '6px 8px' }}
-            onClick={() => setKmzMode('dji')}
-            title="Original DJI flight path. Tune mesh + facade detection to drive the gimbal rewrite. Waypoints stay as DJI flew them.">
-            DJI mode
-          </button>
-          <button
-            className={kmzMode === 'inspection' ? 'btn-primary' : 'btn-secondary'}
-            style={{ flex: 1, fontSize: 12, padding: '6px 8px' }}
-            onClick={() => setKmzMode('inspection')}
-            title="Generate a fresh NEN-2767 inspection mission from the detected facades. Tune mission / flight / TSP params below.">
-            Inspection mode
-          </button>
-        </div>
-      )}
+      {/* ======== PATH MODE SELECTOR (KMZ only) ========
+          Mutually-exclusive choice of which flight path is active.
+          Each mode is a persisted snapshot on the selected building — click
+          switches instantly. If a mode hasn't been generated yet, its
+          "Generate" action appears inside the mode-specific panel below. */}
+      {isKmz && selectedBuildingId && (() => {
+        const selected = buildings.find((b) => b.id === selectedBuildingId);
+        const availableModes = selected?.available_modes ?? [];
+        const hasDji = availableModes.includes('dji');
+        const hasInsp = availableModes.includes('inspection');
+        const MODES: Array<{
+          key: 'dji' | 'inspection';
+          label: string;
+          subtitle: string;
+          has: boolean;
+          tooltip: string;
+        }> = [
+          {
+            key: 'dji', label: 'DJI path', subtitle: hasDji ? 'saved' : 'default',
+            has: hasDji,
+            tooltip: "Original DJI flight path. Tune mesh + facade detection to drive gimbal rewrites. Waypoints stay as DJI flew them.",
+          },
+          {
+            key: 'inspection', label: 'Custom path', subtitle: hasInsp ? 'saved' : 'not generated',
+            has: hasInsp,
+            tooltip: "Fresh NEN-2767 inspection mission from detected facades. Per-facade boustrophedon, perpendicular gimbals, stop-and-shoot.",
+          },
+        ];
+        return (
+          <div className="section" style={{ padding: 10 }}>
+            <h3 style={{ margin: 0, marginBottom: 8, fontSize: 12, letterSpacing: 0.5, textTransform: 'uppercase', color: 'var(--text-dim)' }}>
+              Flight path
+            </h3>
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 6 }}>
+              {MODES.map((m) => {
+                const active = kmzMode === m.key;
+                return (
+                  <button
+                    key={m.key}
+                    onClick={() => void switchMode(m.key)}
+                    title={m.tooltip}
+                    style={{
+                      background: active
+                        ? (m.key === 'inspection'
+                            ? 'linear-gradient(135deg, #0891b2 0%, #06b6d4 100%)'
+                            : 'linear-gradient(135deg, #2563eb 0%, #3b82f6 100%)')
+                        : 'transparent',
+                      color: active ? 'white' : 'inherit',
+                      border: `1px solid ${active ? 'transparent' : 'var(--border)'}`,
+                      borderRadius: 6, padding: '8px 10px', cursor: 'pointer',
+                      display: 'flex', flexDirection: 'column', alignItems: 'flex-start', gap: 2,
+                      opacity: m.has || active ? 1 : 0.75,
+                    }}
+                  >
+                    <span style={{ fontWeight: 600, fontSize: 13 }}>{m.label}</span>
+                    <span style={{ fontSize: 10, opacity: 0.8, display: 'flex', gap: 4, alignItems: 'center' }}>
+                      <span style={{
+                        width: 6, height: 6, borderRadius: '50%',
+                        background: m.has ? '#10b981' : '#6b7280',
+                        display: 'inline-block',
+                      }} />
+                      {m.subtitle}
+                    </span>
+                  </button>
+                );
+              })}
+            </div>
+            {/* Mode-specific action buttons */}
+            {kmzMode === 'dji' && result?.version_id && result.summary.facade_count > 0 && (
+              <div style={{ marginTop: 8, display: 'flex', flexDirection: 'column', gap: 6 }}>
+                <button
+                  className="btn-primary"
+                  style={{ width: '100%', fontSize: 12, padding: '6px 10px', fontWeight: 600 }}
+                  onClick={() => rewriteGimbals()}
+                  title="Rewrite gimbals perpendicular to each facade, cap speed to 3 m/s, strip SmartOblique rosette. Saves a new DJI snapshot."
+                >
+                  Rewrite gimbals
+                </button>
+                <button
+                  className="btn-secondary"
+                  style={{ width: '100%', fontSize: 12, padding: '6px 10px' }}
+                  onClick={() => stripRosetteOnly()}
+                  title="Keep DJI gimbals EXACTLY. Strip only the 5-pose rosette, cap speed to 3 m/s. Saves a new DJI snapshot."
+                >
+                  Strip rosette only
+                </button>
+              </div>
+            )}
+            {kmzMode === 'inspection' && (
+              <div style={{ marginTop: 8 }}>
+                <button
+                  className="btn-primary"
+                  style={{
+                    width: '100%', fontSize: 12, padding: '6px 10px', fontWeight: 600,
+                    background: 'linear-gradient(135deg, #3b82f6 0%, #06b6d4 100%)',
+                  }}
+                  onClick={() => generateInspectionMission()}
+                  title="Generate a fresh NEN-2767 inspection mission from the detected facades. Persists as the inspection snapshot."
+                >
+                  {hasInsp ? 'Regenerate NEN-2767 path' : 'Generate NEN-2767 path'}
+                </button>
+              </div>
+            )}
+          </div>
+        );
+      })()}
 
-      {/* ======== DJI: Mesh reconstruction (KMZ only) ======== */}
+      {/* ======== Mesh reconstruction (shared by both modes) ======== */}
       {isKmz && selectedBuildingId && (
-        <Section title="DJI: Mesh reconstruction" defaultOpen>
+        <Section title="Mesh reconstruction" defaultOpen>
           <button
             onClick={() => kmzOptimizing ? cancelOptimize() : optimizeKmz()}
             disabled={uploading}
@@ -333,9 +398,9 @@ export function Sidebar() {
         </Section>
       )}
 
-      {/* ======== DJI: Facade detection (KMZ only) ======== */}
+      {/* ======== Facade detection (shared by both modes) ======== */}
       {isKmz && selectedBuildingId && (
-        <Section title="DJI: Facade detection" defaultOpen={false}>
+        <Section title="Facade detection" defaultOpen={false}>
           <div className="field-hint" style={{ marginBottom: 6 }}>
             CGAL Shape-Detection (region growing). Tuned for many small facets over few large walls — gimbal targets dormers, sills, balconies. Changes re-run on release.
           </div>

@@ -126,11 +126,37 @@ export interface LoadedBuildingSettings {
   fd_normal_threshold?: number | null;
 }
 
-export async function loadBuilding(id: string): Promise<{
+export async function loadBuilding(
+  id: string,
+  mode?: 'dji' | 'inspection',
+): Promise<{
   result: GenerateResponse;
   settings: LoadedBuildingSettings;
+  mode: 'dji' | 'inspection';
+  available_modes: Array<'dji' | 'inspection'>;
 }> {
-  return request(`/buildings/${id}/load`, { method: 'POST' });
+  const qs = mode ? `?mode=${mode}` : '';
+  return request(`/buildings/${id}/load${qs}`, { method: 'POST' });
+}
+
+export async function saveBuildingSnapshot(
+  buildingId: string,
+  mode: 'dji' | 'inspection',
+  versionId: string,
+  settings?: Record<string, unknown>,
+): Promise<{ ok: true; mode: string; version_id: string }> {
+  return request(`/buildings/${buildingId}/snapshots/${mode}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ version_id: versionId, settings: settings ?? null }),
+  });
+}
+
+export async function deleteBuildingSnapshot(
+  buildingId: string,
+  mode: 'dji' | 'inspection',
+): Promise<{ ok: true; removed: boolean }> {
+  return request(`/buildings/${buildingId}/snapshots/${mode}`, { method: 'DELETE' });
 }
 
 export function uploadMeshFile(

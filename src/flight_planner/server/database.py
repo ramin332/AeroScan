@@ -55,6 +55,8 @@ class BuildingRecord(Base):
         "waypoints_raw",
         "mission_area_wgs84",
         "mission_config_raw",
+        "snapshots",
+        "last_response_gz_b64",
     })
 
     def to_dict(self, include_heavy: bool = False) -> dict:
