@@ -230,13 +230,26 @@ function OriginalGimbalArrows({ waypoints, color, cameraFov, showRosette }: { wa
   const halfW = frustumLen * Math.tan((fovHDeg * Math.PI) / 180 / 2);
   const halfH = frustumLen * Math.tan((fovVDeg * Math.PI) / 180 / 2);
 
+  // Smart3D KMZs mix capture waypoints (with a rosette) and transit
+  // waypoints (no photo action). If ANY waypoint has a rosette, treat this
+  // file as Smart3D and skip transit waypoints — DJI's Capture Quality
+  // Report doesn't render a frustum for them. For non-Smart3D files
+  // (plain takePhoto waylines, autoExplore) no waypoint will have a
+  // rosette and every waypoint is a capture point.
+  const isSmart3D = useMemo(
+    () => waypoints.some((w) => w.smart_oblique_poses && w.smart_oblique_poses.length > 0),
+    [waypoints],
+  );
+
   const { edgeGeo } = useMemo(() => {
     const edgePositions: number[] = [];
     for (const wp of waypoints) {
+      const hasRosette = !!(wp.smart_oblique_poses && wp.smart_oblique_poses.length > 0);
+      if (isSmart3D && !hasRosette) continue;
       const plannedPitch = wp.pitch_before !== undefined ? wp.pitch_before : wp.gimbal_pitch;
       const plannedYaw = wp.yaw_before !== undefined ? wp.yaw_before : wp.heading;
-      const poses = (showRosette && wp.smart_oblique_poses && wp.smart_oblique_poses.length > 0)
-        ? wp.smart_oblique_poses
+      const poses = (showRosette && hasRosette)
+        ? wp.smart_oblique_poses!
         : [{ pitch: plannedPitch, yaw: plannedYaw }];
 
       for (const p of poses) {
@@ -284,7 +297,7 @@ function OriginalGimbalArrows({ waypoints, color, cameraFov, showRosette }: { wa
     const g = new THREE.BufferGeometry();
     g.setAttribute('position', new THREE.Float32BufferAttribute(edgePositions, 3));
     return { edgeGeo: g };
-  }, [waypoints, frustumLen, halfW, halfH, showRosette]);
+  }, [waypoints, frustumLen, halfW, halfH, showRosette, isSmart3D]);
 
   if (!edgeGeo) return null;
   return (
