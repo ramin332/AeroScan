@@ -6,7 +6,12 @@ from pathlib import Path
 
 import pytest
 
-from flight_planner.kmz_import import parse_kmz, polygon_to_enu, waypoints_to_enu
+from flight_planner.kmz_import import (
+    mapping_bbox_to_enu,
+    parse_kmz,
+    polygon_to_enu,
+    waypoints_to_enu,
+)
 
 
 KMZ_DIR = Path(__file__).parent.parent / "kmz"
@@ -100,3 +105,93 @@ def test_parse_auto_explore_has_no_mapping_bbox(sample_kmz):
     """autoExplore KMZs ship only template.kml + waylines.wpml — no tileset."""
     parsed = parse_kmz(sample_kmz("auto_explore"), name="auto_explore")
     assert parsed.mapping_bbox_raw is None
+
+
+# ---------------------------------------------------------------------------
+# mapping_bbox_to_enu — compose 3D-Tiles ECEF→local with WGS84→ENU ref
+# ---------------------------------------------------------------------------
+
+
+def test_mapping_bbox_to_enu_returns_none_when_raw_is_none():
+    assert mapping_bbox_to_enu(None, 0.0, 0.0, 0.0) is None
+
+
+def test_mapping_bbox_to_enu_mijande_matches_raw_when_ref_matches(sample_kmz):
+    """DJI's tileset.transform puts the local-frame origin at the sfm_geo_desc
+    ref point and aligns the local axes with ENU. So when the viewer ref equals
+    the tileset ref, the ENU OBB is literally ``box[0:3]`` + box half-axes.
+    """
+    import math as _math
+
+    parsed = parse_kmz(sample_kmz("mijande"), name="Mijande")
+    enu = mapping_bbox_to_enu(
+        parsed.mapping_bbox_raw,
+        parsed.ref_lat, parsed.ref_lon, parsed.ref_alt,
+    )
+
+    assert enu is not None
+    cx, cy, cz = enu["center"]
+    box = parsed.mapping_bbox_raw["box"]
+    assert cx == pytest.approx(box[0], abs=1e-3)
+    assert cy == pytest.approx(box[1], abs=1e-3)
+    assert cz == pytest.approx(box[2], abs=1e-3)
+
+    axes = enu["axes"]
+    assert len(axes) == 3
+    # Lengths preserved under rigid transform; and axes are axis-aligned here.
+    assert _math.hypot(axes[0][0], axes[0][1]) == pytest.approx(box[3], abs=1e-3)
+    assert _math.hypot(axes[1][0], axes[1][1]) == pytest.approx(box[7], abs=1e-3)
+    assert axes[2][2] == pytest.approx(box[11], abs=1e-3)
+
+
+def test_mapping_bbox_to_enu_translates_when_ref_offset(sample_kmz):
+    """Moving the viewer ref 10m north should shift the ENU OBB center by -10m Y."""
+    parsed = parse_kmz(sample_kmz("mijande"), name="Mijande")
+    base = mapping_bbox_to_enu(
+        parsed.mapping_bbox_raw, parsed.ref_lat, parsed.ref_lon, parsed.ref_alt
+    )
+    # ~10m north ≈ 10 / 111320 deg of latitude
+    shifted = mapping_bbox_to_enu(
+        parsed.mapping_bbox_raw,
+        parsed.ref_lat + 10.0 / 111_320.0,
+        parsed.ref_lon,
+        parsed.ref_alt,
+    )
+    assert shifted["center"][1] == pytest.approx(base["center"][1] - 10.0, abs=0.2)
+    assert shifted["center"][0] == pytest.approx(base["center"][0], abs=0.2)
+    # Axes are rigid: lengths preserved. Directions drift microscopically
+    # because the ENU rotation matrix is lat-dependent; that drift is
+    # irrelevant to the viewer.
+    import math as _math
+    for i in range(3):
+        len_base = _math.sqrt(sum(v * v for v in base["axes"][i]))
+        len_shifted = _math.sqrt(sum(v * v for v in shifted["axes"][i]))
+        assert len_shifted == pytest.approx(len_base, rel=1e-9)
+
+
+def test_mapping_bbox_to_enu_contains_point_cloud(sample_kmz):
+    """≥99% of cloud.ply points (already in LOCAL_ENU) fall inside the ENU OBB."""
+    import numpy as np
+
+    parsed = parse_kmz(sample_kmz("mijande"), name="Mijande")
+    enu = mapping_bbox_to_enu(
+        parsed.mapping_bbox_raw, parsed.ref_lat, parsed.ref_lon, parsed.ref_alt
+    )
+    center = np.array(enu["center"])
+    axes = [np.array(a) for a in enu["axes"]]
+
+    from flight_planner.kmz_import import load_pointcloud
+    pcd = load_pointcloud(parsed.point_cloud_ply)
+    pts = np.asarray(pcd.points)
+    assert len(pts) > 10_000
+
+    # Project each point onto each half-axis direction; inside iff |proj| ≤ |axis|.
+    inside = np.ones(len(pts), dtype=bool)
+    rel = pts - center
+    for a in axes:
+        mag = np.linalg.norm(a)
+        direction = a / mag
+        proj = rel @ direction
+        inside &= np.abs(proj) <= mag + 1e-6
+    frac = inside.sum() / len(pts)
+    assert frac >= 0.99, f"Only {frac:.4f} of cloud points lie inside OBB"
