@@ -925,6 +925,7 @@ async def import_kmz(
                 pointcloud_to_mesh_ply,
                 facades_from_polygon,
                 clip_mesh_to_polygon_xy,
+                mapping_bbox_to_enu,
             )
             from ..models import ActionType, CameraAction, CameraName as _CameraName, MissionConfig
 
@@ -969,14 +970,19 @@ async def import_kmz(
                 pc_positions, pc_colors = pointcloud_to_viewer_arrays(pcd, max_points=250_000)
 
                 from ..models import Building as _Building, RoofType as _RoofType
-                import numpy as _np_raw
-                pts = _np_raw.asarray(pcd.points)
-                if pts.size:
-                    mins = pts.min(axis=0)
-                    maxs = pts.max(axis=0)
-                    bbox_w = float(maxs[0] - mins[0])
-                    bbox_d = float(maxs[1] - mins[1])
-                    bbox_h = float(maxs[2] - mins[2])
+                # DJI's 3D-Tiles Mapping OBB (when present) is the authoritative
+                # scene-bounds volume; its half-axis magnitudes drive the viewer
+                # and the Building record's reported dimensions.
+                mapping_enu = mapping_bbox_to_enu(
+                    parsed.mapping_bbox_raw,
+                    parsed.ref_lat, parsed.ref_lon, parsed.ref_alt,
+                )
+                if mapping_enu is not None:
+                    import numpy as _np_raw
+                    axes = [_np_raw.asarray(a) for a in mapping_enu["axes"]]
+                    bbox_w = float(2.0 * _np_raw.linalg.norm(axes[0]))
+                    bbox_d = float(2.0 * _np_raw.linalg.norm(axes[1]))
+                    bbox_h = float(2.0 * _np_raw.linalg.norm(axes[2]))
                 else:
                     bbox_w = bbox_d = bbox_h = 0.0
                 building = _Building(
@@ -1163,6 +1169,7 @@ async def import_kmz(
                             } for wp in parsed.waypoints
                         ],
                         "mission_config_raw": parsed.mission_config_raw,
+                        "mapping_bbox_raw": parsed.mapping_bbox_raw,
                         "voxel_size": effective_voxel,
                     }),
                 )
@@ -1268,6 +1275,10 @@ async def import_kmz(
                 building, waypoints,
                 point_cloud={"positions": pc_positions, "colors": pc_colors},
                 mission_area=area_enu,
+                mapping_bbox=mapping_bbox_to_enu(
+                    parsed.mapping_bbox_raw,
+                    parsed.ref_lat, parsed.ref_lon, parsed.ref_alt,
+                ),
             )
             # Stamp DJI SmartOblique rosette poses onto viewer waypoint dicts so
             # the frontend can render all 5 original gimbal directions per
@@ -1725,10 +1736,14 @@ def refine_kmz_building(building_id: str, req: RefineKmzRequest):
                 "facade_coverage": compute_facade_coverage(building, waypoints),
             }
 
+            from ..kmz_import import mapping_bbox_to_enu as _mbox_to_enu
             threejs_data = prepare_threejs_data(
                 building, waypoints,
                 point_cloud={"positions": pc_positions, "colors": pc_colors},
                 mission_area=area_enu,
+                mapping_bbox=_mbox_to_enu(
+                    props.get("mapping_bbox_raw"), ref_lat, ref_lon, ref_alt,
+                ),
             )
             vw = threejs_data.get("waypoints", []) if isinstance(threejs_data, dict) else []
             for i, wd in enumerate(vw):

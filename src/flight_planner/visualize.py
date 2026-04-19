@@ -209,6 +209,7 @@ def prepare_threejs_data(
     candidate_facades: list | None = None,
     point_cloud: dict | None = None,
     mission_area: list[tuple[float, float, float]] | None = None,
+    mapping_bbox: dict | None = None,
 ) -> dict:
     """Prepare JSON-serializable data for the 3D Three.js viewer.
 
@@ -217,6 +218,10 @@ def prepare_threejs_data(
 
     ``mission_area`` — optional list of ``(x, y, z)`` ENU vertices forming the
     imported DJI mission-area polygon. Rendered as a dashed ground outline.
+
+    ``mapping_bbox`` — optional ``{"center": [x, y, z], "axes": [[...], [...], [...]]}``
+    oriented bbox in ENU meters, read from the KMZ's 3D-Tiles ``tileset.json``
+    (DJI's "Mapping" volume). ``None`` when the KMZ ships no tileset.
     """
     facade_data = []
     for f in building.facades:
@@ -273,4 +278,6 @@ def prepare_threejs_data(
         result["missionArea"] = {
             "vertices": [[float(x), float(y), float(z)] for x, y, z in mission_area],
         }
+    if mapping_bbox is not None:
+        result["mappingBox"] = mapping_bbox
     return result
