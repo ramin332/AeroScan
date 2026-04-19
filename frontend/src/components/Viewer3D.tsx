@@ -224,7 +224,10 @@ function OriginalGimbalArrows({ waypoints, color, cameraFov }: { waypoints: Wayp
   // fall back to M4E wide defaults.
   const fovHDeg = cameraFov?.fov_h_deg ?? 71.5;
   const fovVDeg = cameraFov?.fov_v_deg ?? 56.9;
-  const frustumLen = cameraFov ? Math.min(cameraFov.distance_m * 0.08, 0.6) : 0.4;
+  // 15% of capture distance keeps frustums readable against scene scale
+  // without overwhelming neighboring waypoints. For DJI mapping (~13m standoff)
+  // this gives ~2m — enough to see gentle pitch tilts like +9° or +20°.
+  const frustumLen = cameraFov ? cameraFov.distance_m * 0.15 : 1.5;
   const halfW = frustumLen * Math.tan((fovHDeg * Math.PI) / 180 / 2);
   const halfH = frustumLen * Math.tan((fovVDeg * Math.PI) / 180 / 2);
 
