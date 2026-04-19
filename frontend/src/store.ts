@@ -595,11 +595,10 @@ export const useStore = create<AppState>()(persist((set, get) => ({
   },
   showOriginalGimbals: true,
   setShowOriginalGimbals: (v: boolean) => set({ showOriginalGimbals: v }),
-  // Default ON: DJI Smart Auto Explore captures 5 photos per waypoint (1 nadir
-  // + 4 obliques). Showing just the planned pose = -90° nadir only, which
-  // looks "all straight down" and hides the oblique coverage that actually
-  // drives the reconstruction.
-  showRosettePoses: true,
+  // Default OFF: match DJI Capture Quality Report, which draws one frustum
+  // per waypoint (the planned aircraft pose) even though SmartOblique fires
+  // a 5-photo rosette at each apex. Toggle ON to see all 5 individual poses.
+  showRosettePoses: false,
   setShowRosettePoses: (v: boolean) => set({ showRosettePoses: v }),
   showMappingBox: false,
   setShowMappingBox: (v: boolean) => set({ showMappingBox: v }),
