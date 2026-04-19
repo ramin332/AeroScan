@@ -222,7 +222,7 @@ function CameraArrows({ waypoints, color, bright, cameraFov }: { waypoints: Wayp
 // (0.7–1.0 m/s) understate the actual flight speed by ~2× and produce a 5×-too-dense
 // shot count if used directly with the shutter interval. Distance-based sampling
 // matches what the DJI RC Plus quality report renders.
-const DJI_SMART3D_INTER_SHOT_DIST_M = 0.65;
+export const DJI_SMART3D_INTER_SHOT_DIST_M = 0.65;
 
 // One color per rosette pose index. Wraps modulo length, so a 5-pose Smart3D
 // cycle shows as 5 distinct color bands across the flight.

@@ -626,6 +626,7 @@ def run_simulation(
     render_scale: float = 0.1,
     voxel_size: float = 0.03,
     raw_mesh: dict | None = None,
+    kmz_context: dict | None = None,
 ) -> dict:
     """Run the full simulate-reconstruct-reimport pipeline."""
     output_dir = Path("sim_output") / (task.task_id if task else "default")
@@ -676,23 +677,84 @@ def run_simulation(
         mesh_path = decimated_path
 
     mesh_data = mesh_path.read_bytes()
-    recon_building = build_building_from_mesh(
-        mesh_data=mesh_data,
-        file_type="ply",
-        lat=building.lat,
-        lon=building.lon,
-        height=None,
-        name=f"{building.label or 'building'}_reconstructed",
-    )
 
-    # --- Phase 3: Generate new mission from reconstructed building ---
+    if kmz_context:
+        # KMZ source: route the reconstructed mesh through the same extraction
+        # pipeline the original import used (CGAL Shape-Detection on a sampled
+        # point cloud + DJI mission-area polygon clip), so the comparison is
+        # apples-to-apples. The default mesh region-growing path produces a
+        # very different facade set and makes the diff unreadable.
+        from .server.api import (
+            _kmz_extract_best_facades,
+            _filter_facades_by_dji_bbox,
+            _tighten_clip_polygon,
+        )
+        from .kmz_import import clip_mesh_to_polygon_xy, polygon_to_enu
+        import io as _io
+
+        ref_lat = kmz_context["ref_lat"]
+        ref_lon = kmz_context["ref_lon"]
+        ref_alt = kmz_context["ref_alt"]
+        mission_area = kmz_context["mission_area_wgs84"]
+
+        # Sample the recon mesh surface — CGAL extractor needs a point cloud,
+        # not faces. ~150k points matches the density we typically feed it
+        # from a real DJI Smart3D cloud.
+        n_sample = min(150_000, max(20_000, len(recon_tm.faces) * 2))
+        sampled, _ = _tm.sample.sample_surface(recon_tm, n_sample)
+        pc_xyz = np.asarray(sampled, dtype=np.float32)
+
+        area_enu = polygon_to_enu(mission_area, ref_lat, ref_lon, ref_alt)
+        clip_poly = _tighten_clip_polygon(area_enu, pc_xyz)
+        clipped_bytes = clip_mesh_to_polygon_xy(mesh_data, clip_poly)
+        mesh_clipped = _tm.load(
+            _io.BytesIO(clipped_bytes), file_type="ply", force="mesh", process=False,
+        )
+
+        recon_building = build_building_from_mesh(
+            mesh_data=clipped_bytes,
+            file_type="ply",
+            lat=ref_lat,
+            lon=ref_lon,
+            height=None,
+            preserve_position=True,
+            name=f"{building.label or 'building'}_reconstructed",
+        )
+        recon_building.facades = _kmz_extract_best_facades(mesh_clipped, clip_poly, pc_xyz)
+        recon_building.facades = _filter_facades_by_dji_bbox(
+            recon_building.facades, mission_area, ref_lat, ref_lon, ref_alt,
+        )
+        logger.info(
+            "Recon (KMZ path): sampled %d pts → %d facades after CGAL+polygon filter",
+            len(pc_xyz), len(recon_building.facades),
+        )
+    else:
+        recon_building = build_building_from_mesh(
+            mesh_data=mesh_data,
+            file_type="ply",
+            lat=building.lat,
+            lon=building.lon,
+            height=None,
+            name=f"{building.label or 'building'}_reconstructed",
+        )
+
+    # --- Phase 3: Mission for the reconstructed view ---
     if task:
         _update_task(task, status="generating", progress=0.85,
-                     message="Generating mission from reconstructed building…")
+                     message="Preparing reconstructed mission…")
 
-    recon_waypoints, _gen_stats = generate_mission_waypoints(
-        recon_building, config, algo,
-    )
+    if kmz_context:
+        # KMZ source: the input "mission" is DJI's Smart3D rosette flight, not an
+        # AeroScan plan. Re-running generate_mission_waypoints would replace it
+        # with a NEN-2767 boustrophedon over the reconstructed facets — wrong
+        # baseline for the comparison. Keep the original DJI waypoints overlaid
+        # on the reconstructed building so the user sees the same flight against
+        # the new geometry.
+        recon_waypoints = waypoints
+    else:
+        recon_waypoints, _gen_stats = generate_mission_waypoints(
+            recon_building, config, algo,
+        )
 
     # --- Phase 4: Build viewer data + comparison ---
     if task:
@@ -701,6 +763,24 @@ def run_simulation(
     threejs = prepare_threejs_data(recon_building, recon_waypoints)
     if hasattr(recon_building, "_mesh_viewer_data") and recon_building._mesh_viewer_data:
         threejs["rawMesh"] = recon_building._mesh_viewer_data
+
+    # KMZ source: recon_waypoints IS the original DJI flight (Phase 3 skip).
+    # Re-stamp the per-WP rosette poses + speed from the original viewer payload
+    # so the simulation viewer renders the same rosette overlay the user saw on
+    # the input mission. prepare_threejs_data drops these because Waypoint
+    # doesn't carry them.
+    if kmz_context:
+        overlay = kmz_context.get("waypoint_overlay") or []
+        vw = threejs.get("waypoints", [])
+        for i, wd in enumerate(vw):
+            if i >= len(overlay):
+                break
+            poses = overlay[i].get("smart_oblique_poses")
+            if poses:
+                wd["smart_oblique_poses"] = poses
+            speed = overlay[i].get("speed_ms")
+            if speed is not None:
+                wd["speed_ms"] = speed
 
     leaflet = prepare_leaflet_data(recon_building, recon_waypoints)
 
@@ -757,6 +837,7 @@ def start_simulation_async(
     render_scale: float = 0.1,
     voxel_size: float = 0.03,
     raw_mesh: dict | None = None,
+    kmz_context: dict | None = None,
 ):
     """Launch simulation in a background thread. Poll via get_task()."""
     task = SimulationTask(task_id=task_id, version_id=version_id)
@@ -771,6 +852,7 @@ def start_simulation_async(
                 building, waypoints, config, algo, task,
                 render_scale=render_scale, voxel_size=voxel_size,
                 raw_mesh=raw_mesh,
+                kmz_context=kmz_context,
             )
             _update_task(task, status="complete", progress=1.0,
                          message="Reconstruction complete", result=result)

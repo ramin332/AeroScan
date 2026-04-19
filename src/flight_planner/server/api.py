@@ -3002,27 +3002,56 @@ def simulate_reconstruct(request: SimulateRequest):
     import logging
     _log = logging.getLogger(__name__)
 
+    # Resolve building_id once — used for both raw_mesh lookup and KMZ context.
+    building_id = None
+    if hasattr(version, "building_params"):
+        building_id = version.building_params.get("building_id")
+    cs = getattr(version, "selection", None) or {}
+    if not building_id and isinstance(cs, dict):
+        building_id = cs.get("building_id")
+
     raw_mesh = version.viewer_data.get("threejs", {}).get("rawMesh")
+    kmz_context: dict | None = None
 
-    if not raw_mesh:
-        # Viewer data didn't have it — look up the original mesh from the database
-        building_id = None
-        if hasattr(version, "building_params"):
-            building_id = version.building_params.get("building_id")
-        # Also check config_snapshot (newer versions store it there)
-        cs = getattr(version, "selection", None) or {}
-        if not building_id and isinstance(cs, dict):
-            building_id = cs.get("building_id")
-
-        if building_id:
-            db = get_db()
-            try:
-                record = db.query(BuildingRecord).filter_by(id=building_id).first()
-                if record and record.properties_json:
-                    props = json.loads(record.properties_json)
+    if building_id:
+        db = get_db()
+        try:
+            record = db.query(BuildingRecord).filter_by(id=building_id).first()
+            if record and record.properties_json:
+                props = json.loads(record.properties_json)
+                if not raw_mesh:
                     raw_mesh = props.get("mesh_viewer")
-            finally:
-                db.close()
+                # KMZ source → re-extract reconstructed facades through the same
+                # CGAL + DJI-polygon pipeline that the original import used, so the
+                # comparison is apples-to-apples (not "CGAL on points" vs "region
+                # growing on mesh", which produces wildly different facade sets).
+                if record.source_type and record.source_type.startswith("kmz_"):
+                    mission_area = props.get("mission_area_wgs84")
+                    if mission_area:
+                        # Snapshot per-waypoint Smart3D rosette poses + flight
+                        # speed from the original viewer payload. The Waypoint
+                        # dataclass doesn't carry these; without re-attaching
+                        # them in Phase 4 the simulation viewer would render
+                        # plain frustums instead of the rosette overlay.
+                        orig_vw = (
+                            version.viewer_data.get("threejs", {}).get("waypoints", [])
+                        )
+                        wp_overlay = [
+                            {
+                                "smart_oblique_poses": w.get("smart_oblique_poses"),
+                                "speed_ms": w.get("speed_ms"),
+                            }
+                            for w in orig_vw
+                        ]
+                        kmz_context = {
+                            "mission_area_wgs84": mission_area,
+                            "ref_lat": float(props.get("ref_lat", record.lat)),
+                            "ref_lon": float(props.get("ref_lon", record.lon)),
+                            "ref_alt": float(props.get("ref_alt", 0.0)),
+                            "waypoint_overlay": wp_overlay,
+                        }
+        finally:
+            db.close()
 
     if not raw_mesh:
         # Last resort: check building._mesh_viewer_data (set during build_building_from_mesh)
@@ -3034,6 +3063,8 @@ def simulate_reconstruct(request: SimulateRequest):
         _log.info(f"Simulation: using raw mesh ({n_verts} verts, {n_faces} faces)")
     else:
         _log.info("Simulation: no raw mesh — using facade slab fallback")
+    if kmz_context:
+        _log.info("Simulation: KMZ source detected — recon will use CGAL extractor + DJI polygon clip")
 
     start_simulation_async(
         building=version.building,
@@ -3045,6 +3076,7 @@ def simulate_reconstruct(request: SimulateRequest):
         render_scale=request.render_scale,
         voxel_size=request.voxel_size,
         raw_mesh=raw_mesh,
+        kmz_context=kmz_context,
     )
 
     return {"task_id": task_id, "status": "started", "source_version": vid}

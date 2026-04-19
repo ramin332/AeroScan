@@ -2,6 +2,7 @@ import { useRef, useMemo, useEffect } from 'react';
 import { useFrame } from '@react-three/fiber';
 import * as THREE from 'three';
 import type { WaypointData } from '../api/types';
+import { DJI_SMART3D_INTER_SHOT_DIST_M } from './Viewer3D';
 
 /**
  * Coordinate conventions:
@@ -62,6 +63,22 @@ export function DroneMarker({ waypoints, progress, cameraFov, timeline }: Props)
     () => waypoints.map((wp) => toScene(wp.x, wp.y, wp.z)),
     [waypoints],
   );
+
+  // Cumulative ENU path length to each waypoint. Used to convert playback
+  // progress → distance traveled → Smart3D shot index, so the gimbal tracks
+  // the same per-shot rosette pose that OriginalGimbalArrows draws statically.
+  const cumDistances = useMemo(() => {
+    const cd = [0];
+    for (let i = 1; i < waypoints.length; i++) {
+      const prev = waypoints[i - 1];
+      const cur = waypoints[i];
+      const dx = cur.x - prev.x;
+      const dy = cur.y - prev.y;
+      const dz = cur.z - prev.z;
+      cd.push(cd[i - 1] + Math.sqrt(dx * dx + dy * dy + dz * dz));
+    }
+    return cd;
+  }, [waypoints]);
 
   // Camera frustum geometry from real specs
   const { beamLength, halfW, halfH } = useMemo(() => {
@@ -144,13 +161,34 @@ export function DroneMarker({ waypoints, progress, cameraFov, timeline }: Props)
     // Heading 90° → drone faces +X → rotation Y = -π/2
     groupRef.current.rotation.set(0, -(wp.heading * Math.PI) / 180, 0);
 
-    // Gimbal pitch around drone's local X (right) axis.
-    // DJI: 0° = forward (-Z in Three.js), -90° = nadir (-Y in Three.js)
-    // Three.js right-hand rule around +X: positive rotates -Z toward +Y (up).
-    // So pitch -90° needs rotation.x = -π/2 to point -Z → -Y (down).
-    // Therefore: rotation.x = pitch_in_radians (no negation).
+    // Gimbal orientation. For Smart3D KMZs we cycle through the source-WP rosette
+    // every DJI_SMART3D_INTER_SHOT_DIST_M of forward travel — same scheme as the
+    // static OriginalGimbalArrows in Viewer3D — so the playback gimbal points at
+    // whichever rosette pose would be firing at the current path distance. For
+    // non-Smart3D missions, fall back to the planned gimbal_pitch with no yaw offset.
+    //
+    // Pose values are absolute (pose.yaw in world frame, DJI 0°=N/CW). The parent
+    // group is already rotated by `-wp.heading`, so the gimbal child rotates by
+    // `-(pose.yaw - wp.heading)` around its local Y to land at absolute yaw.
+    // Order 'YXZ' = yaw-then-pitch in the local frame, matching the physical
+    // gimbal axes on the M4E.
     if (gimbalRef.current) {
-      gimbalRef.current.rotation.set((wp.gimbal_pitch * Math.PI) / 180, 0, 0);
+      const sourceWp = waypoints[idx];
+      const rosette = sourceWp.smart_oblique_poses;
+      gimbalRef.current.rotation.order = 'YXZ';
+      if (rosette && rosette.length > 0 && cumDistances.length === waypoints.length) {
+        const segDist = cumDistances[idx + 1] - cumDistances[idx];
+        const currentDist = cumDistances[idx] + eased * segDist;
+        const shotIdx = Math.floor(currentDist / DJI_SMART3D_INTER_SHOT_DIST_M);
+        const pose = rosette[shotIdx % rosette.length];
+        const yawOffsetRad = -((pose.yaw - wp.heading) * Math.PI) / 180;
+        const pitchRad = (pose.pitch * Math.PI) / 180;
+        gimbalRef.current.rotation.set(pitchRad, yawOffsetRad, 0);
+      } else {
+        // Pitch convention: rotation.x = pitch_radians (no negation).
+        // -90° (nadir) → rotation.x = -π/2 → forward (-Z) tilts to -Y (down). ✓
+        gimbalRef.current.rotation.set((wp.gimbal_pitch * Math.PI) / 180, 0, 0);
+      }
     }
 
     // Photo flash
@@ -175,13 +213,14 @@ export function DroneMarker({ waypoints, progress, cameraFov, timeline }: Props)
         <meshBasicMaterial color="#fff" transparent opacity={0.2} side={THREE.DoubleSide} />
       </mesh>
 
-      {/* Heading: line along -Z (forward in Three.js local) */}
+      {/* Heading: line along -Z (forward in Three.js local) — drone flight direction,
+          not camera direction. The gimbal frustum below shows where the camera points. */}
       <mesh position={[0, 0, -0.6]}>
         <boxGeometry args={[0.04, 0.04, 0.6]} />
         <meshBasicMaterial color="#fff" transparent opacity={0.35} />
       </mesh>
 
-      {/* Gimbal group: default looks along -Z (forward), pitch rotates around X */}
+      {/* Gimbal group: default looks along -Z (forward), yaw+pitch applied per-shot */}
       <group ref={gimbalRef}>
         {/* Camera lens */}
         <mesh position={[0, 0, -0.2]}>
