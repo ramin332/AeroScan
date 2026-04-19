@@ -904,7 +904,7 @@ function CameraPreview({ waypoints, progress, cameraFov, timeline, onSnapshot }:
   );
 }
 
-export function Viewer3D({ data, cameraFov, defaultViewMode = 'plan' }: { data: ThreeJSData | null; cameraFov?: CameraFOV; defaultViewMode?: ViewMode }) {
+export function Viewer3D({ data, cameraFov, defaultViewMode = 'plan' }: { data: ThreeJSData | null; cameraFov?: CameraFOV | null; defaultViewMode?: ViewMode }) {
   const [selectedWp, setSelectedWp] = useState<WaypointData | null>(null);
   const [playing, setPlaying] = useState(false);
   const [progress, setProgress] = useState(0);
@@ -913,7 +913,17 @@ export function Viewer3D({ data, cameraFov, defaultViewMode = 'plan' }: { data: 
   const [usePhysics, setUsePhysics] = useState(true);
   const [viewMode, setViewMode] = useState<ViewMode>(defaultViewMode);
   const [captureDir, setCaptureDir] = useState<string | null>(null);
-  const { lightMode, disabledFacades, enabledCandidates } = useStore();
+  const { lightMode, disabledFacades, enabledCandidates, cameraFovOverride } = useStore();
+  const effectiveCameraFov: CameraFOV | undefined = useMemo(() => {
+    if (!cameraFov) return undefined;
+    const o = cameraFovOverride;
+    if (o.fov_h_deg == null && o.fov_v_deg == null && o.distance_m == null) return cameraFov;
+    return {
+      fov_h_deg: o.fov_h_deg ?? cameraFov.fov_h_deg,
+      fov_v_deg: o.fov_v_deg ?? cameraFov.fov_v_deg,
+      distance_m: o.distance_m ?? cameraFov.distance_m,
+    };
+  }, [cameraFov, cameraFovOverride]);
   const showPip = playing || progress > 0;
   const animRef = useRef<number | null>(null);
   const lastTimeRef = useRef(0);
@@ -1087,12 +1097,12 @@ export function Viewer3D({ data, cameraFov, defaultViewMode = 'plan' }: { data: 
           dampingFactor={0.08}
         />
         <CameraReframe target={sceneCentroid} radius={sceneRadius} />
-        <Scene data={data} onWaypointClick={setSelectedWp} visitedIndex={playing || progress > 0 ? getVisitedIndex(progress, data.waypoints.length) : -1} viewMode={viewMode} activeFacades={activeFacadeSet} lightMode={lightMode} cameraFov={cameraFov} />
+        <Scene data={data} onWaypointClick={setSelectedWp} visitedIndex={playing || progress > 0 ? getVisitedIndex(progress, data.waypoints.length) : -1} viewMode={viewMode} activeFacades={activeFacadeSet} lightMode={lightMode} cameraFov={effectiveCameraFov} />
         {(playing || progress > 0) && (
-          <DroneMarker waypoints={data.waypoints} progress={progress} cameraFov={cameraFov} timeline={usePhysics ? timeline : undefined} />
+          <DroneMarker waypoints={data.waypoints} progress={progress} cameraFov={effectiveCameraFov} timeline={usePhysics ? timeline : undefined} />
         )}
         {showPip && (
-          <CameraPreview waypoints={data.waypoints} progress={progress} cameraFov={cameraFov} timeline={usePhysics ? timeline : undefined} onSnapshot={handleSnapshot} />
+          <CameraPreview waypoints={data.waypoints} progress={progress} cameraFov={effectiveCameraFov} timeline={usePhysics ? timeline : undefined} onSnapshot={handleSnapshot} />
         )}
       </Canvas>
 

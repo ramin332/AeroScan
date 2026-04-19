@@ -42,6 +42,9 @@ export function Sidebar() {
     simStatus, simProgress, simMessage, startSimulation,
     rewriteGimbals, generateInspectionMission, toggleKmzFacades, lastKmzFile,
     triggerMissionUpdate,
+    showMappingBox, setShowMappingBox,
+    showOriginalGimbals, setShowOriginalGimbals,
+    cameraFovOverride, setCameraFovOverride, resetCameraFovOverride,
   } = useStore();
 
   useEffect(() => { void refreshBuildings(); }, [refreshBuildings]);
@@ -801,6 +804,85 @@ export function Sidebar() {
               </div>
             </div>
           )}
+        </Section>
+      )}
+
+      {/* ======== SCENE LAYERS ======== */}
+      {result && (
+        <Section title="Scene Layers" defaultOpen={false}>
+          <div className="field-hint" style={{ marginBottom: 6 }}>
+            3D viewer overlays and camera-frustum geometry.
+          </div>
+          <ToggleField
+            label="Mapping box (tileset OBB)"
+            value={showMappingBox}
+            onChange={setShowMappingBox}
+            tooltip="Draws the 3D-Tiles bounding box from the DJI KMZ tileset.json. Only visible when the import carries a tileset."
+          />
+          <div style={{ fontSize: 10, color: 'var(--muted)', margin: '-2px 0 6px 2px' }}>
+            Source: {result.viewer_data.threejs.mappingBox
+              ? 'tileset.json (authoritative)'
+              : 'none — this KMZ has no tileset'}
+          </div>
+          <ToggleField
+            label="Original-pose frustums"
+            value={showOriginalGimbals}
+            onChange={setShowOriginalGimbals}
+            tooltip="Renders one pyramid per photo. For KMZ imports this expands the 5-pose SmartOblique rosette."
+          />
+          {result.summary.camera && (() => {
+            const cam = result.summary.camera;
+            const curH = cameraFovOverride.fov_h_deg ?? cam.fov_h_deg;
+            const curV = cameraFovOverride.fov_v_deg ?? cam.fov_v_deg;
+            const curD = cameraFovOverride.distance_m ?? cam.distance_m;
+            const isModified =
+              cameraFovOverride.fov_h_deg != null ||
+              cameraFovOverride.fov_v_deg != null ||
+              cameraFovOverride.distance_m != null;
+            return (
+              <>
+                <div style={{ fontSize: 10, color: 'var(--muted)', margin: '8px 0 4px 2px', fontWeight: 600, textTransform: 'uppercase', letterSpacing: 0.5 }}>
+                  Frustum overrides
+                </div>
+                <div style={{ fontSize: 10, color: 'var(--muted)', marginBottom: 6 }}>
+                  Resolved from {cam.name} lens ({cam.focal_length_mm} mm).
+                  Overrides affect rendering only — not the exported mission.
+                </div>
+                <SliderField
+                  label="FOV H"
+                  value={curH} min={20} max={120} step={0.5}
+                  format={(v) => `${v.toFixed(1)}°`}
+                  onChange={(v) => setCameraFovOverride({ fov_h_deg: v })}
+                  defaultValue={cam.fov_h_deg}
+                  onReset={() => setCameraFovOverride({ fov_h_deg: null })}
+                />
+                <SliderField
+                  label="FOV V"
+                  value={curV} min={20} max={120} step={0.5}
+                  format={(v) => `${v.toFixed(1)}°`}
+                  onChange={(v) => setCameraFovOverride({ fov_v_deg: v })}
+                  defaultValue={cam.fov_v_deg}
+                  onReset={() => setCameraFovOverride({ fov_v_deg: null })}
+                />
+                <SliderField
+                  label="Distance"
+                  value={curD} min={1} max={100} step={0.5}
+                  format={(v) => `${v.toFixed(1)} m`}
+                  onChange={(v) => setCameraFovOverride({ distance_m: v })}
+                  defaultValue={cam.distance_m}
+                  onReset={() => setCameraFovOverride({ distance_m: null })}
+                />
+                {isModified && (
+                  <button
+                    onClick={resetCameraFovOverride}
+                    style={{ marginTop: 4, fontSize: 10, padding: '3px 8px', cursor: 'pointer' }}
+                  >
+                    Reset all frustum overrides
+                  </button>
+                )}
+              </>
+            );
+          })()}
         </Section>
       )}
 

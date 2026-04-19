@@ -203,6 +203,12 @@ interface AppState {
   setShowOriginalGimbals: (v: boolean) => void;
   showMappingBox: boolean;
   setShowMappingBox: (v: boolean) => void;
+  // Per-field overrides for the camera intrinsics used to draw frustums.
+  // Null keys mean "use summary.camera value verbatim"; set by the sidebar to
+  // let operators dial the frustum without re-importing.
+  cameraFovOverride: { fov_h_deg: number | null; fov_v_deg: number | null; distance_m: number | null };
+  setCameraFovOverride: (patch: Partial<{ fov_h_deg: number | null; fov_v_deg: number | null; distance_m: number | null }>) => void;
+  resetCameraFovOverride: () => void;
 
   // Simulation / reconstruction
   simTaskId: string | null;
@@ -583,6 +589,13 @@ export const useStore = create<AppState>()(persist((set, get) => ({
   setShowOriginalGimbals: (v: boolean) => set({ showOriginalGimbals: v }),
   showMappingBox: false,
   setShowMappingBox: (v: boolean) => set({ showMappingBox: v }),
+  cameraFovOverride: { fov_h_deg: null, fov_v_deg: null, distance_m: null },
+  setCameraFovOverride: (patch) => set((s) => ({
+    cameraFovOverride: { ...s.cameraFovOverride, ...patch },
+  })),
+  resetCameraFovOverride: () => set({
+    cameraFovOverride: { fov_h_deg: null, fov_v_deg: null, distance_m: null },
+  }),
 
   refineKmz: async (voxelSize: number) => {
     const s = get();
