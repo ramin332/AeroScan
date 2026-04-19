@@ -215,23 +215,27 @@ function CameraArrows({ waypoints, color, bright, cameraFov }: { waypoints: Wayp
   );
 }
 
-function OriginalGimbalArrows({ waypoints, color }: { waypoints: WaypointData[]; color: string }) {
-  // Match DJI Pilot 2: one camera frustum per waypoint, using the placemark's
-  // waypointGimbalPitchAngle + waypointHeadingAngle. The 5-pose SmartOblique
-  // rosette is an execution-time cycling detail (action group config), not a
-  // per-waypoint plan element — Pilot doesn't render it either.
-  const frustumLen = 2.0;
-  const fovHDeg = 84;
-  const fovVDeg = 56;
-  const halfW = frustumLen * Math.tan((fovHDeg * Math.PI) / 180 / 2) * 0.25;
-  const halfH = frustumLen * Math.tan((fovVDeg * Math.PI) / 180 / 2) * 0.25;
+function OriginalGimbalArrows({ waypoints, color, cameraFov }: { waypoints: WaypointData[]; color: string; cameraFov?: CameraFOV }) {
+  // Match DJI's Smart 3D Capture Quality Report: one frustum per photo,
+  // which means one per pose in the SmartOblique rosette — typically 5 per
+  // waypoint (1 nadir + 4 obliques). Falls back to the placemark's planned
+  // pitch/yaw for waypoints without a rosette (e.g. plain waylines).
+  // Use real camera intrinsics from summary.camera when available; otherwise
+  // fall back to M4E wide defaults.
+  const fovHDeg = cameraFov?.fov_h_deg ?? 71.5;
+  const fovVDeg = cameraFov?.fov_v_deg ?? 56.9;
+  const frustumLen = cameraFov ? Math.min(cameraFov.distance_m * 0.08, 0.6) : 0.4;
+  const halfW = frustumLen * Math.tan((fovHDeg * Math.PI) / 180 / 2);
+  const halfH = frustumLen * Math.tan((fovVDeg * Math.PI) / 180 / 2);
 
   const { edgeGeo } = useMemo(() => {
     const edgePositions: number[] = [];
     for (const wp of waypoints) {
-      const pitch = wp.pitch_before !== undefined ? wp.pitch_before : wp.gimbal_pitch;
-      const yaw = wp.yaw_before !== undefined ? wp.yaw_before : wp.heading;
-      const poses = [{ pitch, yaw }];
+      const plannedPitch = wp.pitch_before !== undefined ? wp.pitch_before : wp.gimbal_pitch;
+      const plannedYaw = wp.yaw_before !== undefined ? wp.yaw_before : wp.heading;
+      const poses = wp.smart_oblique_poses && wp.smart_oblique_poses.length > 0
+        ? wp.smart_oblique_poses
+        : [{ pitch: plannedPitch, yaw: plannedYaw }];
 
       for (const p of poses) {
         const yr = (p.yaw * Math.PI) / 180;
@@ -244,10 +248,10 @@ function OriginalGimbalArrows({ waypoints, color }: { waypoints: WaypointData[];
         const rx = Math.cos(yr);
         const ry = -Math.sin(yr);
         const rz = 0;
-        // Up vector = forward × right (ENU)
-        const ux = fy * rz - fz * ry;
-        const uy = fz * rx - fx * rz;
-        const uz = fx * ry - fy * rx;
+        // Up vector = right × forward (ENU, right-handed)
+        const ux = ry * fz - rz * fy;
+        const uy = rz * fx - rx * fz;
+        const uz = rx * fy - ry * fx;
 
         // Apex (waypoint) in THREE coords
         const [ax, ay, az] = enu(wp.x, wp.y, wp.z);
@@ -694,7 +698,7 @@ function Scene({ data, onWaypointClick, visitedIndex, viewMode, activeFacades, l
             <group key={fi}>
               <WaypointSpheres waypoints={wps} color={isActive ? color : '#1a1a2a'} bright={isActive} />
               {isActive && <CameraArrows waypoints={wps} color={color} bright cameraFov={cameraFov} />}
-              {isActive && showOriginalGimbals && <OriginalGimbalArrows waypoints={wps} color="#ff3344" />}
+              {isActive && showOriginalGimbals && <OriginalGimbalArrows waypoints={wps} color="#ff3344" cameraFov={cameraFov} />}
             </group>
           );
         }
@@ -710,7 +714,7 @@ function Scene({ data, onWaypointClick, visitedIndex, viewMode, activeFacades, l
           <group key={fi}>
             <WaypointSpheres waypoints={wps} color={color} />
             <CameraArrows waypoints={wps} color={color} />
-            {showOriginalGimbals && <OriginalGimbalArrows waypoints={wps} color="#ff3344" />}
+            {showOriginalGimbals && <OriginalGimbalArrows waypoints={wps} color="#ff3344" cameraFov={cameraFov} />}
           </group>
         );
       })}

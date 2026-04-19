@@ -1121,6 +1121,8 @@ async def import_kmz(
                 "properties": {"name": parsed.name, "height": building.height, "source": record_source_type},
             }
 
+            camera_intrinsics = resolve_capture_intrinsics(parsed)
+
             if building_id is None:
                 import numpy as _np3
                 pc_arr = _np3.concatenate([
@@ -1250,7 +1252,6 @@ async def import_kmz(
                 dz = waypoints[i].z - waypoints[i - 1].z
                 total_path_m += math.sqrt(dx * dx + dy * dy + dz * dz)
             est_time_s = total_path_m / max(config.flight_speed_ms, 0.1)
-            camera_intrinsics = resolve_capture_intrinsics(parsed)
             summary = {
                 "waypoint_count": len(waypoints),
                 "inspection_waypoints": len(waypoints),
