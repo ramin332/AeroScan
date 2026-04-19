@@ -49,3 +49,54 @@ def test_polygon_to_enu_closes():
     assert len(poly_enu) == len(parsed.mission_area_wgs84)
     for x, y, _ in poly_enu:
         assert abs(x) < 300 and abs(y) < 300
+
+
+# ---------------------------------------------------------------------------
+# 3D-Tiles tileset.json (the Mapping OBB)
+# ---------------------------------------------------------------------------
+
+
+def test_parse_mijande_extracts_mapping_bbox_raw(sample_kmz):
+    parsed = parse_kmz(sample_kmz("mijande"), name="Mijande")
+
+    assert parsed.mapping_bbox_raw is not None
+    raw = parsed.mapping_bbox_raw
+
+    box = raw["box"]
+    assert len(box) == 12
+    assert box[0] == pytest.approx(-11.078995704650879)
+    assert box[1] == pytest.approx(35.02486801147461)
+    assert box[2] == pytest.approx(8.606666564941406)
+    # First half-axis: +X, magnitude 30.02
+    assert box[3] == pytest.approx(30.02245330810547)
+    assert box[4] == pytest.approx(0.0)
+    assert box[5] == pytest.approx(0.0)
+    # Second half-axis: +Y, magnitude 54.97
+    assert box[7] == pytest.approx(54.972225189208984)
+    # Third half-axis: +Z, magnitude 9.69
+    assert box[11] == pytest.approx(9.690000534057617)
+
+    transform = raw["transform"]
+    assert len(transform) == 16
+    # ECEF translation (column-major, last column) — the Netherlands at ~6.6°E/52.4°N
+    assert transform[12] == pytest.approx(3872130.485288672, rel=1e-6)
+    assert transform[13] == pytest.approx(450822.9109937097, rel=1e-6)
+    assert transform[14] == pytest.approx(5031308.761120935, rel=1e-6)
+
+
+def test_parse_mijande_extra_extracts_mapping_bbox_raw(sample_kmz):
+    parsed = parse_kmz(sample_kmz("mijande_extra"), name="MijandeExtra")
+
+    assert parsed.mapping_bbox_raw is not None
+    box = parsed.mapping_bbox_raw["box"]
+    assert len(box) == 12
+    assert box[0] == pytest.approx(-38.71443557739258)
+    assert box[3] == pytest.approx(21.86248016357422)
+    assert box[7] == pytest.approx(37.45479202270508)
+    assert box[11] == pytest.approx(5.62999963760376)
+
+
+def test_parse_auto_explore_has_no_mapping_bbox(sample_kmz):
+    """autoExplore KMZs ship only template.kml + waylines.wpml — no tileset."""
+    parsed = parse_kmz(sample_kmz("auto_explore"), name="auto_explore")
+    assert parsed.mapping_bbox_raw is None

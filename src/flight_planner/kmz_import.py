@@ -84,6 +84,11 @@ class ImportedKmz:
     mission_area_wgs84: list[tuple[float, float, float]]   # (lon, lat, alt)
     mission_config_raw: dict
     point_cloud_ply: Optional[bytes]                   # raw PLY bytes, or None
+    # 3D-Tiles tileset.json contents (``root.boundingVolume.box`` = 12 floats,
+    # ``root.transform`` = 16 floats, column-major ECEF→local). This is the
+    # authoritative "Mapping" OBB shown in DJI's Capture Quality Report UI.
+    # ``None`` when the KMZ ships no point-cloud tileset (autoExplore).
+    mapping_bbox_raw: Optional[dict] = None
 
 
 # ---------------------------------------------------------------------------
@@ -94,7 +99,8 @@ class ImportedKmz:
 def _find_members(zf: zipfile.ZipFile) -> dict[str, str]:
     """Locate the key files inside a DJI KMZ.
 
-    Returns a dict with keys: template, waylines, pointcloud, geo_desc (any may be missing).
+    Returns a dict with keys: template, waylines, pointcloud, geo_desc, tileset
+    (any may be missing).
     """
     members: dict[str, str] = {}
     for name in zf.namelist():
@@ -107,7 +113,33 @@ def _find_members(zf: zipfile.ZipFile) -> dict[str, str]:
             members["pointcloud"] = name
         elif lower.endswith("sfm_geo_desc.json"):
             members["geo_desc"] = name
+        elif lower.endswith("/tileset.json") or lower.endswith("\\tileset.json"):
+            members["tileset"] = name
     return members
+
+
+def _parse_tileset(xml_bytes: bytes) -> Optional[dict]:
+    """Parse a 3D-Tiles ``tileset.json`` and return the Mapping OBB payload.
+
+    The 12-float ``box`` is ``[cx, cy, cz, ux, uy, uz, vx, vy, vz, wx, wy, wz]``
+    in the tile's local frame; ``transform`` is a column-major 4×4 that maps
+    local → ECEF. Returns ``None`` if the expected fields are absent.
+    """
+    try:
+        doc = json.loads(xml_bytes.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        return None
+    root = doc.get("root") or {}
+    box = (root.get("boundingVolume") or {}).get("box")
+    transform = root.get("transform")
+    if not (isinstance(box, list) and len(box) == 12):
+        return None
+    if not (isinstance(transform, list) and len(transform) == 16):
+        return None
+    return {
+        "box": [float(v) for v in box],
+        "transform": [float(v) for v in transform],
+    }
 
 
 def _parse_template(xml_bytes: bytes) -> tuple[dict, list[tuple[float, float, float]], Optional[tuple[float, float, float]]]:
@@ -356,6 +388,11 @@ def parse_kmz(data: bytes, name: str = "") -> ImportedKmz:
         if members.get("pointcloud"):
             point_cloud_ply = zf.read(members["pointcloud"])
 
+        # --- tileset.json (3D-Tiles Mapping OBB) ---
+        mapping_bbox_raw: Optional[dict] = None
+        if members.get("tileset"):
+            mapping_bbox_raw = _parse_tileset(zf.read(members["tileset"]))
+
     resolved_name = name or "imported_kmz"
     return ImportedKmz(
         name=resolved_name,
@@ -366,6 +403,7 @@ def parse_kmz(data: bytes, name: str = "") -> ImportedKmz:
         mission_area_wgs84=poly,
         mission_config_raw=mission_cfg,
         point_cloud_ply=point_cloud_ply,
+        mapping_bbox_raw=mapping_bbox_raw,
     )
 
 
