@@ -84,11 +84,6 @@ class ImportedKmz:
     mission_area_wgs84: list[tuple[float, float, float]]   # (lon, lat, alt)
     mission_config_raw: dict
     point_cloud_ply: Optional[bytes]                   # raw PLY bytes, or None
-    # 3D-Tiles tileset.json contents (``root.boundingVolume.box`` = 12 floats,
-    # ``root.transform`` = 16 floats, column-major ECEF→local). This is the
-    # authoritative "Mapping" OBB shown in DJI's Capture Quality Report UI.
-    # ``None`` when the KMZ ships no point-cloud tileset (autoExplore).
-    mapping_bbox_raw: Optional[dict] = None
 
 
 # ---------------------------------------------------------------------------
@@ -99,7 +94,7 @@ class ImportedKmz:
 def _find_members(zf: zipfile.ZipFile) -> dict[str, str]:
     """Locate the key files inside a DJI KMZ.
 
-    Returns a dict with keys: template, waylines, pointcloud, geo_desc, tileset
+    Returns a dict with keys: template, waylines, pointcloud, geo_desc
     (any may be missing).
     """
     members: dict[str, str] = {}
@@ -113,33 +108,7 @@ def _find_members(zf: zipfile.ZipFile) -> dict[str, str]:
             members["pointcloud"] = name
         elif lower.endswith("sfm_geo_desc.json"):
             members["geo_desc"] = name
-        elif lower.endswith("/tileset.json") or lower.endswith("\\tileset.json"):
-            members["tileset"] = name
     return members
-
-
-def _parse_tileset(xml_bytes: bytes) -> Optional[dict]:
-    """Parse a 3D-Tiles ``tileset.json`` and return the Mapping OBB payload.
-
-    The 12-float ``box`` is ``[cx, cy, cz, ux, uy, uz, vx, vy, vz, wx, wy, wz]``
-    in the tile's local frame; ``transform`` is a column-major 4×4 that maps
-    local → ECEF. Returns ``None`` if the expected fields are absent.
-    """
-    try:
-        doc = json.loads(xml_bytes.decode("utf-8"))
-    except (ValueError, UnicodeDecodeError):
-        return None
-    root = doc.get("root") or {}
-    box = (root.get("boundingVolume") or {}).get("box")
-    transform = root.get("transform")
-    if not (isinstance(box, list) and len(box) == 12):
-        return None
-    if not (isinstance(transform, list) and len(transform) == 16):
-        return None
-    return {
-        "box": [float(v) for v in box],
-        "transform": [float(v) for v in transform],
-    }
 
 
 def _parse_template(xml_bytes: bytes) -> tuple[dict, list[tuple[float, float, float]], Optional[tuple[float, float, float]]]:
@@ -388,11 +357,6 @@ def parse_kmz(data: bytes, name: str = "") -> ImportedKmz:
         if members.get("pointcloud"):
             point_cloud_ply = zf.read(members["pointcloud"])
 
-        # --- tileset.json (3D-Tiles Mapping OBB) ---
-        mapping_bbox_raw: Optional[dict] = None
-        if members.get("tileset"):
-            mapping_bbox_raw = _parse_tileset(zf.read(members["tileset"]))
-
     resolved_name = name or "imported_kmz"
     return ImportedKmz(
         name=resolved_name,
@@ -403,7 +367,6 @@ def parse_kmz(data: bytes, name: str = "") -> ImportedKmz:
         mission_area_wgs84=poly,
         mission_config_raw=mission_cfg,
         point_cloud_ply=point_cloud_ply,
-        mapping_bbox_raw=mapping_bbox_raw,
     )
 
 
@@ -483,87 +446,6 @@ def polygon_to_enu(
         ((lon - ref_lon) * m_per_lon, (lat - ref_lat) * m_per_lat, alt - ref_alt)
         for lon, lat, alt in polygon_wgs84
     ]
-
-
-# WGS84 ellipsoid constants for geodetic → ECEF conversion.
-_WGS84_A = 6378137.0
-_WGS84_F = 1.0 / 298.257223563
-_WGS84_E2 = _WGS84_F * (2.0 - _WGS84_F)
-
-
-def _wgs84_to_ecef(lat_deg: float, lon_deg: float, alt_m: float) -> np.ndarray:
-    """Geodetic WGS84 → Earth-Centered Earth-Fixed (meters)."""
-    lat = math.radians(lat_deg)
-    lon = math.radians(lon_deg)
-    s_lat, c_lat = math.sin(lat), math.cos(lat)
-    N = _WGS84_A / math.sqrt(1.0 - _WGS84_E2 * s_lat * s_lat)
-    x = (N + alt_m) * c_lat * math.cos(lon)
-    y = (N + alt_m) * c_lat * math.sin(lon)
-    z = (N * (1.0 - _WGS84_E2) + alt_m) * s_lat
-    return np.array([x, y, z], dtype=np.float64)
-
-
-def _ecef_to_enu_rotation(lat_deg: float, lon_deg: float) -> np.ndarray:
-    """Rotation matrix that takes an ECEF *delta* vector into ENU at (lat, lon)."""
-    lat = math.radians(lat_deg)
-    lon = math.radians(lon_deg)
-    s_lat, c_lat = math.sin(lat), math.cos(lat)
-    s_lon, c_lon = math.sin(lon), math.cos(lon)
-    return np.array([
-        [-s_lon,          c_lon,         0.0   ],
-        [-s_lat * c_lon, -s_lat * s_lon, c_lat ],
-        [ c_lat * c_lon,  c_lat * s_lon, s_lat ],
-    ], dtype=np.float64)
-
-
-def mapping_bbox_to_enu(
-    raw: Optional[dict],
-    ref_lat: float,
-    ref_lon: float,
-    ref_alt: float,
-) -> Optional[dict]:
-    """Project a raw 3D-Tiles Mapping OBB into the viewer's ENU frame.
-
-    ``raw`` comes from ``ImportedKmz.mapping_bbox_raw``: the 12-float
-    ``box = [cx, cy, cz, ux, uy, uz, vx, vy, vz, wx, wy, wz]`` in the tile's
-    local frame, plus the 16-float column-major ``transform`` that maps
-    local → ECEF. This function composes that with the WGS84→ENU frame anchored
-    at the viewer's reference GPS so the OBB can be rendered in the same
-    coordinate system as the waypoints and point cloud.
-
-    Returned ``center`` is the OBB centroid in ENU meters; ``axes`` is a list of
-    three ENU *half-axis* vectors (lengths = the box's half-extents, directions
-    arbitrary — the OBB is oriented, not axis-aligned). Returns ``None`` when
-    ``raw is None`` so callers can pass through degraded cases (autoExplore).
-    """
-    if raw is None:
-        return None
-    box = raw["box"]
-    transform = raw["transform"]
-    # transform is column-major: columns are the local basis vectors in ECEF,
-    # and column 3 is the ECEF origin of the local frame.
-    T = np.asarray(transform, dtype=np.float64).reshape(4, 4, order="F")
-    R_local_to_ecef = T[:3, :3]
-    t_ecef = T[:3, 3]
-
-    local_center = np.asarray(box[0:3], dtype=np.float64)
-    local_axes = [
-        np.asarray(box[3:6], dtype=np.float64),
-        np.asarray(box[6:9], dtype=np.float64),
-        np.asarray(box[9:12], dtype=np.float64),
-    ]
-
-    ref_ecef = _wgs84_to_ecef(ref_lat, ref_lon, ref_alt)
-    R_ecef_to_enu = _ecef_to_enu_rotation(ref_lat, ref_lon)
-
-    center_ecef = R_local_to_ecef @ local_center + t_ecef
-    center_enu = R_ecef_to_enu @ (center_ecef - ref_ecef)
-    axes_enu = [R_ecef_to_enu @ (R_local_to_ecef @ a) for a in local_axes]
-
-    return {
-        "center": [float(v) for v in center_enu],
-        "axes": [[float(v) for v in a] for a in axes_enu],
-    }
 
 
 def resolve_capture_intrinsics(parsed: ImportedKmz) -> dict:

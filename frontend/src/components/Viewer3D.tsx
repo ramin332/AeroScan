@@ -2,7 +2,7 @@ import { useRef, useMemo, useState, useCallback, useEffect } from 'react';
 import { Canvas, useThree, useFrame, type ThreeEvent } from '@react-three/fiber';
 import { OrbitControls, Line, PivotControls } from '@react-three/drei';
 import * as THREE from 'three';
-import type { MappingBox, MissionAreaData, PointCloudData, RawMeshData, ThreeJSData, WaypointData } from '../api/types';
+import type { PointCloudData, RawMeshData, ThreeJSData, WaypointData } from '../api/types';
 import { DroneMarker, getVisitedIndex, DRONE_LAYER } from './DroneAnimation';
 import { useStore } from '../store';
 
@@ -215,95 +215,287 @@ function CameraArrows({ waypoints, color, bright, cameraFov }: { waypoints: Wayp
   );
 }
 
-function OriginalGimbalArrows({ waypoints, color, cameraFov, showRosette }: { waypoints: WaypointData[]; color: string; cameraFov?: CameraFOV; showRosette?: boolean }) {
-  // Default: one frustum per waypoint (planned pose) — matches DJI's Capture
-  // Quality Report "one per point" display. When showRosette is true, all 5
-  // SmartOblique poses per waypoint are drawn instead.
-  // Use real camera intrinsics from summary.camera when available; otherwise
-  // fall back to M4E wide defaults.
+// Inter-shot SPACING in meters along the flight path. Calibrated from MijandeExtra:
+// 1333 reported photos over ~850 m of inspection-pass length → 0.64 m/shot. Equivalent
+// to 0.316 s shutter × ~2.0 m/s effective Smart3D pass speed; we sample by distance,
+// not time, because the `waypointSpeed`/`autoFlightSpeed` fields in DJI Smart3D WPML
+// (0.7–1.0 m/s) understate the actual flight speed by ~2× and produce a 5×-too-dense
+// shot count if used directly with the shutter interval. Distance-based sampling
+// matches what the DJI RC Plus quality report renders.
+const DJI_SMART3D_INTER_SHOT_DIST_M = 0.65;
+
+// One color per rosette pose index. Wraps modulo length, so a 5-pose Smart3D
+// cycle shows as 5 distinct color bands across the flight.
+const ROSETTE_PALETTE: [number, number, number][] = [
+  [1.00, 0.85, 0.25], // amber  — typically nadir
+  [0.30, 0.85, 1.00], // cyan
+  [0.95, 0.45, 0.85], // magenta
+  [0.45, 1.00, 0.55], // green
+  [1.00, 0.55, 0.30], // orange
+  [0.70, 0.60, 1.00], // lavender
+  [0.40, 0.95, 0.90], // teal
+  [1.00, 0.75, 0.80], // rose
+];
+
+function OriginalGimbalArrows({ waypoints, color, cameraFov }: { waypoints: WaypointData[]; color: string; cameraFov?: CameraFOV }) {
+  // Simulates the actual shutter events on a Smart3D flight. DJI cycles the
+  // rosette template ("unlimited" mode) WHILE flying between adjacent WPs,
+  // so shot positions lerp along the segment and pose index wraps modulo
+  // rosette length. Count per segment = (dist / speed) / shutter_interval.
+  // Transit WPs (no rosette) contribute nothing — they're not capture points.
+  // Non-Smart3D KMZs (plain takePhoto) fall back to one frustum per WP.
   const fovHDeg = cameraFov?.fov_h_deg ?? 71.5;
   const fovVDeg = cameraFov?.fov_v_deg ?? 56.9;
-  // 15% of capture distance keeps frustums readable against scene scale
-  // without overwhelming neighboring waypoints. For DJI mapping (~13m standoff)
-  // this gives ~2m — enough to see gentle pitch tilts like +9° or +20°.
-  const frustumLen = cameraFov ? cameraFov.distance_m * 0.15 : 1.5;
+  const frustumLen = cameraFov ? Math.min(Math.max(cameraFov.distance_m * 0.06, 0.3), 1.5) : 0.8;
   const halfW = frustumLen * Math.tan((fovHDeg * Math.PI) / 180 / 2);
   const halfH = frustumLen * Math.tan((fovVDeg * Math.PI) / 180 / 2);
 
-  // Smart3D KMZs mix capture waypoints (with a rosette) and transit
-  // waypoints (no photo action). If ANY waypoint has a rosette, treat this
-  // file as Smart3D and skip transit waypoints — DJI's Capture Quality
-  // Report doesn't render a frustum for them. For non-Smart3D files
-  // (plain takePhoto waylines, autoExplore) no waypoint will have a
-  // rosette and every waypoint is a capture point.
   const isSmart3D = useMemo(
     () => waypoints.some((w) => w.smart_oblique_poses && w.smart_oblique_poses.length > 0),
     [waypoints],
   );
 
-  const { edgeGeo } = useMemo(() => {
+  const { edgeGeo, fillGeo, vertexColored } = useMemo(() => {
     const edgePositions: number[] = [];
-    for (const wp of waypoints) {
-      const hasRosette = !!(wp.smart_oblique_poses && wp.smart_oblique_poses.length > 0);
-      if (isSmart3D && !hasRosette) continue;
-      const plannedPitch = wp.pitch_before !== undefined ? wp.pitch_before : wp.gimbal_pitch;
-      const plannedYaw = wp.yaw_before !== undefined ? wp.yaw_before : wp.heading;
-      const poses = (showRosette && hasRosette)
-        ? wp.smart_oblique_poses!
-        : [{ pitch: plannedPitch, yaw: plannedYaw }];
+    const edgeColors: number[] = [];
+    const fillPositions: number[] = [];
+    const fillColors: number[] = [];
 
-      for (const p of poses) {
-        const yr = (p.yaw * Math.PI) / 180;
-        const pr = (p.pitch * Math.PI) / 180;
-        // Forward (look direction) in ENU
-        const fx = Math.sin(yr) * Math.cos(pr);
-        const fy = Math.cos(yr) * Math.cos(pr);
-        const fz = Math.sin(pr);
-        // Right vector (horizontal, perpendicular to forward & world up)
-        const rx = Math.cos(yr);
-        const ry = -Math.sin(yr);
-        const rz = 0;
-        // Up vector = right × forward (ENU, right-handed)
-        const ux = ry * fz - rz * fy;
-        const uy = rz * fx - rx * fz;
-        const uz = rx * fy - ry * fx;
+    const emitFrustum = (
+      wx: number,
+      wy: number,
+      wz: number,
+      pitchDeg: number,
+      yawDeg: number,
+      col: [number, number, number] | null,
+    ) => {
+      const yr = (yawDeg * Math.PI) / 180;
+      const pr = (pitchDeg * Math.PI) / 180;
+      const fx = Math.sin(yr) * Math.cos(pr);
+      const fy = Math.cos(yr) * Math.cos(pr);
+      const fz = Math.sin(pr);
+      const rx = Math.cos(yr);
+      const ry = -Math.sin(yr);
+      const ux = ry * fz - 0 * fy;
+      const uy = 0 * fx - rx * fz;
+      const uz = rx * fy - ry * fx;
+      const [ax, ay, az] = enu(wx, wy, wz);
+      const bcx = wx + fx * frustumLen;
+      const bcy = wy + fy * frustumLen;
+      const bcz = wz + fz * frustumLen;
+      // Corners in [TL, TR, BR, BL] order (relative to camera frame).
+      const corners: [number, number, number][] = [
+        enu(bcx - rx * halfW + ux * halfH, bcy - ry * halfW + uy * halfH, bcz + uz * halfH),
+        enu(bcx + rx * halfW + ux * halfH, bcy + ry * halfW + uy * halfH, bcz + uz * halfH),
+        enu(bcx + rx * halfW - ux * halfH, bcy + ry * halfW - uy * halfH, bcz - uz * halfH),
+        enu(bcx - rx * halfW - ux * halfH, bcy - ry * halfW - uy * halfH, bcz - uz * halfH),
+      ];
+      // DJI Quality Report style: 4 apex→corner edges + 4 far-rect edges + filled
+      // square "photo" at the far plane. Wireframe pyramid over a translucent quad.
+      for (const c of corners) edgePositions.push(ax, ay, az, c[0], c[1], c[2]);
+      for (let i = 0; i < 4; i++) {
+        const a = corners[i];
+        const b = corners[(i + 1) % 4];
+        edgePositions.push(a[0], a[1], a[2], b[0], b[1], b[2]);
+      }
+      const [TL, TR, BR, BL] = corners;
+      fillPositions.push(
+        TL[0], TL[1], TL[2], TR[0], TR[1], TR[2], BR[0], BR[1], BR[2],
+        TL[0], TL[1], TL[2], BR[0], BR[1], BR[2], BL[0], BL[1], BL[2],
+      );
+      if (col) {
+        // 8 edge segments × 2 verts = 16 verts; fill quad = 6 verts
+        for (let v = 0; v < 16; v++) edgeColors.push(col[0], col[1], col[2]);
+        for (let v = 0; v < 6; v++) fillColors.push(col[0], col[1], col[2]);
+      }
+    };
 
-        // Apex (waypoint) in THREE coords
-        const [ax, ay, az] = enu(wp.x, wp.y, wp.z);
-        // Base center
-        const bcx = wp.x + fx * frustumLen;
-        const bcy = wp.y + fy * frustumLen;
-        const bcz = wp.z + fz * frustumLen;
-        // 4 base corners (TL, TR, BR, BL)
-        const corners: [number, number, number][] = [
-          enu(bcx - rx * halfW + ux * halfH, bcy - ry * halfW + uy * halfH, bcz - rz * halfW + uz * halfH),
-          enu(bcx + rx * halfW + ux * halfH, bcy + ry * halfW + uy * halfH, bcz + rz * halfW + uz * halfH),
-          enu(bcx + rx * halfW - ux * halfH, bcy + ry * halfW - uy * halfH, bcz + rz * halfW - uz * halfH),
-          enu(bcx - rx * halfW - ux * halfH, bcy - ry * halfW - uy * halfH, bcz - rz * halfW - uz * halfH),
-        ];
-        // Apex → each corner (4 edges)
-        for (const c of corners) {
-          edgePositions.push(ax, ay, az, c[0], c[1], c[2]);
+    if (isSmart3D) {
+      // Distance-based shot simulation matching DJI's `smartObliqueCycleMode=unlimited`:
+      // the gimbal cycles 0→1→2→3→4→0… continuously across the whole flight, and one
+      // photo fires every DJI_SMART3D_INTER_SHOT_DIST_M of forward travel. The active
+      // rosette template (which direction pose-index k points) is updated per WP from
+      // the currently-loaded `startSmartOblique` block — DJI re-issues a slightly-tilted
+      // rosette every 2–3 WPs to track the building, but the cycle counter is NOT reset
+      // on template change (otherwise we'd emit all 5 poses at every WP).
+      let nextShotAtDist = 0;
+      let cycleIdx = 0;
+      let cumDist = 0;
+      for (let i = 0; i < waypoints.length - 1; i++) {
+        const wp = waypoints[i];
+        const nxt = waypoints[i + 1];
+        const dx = nxt.x - wp.x, dy = nxt.y - wp.y, dz = nxt.z - wp.z;
+        const segLen = Math.sqrt(dx * dx + dy * dy + dz * dz);
+        const segEnd = cumDist + segLen;
+        const rosette = wp.smart_oblique_poses;
+        if (rosette && rosette.length > 0) {
+          while (nextShotAtDist < segEnd) {
+            if (nextShotAtDist >= cumDist) {
+              const frac = segLen > 0 ? (nextShotAtDist - cumDist) / segLen : 0;
+              const px = wp.x + dx * frac;
+              const py = wp.y + dy * frac;
+              const pz = wp.z + dz * frac;
+              const poseIdx = cycleIdx % rosette.length;
+              const pose = rosette[poseIdx];
+              const col = ROSETTE_PALETTE[poseIdx % ROSETTE_PALETTE.length];
+              emitFrustum(px, py, pz, pose.pitch, pose.yaw, col);
+              cycleIdx++;
+            }
+            nextShotAtDist += DJI_SMART3D_INTER_SHOT_DIST_M;
+          }
+        } else {
+          // Transit segment with no active rosette: skip emission but advance the
+          // cursor so the cycle phase stays consistent if a rosette resumes after.
+          while (nextShotAtDist < segEnd) nextShotAtDist += DJI_SMART3D_INTER_SHOT_DIST_M;
         }
-        // Base rectangle (4 edges)
-        for (let i = 0; i < 4; i++) {
-          const a = corners[i];
-          const b = corners[(i + 1) % 4];
-          edgePositions.push(a[0], a[1], a[2], b[0], b[1], b[2]);
-        }
+        cumDist = segEnd;
+      }
+    } else {
+      for (const wp of waypoints) {
+        const plannedPitch = wp.pitch_before !== undefined ? wp.pitch_before : wp.gimbal_pitch;
+        const plannedYaw = wp.yaw_before !== undefined ? wp.yaw_before : wp.heading;
+        emitFrustum(wp.x, wp.y, wp.z, plannedPitch, plannedYaw, null);
       }
     }
-    if (edgePositions.length === 0) return { edgeGeo: null };
+
+    if (edgePositions.length === 0) return { edgeGeo: null, fillGeo: null, vertexColored: false };
     const g = new THREE.BufferGeometry();
     g.setAttribute('position', new THREE.Float32BufferAttribute(edgePositions, 3));
-    return { edgeGeo: g };
-  }, [waypoints, frustumLen, halfW, halfH, showRosette, isSmart3D]);
+    const hasColors = edgeColors.length === edgePositions.length;
+    if (hasColors) g.setAttribute('color', new THREE.Float32BufferAttribute(edgeColors, 3));
+    let fill: THREE.BufferGeometry | null = null;
+    if (fillPositions.length > 0) {
+      fill = new THREE.BufferGeometry();
+      fill.setAttribute('position', new THREE.Float32BufferAttribute(fillPositions, 3));
+      if (fillColors.length === fillPositions.length) {
+        fill.setAttribute('color', new THREE.Float32BufferAttribute(fillColors, 3));
+      }
+    }
+    return { edgeGeo: g, fillGeo: fill, vertexColored: hasColors };
+  }, [waypoints, frustumLen, halfW, halfH, isSmart3D]);
 
   if (!edgeGeo) return null;
   return (
-    <lineSegments geometry={edgeGeo}>
-      <lineBasicMaterial color={color} transparent opacity={0.55} />
-    </lineSegments>
+    <group>
+      {fillGeo && (
+        <mesh geometry={fillGeo}>
+          {vertexColored ? (
+            <meshBasicMaterial
+              vertexColors
+              transparent
+              opacity={0.18}
+              side={THREE.DoubleSide}
+              depthWrite={false}
+            />
+          ) : (
+            <meshBasicMaterial
+              color={color}
+              transparent
+              opacity={0.15}
+              side={THREE.DoubleSide}
+              depthWrite={false}
+            />
+          )}
+        </mesh>
+      )}
+      <lineSegments geometry={edgeGeo}>
+        {vertexColored ? (
+          <lineBasicMaterial vertexColors transparent opacity={0.45} depthWrite={false} />
+        ) : (
+          <lineBasicMaterial color={color} transparent opacity={0.55} depthWrite={false} />
+        )}
+      </lineSegments>
+    </group>
+  );
+}
+
+/**
+ * Oversized rendering of a single rosette — finds the first WP with a
+ * SmartOblique rosette and draws its 5 poses at 4m frustum length in vivid
+ * colors. Use this to verify the pitch/yaw math: the 5 directions should fan
+ * out (not all point nadir). If they do all point down, the transform is wrong.
+ */
+function RosetteDiagnostic({ waypoints, cameraFov }: { waypoints: WaypointData[]; cameraFov?: CameraFOV }) {
+  const fovHDeg = cameraFov?.fov_h_deg ?? 71.5;
+  const fovVDeg = cameraFov?.fov_v_deg ?? 56.9;
+  const frustumLen = 4.0;
+  const halfW = frustumLen * Math.tan((fovHDeg * Math.PI) / 180 / 2);
+  const halfH = frustumLen * Math.tan((fovVDeg * Math.PI) / 180 / 2);
+
+  const { edgeGeo, fillGeo } = useMemo(() => {
+    // Pick the WP whose rosette has the MAX single positive pitch — that's
+    // the steepest look-up case in the mission. If upward frustums render
+    // correctly here, the transform is fine for all pitches.
+    let wp: WaypointData | undefined;
+    let maxPitch = -Infinity;
+    for (const w of waypoints) {
+      const poses = w.smart_oblique_poses;
+      if (!poses || poses.length === 0) continue;
+      const m = Math.max(...poses.map((p) => p.pitch));
+      if (m > maxPitch) { maxPitch = m; wp = w; }
+    }
+    if (!wp || !wp.smart_oblique_poses) return { edgeGeo: null, fillGeo: null };
+    const dbg = `Diagnostic WP idx=${wp.index ?? '?'} maxPitch=${maxPitch.toFixed(1)}° poses=${wp.smart_oblique_poses.map(p => `(${p.pitch}°,${p.yaw.toFixed(0)}°)`).join(' ')}`;
+    // eslint-disable-next-line no-console
+    console.log('[RosetteDiagnostic]', dbg);
+    const edgePositions: number[] = [];
+    const edgeColors: number[] = [];
+    const fillPositions: number[] = [];
+    const fillColors: number[] = [];
+    wp.smart_oblique_poses.forEach((pose, k) => {
+      const col = ROSETTE_PALETTE[k % ROSETTE_PALETTE.length];
+      const yr = (pose.yaw * Math.PI) / 180;
+      const pr = (pose.pitch * Math.PI) / 180;
+      const fx = Math.sin(yr) * Math.cos(pr);
+      const fy = Math.cos(yr) * Math.cos(pr);
+      const fz = Math.sin(pr);
+      const rx = Math.cos(yr);
+      const ry = -Math.sin(yr);
+      const ux = ry * fz;
+      const uy = -rx * fz;
+      const uz = rx * fy - ry * fx;
+      const [ax, ay, az] = enu(wp.x, wp.y, wp.z);
+      const bcx = wp.x + fx * frustumLen;
+      const bcy = wp.y + fy * frustumLen;
+      const bcz = wp.z + fz * frustumLen;
+      const corners: [number, number, number][] = [
+        enu(bcx - rx * halfW + ux * halfH, bcy - ry * halfW + uy * halfH, bcz + uz * halfH),
+        enu(bcx + rx * halfW + ux * halfH, bcy + ry * halfW + uy * halfH, bcz + uz * halfH),
+        enu(bcx + rx * halfW - ux * halfH, bcy + ry * halfW - uy * halfH, bcz - uz * halfH),
+        enu(bcx - rx * halfW - ux * halfH, bcy - ry * halfW - uy * halfH, bcz - uz * halfH),
+      ];
+      for (const c of corners) edgePositions.push(ax, ay, az, c[0], c[1], c[2]);
+      for (let i = 0; i < 4; i++) {
+        const a = corners[i], b = corners[(i + 1) % 4];
+        edgePositions.push(a[0], a[1], a[2], b[0], b[1], b[2]);
+      }
+      const [TL, TR, BR, BL] = corners;
+      fillPositions.push(
+        TL[0], TL[1], TL[2], TR[0], TR[1], TR[2], BR[0], BR[1], BR[2],
+        TL[0], TL[1], TL[2], BR[0], BR[1], BR[2], BL[0], BL[1], BL[2],
+      );
+      for (let v = 0; v < 16; v++) edgeColors.push(col[0], col[1], col[2]);
+      for (let v = 0; v < 6; v++) fillColors.push(col[0], col[1], col[2]);
+    });
+    const g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.Float32BufferAttribute(edgePositions, 3));
+    g.setAttribute('color', new THREE.Float32BufferAttribute(edgeColors, 3));
+    const f = new THREE.BufferGeometry();
+    f.setAttribute('position', new THREE.Float32BufferAttribute(fillPositions, 3));
+    f.setAttribute('color', new THREE.Float32BufferAttribute(fillColors, 3));
+    return { edgeGeo: g, fillGeo: f };
+  }, [waypoints, frustumLen, halfW, halfH]);
+
+  if (!edgeGeo || !fillGeo) return null;
+  return (
+    <group>
+      <mesh geometry={fillGeo}>
+        <meshBasicMaterial vertexColors transparent opacity={0.4} side={THREE.DoubleSide} depthWrite={false} />
+      </mesh>
+      <lineSegments geometry={edgeGeo}>
+        <lineBasicMaterial vertexColors transparent opacity={0.95} linewidth={2} depthWrite={false} />
+      </lineSegments>
+    </group>
   );
 }
 
@@ -329,13 +521,10 @@ function FlightPath({ waypoints }: { waypoints: WaypointData[] }) {
   );
 }
 
-/** Renders the DJI tileset OBB as a semi-transparent block (matches DJI's
- *  Smart 3D Capture Quality Report "Mapping" toggle). Inputs are in ENU; we
- *  swizzle to Three.js (x=E, y=Up, z=-N) for center and each half-axis. */
-/** Axis-aligned box from the mission-area polygon XY extent + waypoint Z
- *  extent. Matches the bounding volume DJI's RC Plus renders on-controller
- *  (a subset of the full tileset OBB, because the polygon declares where the
- *  scan actually flew). */
+/** Axis-aligned box from the RC Plus mission-area polygon XY extent +
+ *  waypoint Z extent. This is the single source of truth for "where the DJI
+ *  mission covers" — used both for rendering the "Mapping box" toggle and as
+ *  the scoping polygon for facade filtering. */
 function PolygonBoxView({
   polygon,
   waypoints,
@@ -381,48 +570,12 @@ function PolygonBoxView({
   );
 }
 
-function MappingBoxView({ box }: { box: MappingBox }) {
-  const { position, matrix } = useMemo(() => {
-    const enuToThree = (v: readonly [number, number, number]) =>
-      new THREE.Vector3(v[0], v[2], -v[1]);
-    const center = enuToThree(box.center);
-    // Full-axis vectors (unit box is 2×2×2, so columns are full axes, not halves)
-    const ax = enuToThree(box.axes[0]);
-    const ay = enuToThree(box.axes[1]);
-    const az = enuToThree(box.axes[2]);
-    const m = new THREE.Matrix4().makeBasis(ax, ay, az);
-    return { position: center, matrix: m };
-  }, [box]);
-
-  return (
-    <group position={position}>
-      <group matrixAutoUpdate={false} matrix={matrix}>
-        <mesh>
-          <boxGeometry args={[2, 2, 2]} />
-          <meshBasicMaterial
-            color="#4aa3ff"
-            transparent
-            opacity={0.18}
-            side={THREE.DoubleSide}
-            depthWrite={false}
-          />
-        </mesh>
-        <lineSegments>
-          <edgesGeometry args={[new THREE.BoxGeometry(2, 2, 2)]} />
-          <lineBasicMaterial color="#7ec4ff" transparent opacity={0.8} />
-        </lineSegments>
-      </group>
-    </group>
-  );
-}
-
 function RawMeshView({ mesh, dimmed }: { mesh: RawMeshData; dimmed?: boolean }) {
   const solidRef = useRef<THREE.Mesh>(null);
   const [geometry, setGeometry] = useState<THREE.BufferGeometry | null>(null);
 
   useEffect(() => {
     let disposed = false;
-    let prev: THREE.BufferGeometry | null = null;
 
     (async () => {
       const { positions, indices } = await decodeRawMesh(mesh);
@@ -440,11 +593,10 @@ function RawMeshView({ mesh, dimmed }: { mesh: RawMeshData; dimmed?: boolean }) 
       geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
       geo.setIndex(new THREE.BufferAttribute(indices, 1));
       geo.computeVertexNormals();
-      setGeometry((old) => {
-        prev = old;
+      setGeometry((old: THREE.BufferGeometry | null) => {
+        if (old) old.dispose();
         return geo;
       });
-      if (prev) prev.dispose();
     })();
 
     return () => {
@@ -566,18 +718,6 @@ function PointCloudView({ data }: { data: PointCloudData }) {
   );
 }
 
-function MissionAreaView({ data }: { data: MissionAreaData }) {
-  const points = useMemo(() => {
-    const pts = data.vertices.map((v) => enu(v[0], v[1], v[2]));
-    if (pts.length > 2) pts.push(pts[0]);
-    return pts;
-  }, [data]);
-  if (points.length < 2) return null;
-  return (
-    <Line points={points} color="#22d3ee" lineWidth={1.5} dashed dashSize={0.5} gapSize={0.3} />
-  );
-}
-
 function VisitedOverlay({ waypoints, visitedUpTo }: { waypoints: WaypointData[]; visitedUpTo: number }) {
   const meshRef = useRef<THREE.InstancedMesh>(null);
   const count = Math.min(visitedUpTo + 1, waypoints.length);
@@ -617,9 +757,8 @@ function Scene({ data, onWaypointClick, visitedIndex, viewMode, activeFacades, l
   const exclusionZones = useStore((s) => s.exclusionZones);
   const updateExclusionZone = useStore((s) => s.updateExclusionZone);
   const showOriginalGimbals = useStore((s) => s.showOriginalGimbals);
-  const showRosettePoses = useStore((s) => s.showRosettePoses);
+  const showRosetteDiagnostic = useStore((s) => s.showRosetteDiagnostic);
   const showMappingBox = useStore((s) => s.showMappingBox);
-  const mappingBoxSource = useStore((s) => s.mappingBoxSource);
 
   // Separate inspection and transition waypoints
   const { facadeWaypoints, transitionWaypoints } = useMemo(() => {
@@ -764,7 +903,8 @@ function Scene({ data, onWaypointClick, visitedIndex, viewMode, activeFacades, l
             <group key={fi}>
               <WaypointSpheres waypoints={wps} color={isActive ? color : '#1a1a2a'} bright={isActive} />
               {isActive && <CameraArrows waypoints={wps} color={color} bright cameraFov={cameraFov} />}
-              {isActive && showOriginalGimbals && <OriginalGimbalArrows waypoints={wps} color="#ff3344" cameraFov={cameraFov} showRosette={showRosettePoses} />}
+              {isActive && showOriginalGimbals && <OriginalGimbalArrows waypoints={wps} color="#ff3344" cameraFov={cameraFov} />}
+              {isActive && showRosetteDiagnostic && <RosetteDiagnostic waypoints={wps} cameraFov={cameraFov} />}
             </group>
           );
         }
@@ -780,7 +920,8 @@ function Scene({ data, onWaypointClick, visitedIndex, viewMode, activeFacades, l
           <group key={fi}>
             <WaypointSpheres waypoints={wps} color={color} />
             <CameraArrows waypoints={wps} color={color} />
-            {showOriginalGimbals && <OriginalGimbalArrows waypoints={wps} color="#ff3344" cameraFov={cameraFov} showRosette={showRosettePoses} />}
+            {showOriginalGimbals && <OriginalGimbalArrows waypoints={wps} color="#ff3344" cameraFov={cameraFov} />}
+            {showRosetteDiagnostic && <RosetteDiagnostic waypoints={wps} cameraFov={cameraFov} />}
           </group>
         );
       })}
@@ -806,14 +947,10 @@ function Scene({ data, onWaypointClick, visitedIndex, viewMode, activeFacades, l
       {/* Imported DJI Smart3D reference point cloud */}
       {data.pointCloud && <PointCloudView data={data.pointCloud} />}
 
-      {/* Mapping volume. Default source is the mission-polygon extent (matches
-          RC Plus on-controller). 'tileset' uses the full 3D-Tiles OBB which is
-          larger — includes terrain around the scanned area. */}
-      {showMappingBox && mappingBoxSource === 'polygon' && data.missionArea && (
+      {/* Mapping volume — RC Plus mission-polygon extent. Single source of
+          truth for facade planning scope. */}
+      {showMappingBox && data.missionArea && (
         <PolygonBoxView polygon={data.missionArea.vertices} waypoints={data.waypoints} />
-      )}
-      {showMappingBox && mappingBoxSource === 'tileset' && data.mappingBox && (
-        <MappingBoxView box={data.mappingBox} />
       )}
 
       {/* Mission-area polygon intentionally not drawn in 3D — it clutters the
@@ -1008,26 +1145,13 @@ export function Viewer3D({ data, cameraFov, defaultViewMode = 'plan' }: { data: 
     setSnapshot(null);
   }, [data]);
 
-  // Scene centroid + bounding radius in Three.js space. For DJI KMZ imports
-  // we drive framing from the authoritative tileset OBB; otherwise fall back
-  // to the waypoint/facade extent so uploaded-mesh scenes still frame.
+  // Scene centroid + bounding radius in Three.js space, derived from
+  // waypoint + facade extent.
   const { sceneCentroid, sceneRadius } = useMemo<{
     sceneCentroid: [number, number, number];
     sceneRadius: number;
   }>(() => {
     if (!data) return { sceneCentroid: [0, 0, 0], sceneRadius: 30 };
-    if (data.mappingBox) {
-      const { center, axes } = data.mappingBox;
-      // ENU → Three.js (x=E, y=Up=ENU.z, z=-N)
-      const cx = center[0], cy = center[2], cz = -center[1];
-      // axes are full half-axis vectors; diagonal half-length bounds the box.
-      const diag = Math.sqrt(
-        axes[0].reduce((s, v) => s + v * v, 0) +
-        axes[1].reduce((s, v) => s + v * v, 0) +
-        axes[2].reduce((s, v) => s + v * v, 0),
-      );
-      return { sceneCentroid: [cx, cy, cz], sceneRadius: diag };
-    }
     const pts: [number, number, number][] = [];
     for (const wp of data.waypoints) pts.push([wp.x, wp.z, -wp.y]);
     for (const f of data.facades) {

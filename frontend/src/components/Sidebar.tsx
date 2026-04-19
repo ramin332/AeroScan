@@ -43,9 +43,8 @@ export function Sidebar() {
     rewriteGimbals, generateInspectionMission, toggleKmzFacades, lastKmzFile,
     triggerMissionUpdate,
     showMappingBox, setShowMappingBox,
-    mappingBoxSource, setMappingBoxSource,
     showOriginalGimbals, setShowOriginalGimbals,
-    showRosettePoses, setShowRosettePoses,
+    showRosetteDiagnostic, setShowRosetteDiagnostic,
     cameraFovOverride, setCameraFovOverride, resetCameraFovOverride,
   } = useStore();
 
@@ -819,45 +818,22 @@ export function Sidebar() {
             label="Mapping box"
             value={showMappingBox}
             onChange={setShowMappingBox}
-            tooltip="Draws the mapping bounding volume. Default source = mission-area polygon extent (what RC Plus shows on the controller)."
+            tooltip="Draws DJI's RC Plus mission-area bounding volume. This is the single source of truth for facade planning."
           />
-          {showMappingBox && (
-            <div style={{ display: 'flex', gap: 6, margin: '-2px 0 6px 2px' }}>
-              <button
-                type="button"
-                className={`btn ${mappingBoxSource === 'polygon' ? 'btn-primary' : 'btn-ghost'}`}
-                style={{ flex: 1, fontSize: 11 }}
-                onClick={() => setMappingBoxSource('polygon')}
-              >
-                Polygon (RC Plus)
-              </button>
-              <button
-                type="button"
-                className={`btn ${mappingBoxSource === 'tileset' ? 'btn-primary' : 'btn-ghost'}`}
-                style={{ flex: 1, fontSize: 11 }}
-                onClick={() => setMappingBoxSource('tileset')}
-                disabled={!result.viewer_data.threejs.mappingBox}
-              >
-                Tileset OBB
-              </button>
-            </div>
-          )}
           <div style={{ fontSize: 10, color: 'var(--muted)', margin: '-2px 0 6px 2px' }}>
-            {mappingBoxSource === 'polygon'
-              ? (result.viewer_data.threejs.missionArea ? 'mission-area polygon (subset)' : 'no polygon in this import')
-              : (result.viewer_data.threejs.mappingBox ? 'tileset.json (full tile extent)' : 'no tileset in this import')}
+            {result.viewer_data.threejs.missionArea ? 'mission-area polygon (RC Plus)' : 'no polygon in this import'}
           </div>
           <ToggleField
             label="Camera frustums"
             value={showOriginalGimbals}
             onChange={setShowOriginalGimbals}
-            tooltip="Per-photo camera pyramid. Smart Auto Explore captures multiple photos per waypoint so expect clusters at each apex."
+            tooltip="Simulated shutter events. DJI Smart3D cycles the rosette (unlimited mode) while flying between capture WPs; shots = (segment distance / speed) / 0.316s. Positions lerp along each segment, pose wraps the rosette."
           />
           <ToggleField
-            label="Expand SmartOblique rosette"
-            value={showRosettePoses}
-            onChange={setShowRosettePoses}
-            tooltip="Draws all 5 poses per waypoint (1 nadir + 4 obliques). Turn OFF to see only the planned aircraft pose (~-90° nadir) — useful for debugging but hides the oblique coverage that reconstruction actually uses."
+            label="Diagnose rosette"
+            value={showRosetteDiagnostic}
+            onChange={setShowRosetteDiagnostic}
+            tooltip="Overlays one oversized 5-pose rosette at the WP with the widest pitch spread. Verifies the pitch/yaw transform — if any pose points wrong, the math is wrong."
           />
           {result.summary.camera && (() => {
             const cam = result.summary.camera;

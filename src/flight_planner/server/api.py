@@ -77,39 +77,54 @@ def _kmz_extract_best_facades(
     return facades
 
 
-def _waypoint_hull_polygon(waypoints_xy, expand_m: float = 2.0):
-    """Return the convex hull of waypoint XYs, expanded outward by ``expand_m``.
+def _expand_polygon_xy(polygon_enu, margin_m: float):
+    """Return the polygon expanded outward by ``margin_m`` (axis-aligned bbox)."""
+    import numpy as _np
+    if not polygon_enu or len(polygon_enu) < 3 or margin_m <= 0:
+        return polygon_enu
+    arr = _np.asarray(polygon_enu, dtype=float).reshape(-1, 3)
+    centroid = arr[:, :2].mean(axis=0)
+    out = []
+    for x, y, z in arr:
+        dx = x - centroid[0]
+        dy = y - centroid[1]
+        r = (dx * dx + dy * dy) ** 0.5
+        if r < 1e-6:
+            out.append((float(x), float(y), float(z)))
+            continue
+        scale = (r + margin_m) / r
+        out.append((float(centroid[0] + dx * scale), float(centroid[1] + dy * scale), float(z)))
+    return out
 
-    The DJI mission polygon (``mission_area_wgs84``) declares a scan REGION
-    that's often much larger than where the drone actually flew; for facade
-    filtering we want "where DJI is flying, + a small margin". Hull of
-    waypoint positions is that boundary.
+
+def _filter_facades_by_dji_bbox(
+    facades,
+    mission_area_wgs84: list | None,
+    ref_lat: float,
+    ref_lon: float,
+    ref_alt: float,
+    *,
+    margin_m: float = 2.0,
+):
+    """Restrict facades to the DJI RC Plus mission-area polygon.
+
+    The ``mission_area_wgs84`` polygon (from the KMZ ``template.kml``) is the
+    authoritative bound: it's what the RC Plus shows on-controller as the
+    mapped region. A small ``margin_m`` is added so facades lying just on
+    the polygon edge (common when the building footprint hugs the mission
+    boundary) still survive. Returns the input list unchanged if no polygon
+    is available (degraded KMZ).
     """
     import numpy as _np
-    wp = _np.asarray(waypoints_xy, dtype=float).reshape(-1, 2)
-    if len(wp) < 3:
-        return []
-    try:
-        from scipy.spatial import ConvexHull as _Hull  # type: ignore
-        hull = _Hull(wp)
-        boundary = wp[hull.vertices]
-    except Exception:
-        mn, mx = wp.min(axis=0), wp.max(axis=0)
-        boundary = _np.array([[mn[0], mn[1]], [mx[0], mn[1]], [mx[0], mx[1]], [mn[0], mx[1]]])
-    c = boundary.mean(axis=0)
-    vecs = boundary - c
-    radii = _np.linalg.norm(vecs, axis=1)
-    radii_safe = _np.where(radii < 1e-9, 1.0, radii)
-    expanded = c + vecs / radii_safe[:, None] * (radii + expand_m)[:, None]
-    return [(float(p[0]), float(p[1]), 0.0) for p in expanded]
-
-
-def _filter_facades_by_camera_coverage(facades, polygon_enu):
-    """Drop facades whose XY centroid is outside the given polygon."""
-    import numpy as _np
-    if not facades or not polygon_enu or len(polygon_enu) < 3:
+    from ..kmz_import import polygon_to_enu as _poly_to_enu
+    if not mission_area_wgs84:
+        print("[kmz facades] no mission_area_wgs84 — skipping filter")
         return facades
-    poly = _np.asarray(polygon_enu, dtype=float).reshape(-1, 3)[:, :2]
+    poly_enu = _poly_to_enu(mission_area_wgs84, ref_lat, ref_lon, ref_alt)
+    poly_enu = _expand_polygon_xy(poly_enu, margin_m)
+    if not poly_enu or len(poly_enu) < 3:
+        return facades
+    poly = _np.asarray(poly_enu, dtype=float).reshape(-1, 3)[:, :2]
 
     def _inside(x: float, y: float) -> bool:
         inside = False
@@ -123,12 +138,8 @@ def _filter_facades_by_camera_coverage(facades, polygon_enu):
             j = i
         return inside
 
-    kept = []
-    for f in facades:
-        c = _np.asarray(f.vertices).mean(axis=0)
-        if _inside(float(c[0]), float(c[1])):
-            kept.append(f)
-    print(f"[kmz facades] coverage-polygon filter: {len(facades)} → {len(kept)}")
+    kept = [f for f in facades if _inside(*_np.asarray(f.vertices).mean(axis=0)[:2])]
+    print(f"[kmz facades] RC Plus polygon filter (margin={margin_m}m): {len(facades)} → {len(kept)}")
     return kept
 
 
@@ -925,7 +936,6 @@ async def import_kmz(
                 pointcloud_to_mesh_ply,
                 facades_from_polygon,
                 clip_mesh_to_polygon_xy,
-                mapping_bbox_to_enu,
                 resolve_capture_intrinsics,
             )
             from ..models import ActionType, CameraAction, CameraName as _CameraName, MissionConfig
@@ -971,21 +981,25 @@ async def import_kmz(
                 pc_positions, pc_colors = pointcloud_to_viewer_arrays(pcd, max_points=250_000)
 
                 from ..models import Building as _Building, RoofType as _RoofType
-                # DJI's 3D-Tiles Mapping OBB (when present) is the authoritative
-                # scene-bounds volume; its half-axis magnitudes drive the viewer
-                # and the Building record's reported dimensions.
-                mapping_enu = mapping_bbox_to_enu(
-                    parsed.mapping_bbox_raw,
+                # Building bounds come from the RC Plus mission-area polygon +
+                # point-cloud Z extent — the same volume the "Mapping box" toggle
+                # plots in the viewer.
+                import numpy as _np_raw
+                area_enu_raw = polygon_to_enu(
+                    parsed.mission_area_wgs84,
                     parsed.ref_lat, parsed.ref_lon, parsed.ref_alt,
                 )
-                if mapping_enu is not None:
-                    import numpy as _np_raw
-                    axes = [_np_raw.asarray(a) for a in mapping_enu["axes"]]
-                    bbox_w = float(2.0 * _np_raw.linalg.norm(axes[0]))
-                    bbox_d = float(2.0 * _np_raw.linalg.norm(axes[1]))
-                    bbox_h = float(2.0 * _np_raw.linalg.norm(axes[2]))
+                if area_enu_raw:
+                    area_arr = _np_raw.asarray(area_enu_raw, dtype=float).reshape(-1, 3)[:, :2]
+                    bbox_w = float(area_arr[:, 0].max() - area_arr[:, 0].min())
+                    bbox_d = float(area_arr[:, 1].max() - area_arr[:, 1].min())
                 else:
-                    bbox_w = bbox_d = bbox_h = 0.0
+                    bbox_w = bbox_d = 0.0
+                try:
+                    pc_z = _np_raw.asarray(pcd.points, dtype=_np_raw.float32)[:, 2]
+                    bbox_h = float(pc_z.max() - pc_z.min()) if pc_z.size else 0.0
+                except Exception:
+                    bbox_h = 0.0
                 building = _Building(
                     lat=parsed.ref_lat, lon=parsed.ref_lon, ground_altitude=parsed.ref_alt,
                     width=bbox_w, depth=bbox_d, height=bbox_h,
@@ -1033,9 +1047,11 @@ async def import_kmz(
                     _io.BytesIO(clipped_bytes), file_type="ply", force="mesh", process=False,
                 )
                 building.facades = _kmz_extract_best_facades(_mesh_clipped, clip_poly_cached, pc_xyz_cached)
-                _enu_wps_c = waypoints_to_enu(parsed.waypoints, parsed.ref_lat, parsed.ref_lon, parsed.ref_alt)
-                _hull_poly_c = _waypoint_hull_polygon([(w["x"], w["y"]) for w in _enu_wps_c], expand_m=2.0)
-                building.facades = _filter_facades_by_camera_coverage(building.facades, _hull_poly_c)
+                building.facades = _filter_facades_by_dji_bbox(
+                    building.facades,
+                    parsed.mission_area_wgs84,
+                    parsed.ref_lat, parsed.ref_lon, parsed.ref_alt,
+                )
             else:
                 _set_upload_progress(task_id, 0.15, f"Loading point cloud ({len(parsed.point_cloud_ply)//1024} KB)…")
                 pcd = load_pointcloud(parsed.point_cloud_ply)
@@ -1072,9 +1088,11 @@ async def import_kmz(
                     _io.BytesIO(clipped_bytes), file_type="ply", force="mesh", process=False,
                 )
                 building.facades = _kmz_extract_best_facades(_mesh_clipped, clip_poly_fresh, pc_xyz_fresh)
-                _enu_wps_f = waypoints_to_enu(parsed.waypoints, parsed.ref_lat, parsed.ref_lon, parsed.ref_alt)
-                _hull_poly_f = _waypoint_hull_polygon([(w["x"], w["y"]) for w in _enu_wps_f], expand_m=2.0)
-                building.facades = _filter_facades_by_camera_coverage(building.facades, _hull_poly_f)
+                building.facades = _filter_facades_by_dji_bbox(
+                    building.facades,
+                    parsed.mission_area_wgs84,
+                    parsed.ref_lat, parsed.ref_lon, parsed.ref_alt,
+                )
 
             _set_upload_progress(task_id, 0.88, "Saving imported building…")
 
@@ -1172,7 +1190,6 @@ async def import_kmz(
                             } for wp in parsed.waypoints
                         ],
                         "mission_config_raw": parsed.mission_config_raw,
-                        "mapping_bbox_raw": parsed.mapping_bbox_raw,
                         "camera_intrinsics": camera_intrinsics,
                         "voxel_size": effective_voxel,
                     }),
@@ -1273,10 +1290,6 @@ async def import_kmz(
                 building, waypoints,
                 point_cloud={"positions": pc_positions, "colors": pc_colors},
                 mission_area=area_enu,
-                mapping_bbox=mapping_bbox_to_enu(
-                    parsed.mapping_bbox_raw,
-                    parsed.ref_lat, parsed.ref_lon, parsed.ref_alt,
-                ),
             )
             # Stamp DJI SmartOblique rosette poses onto viewer waypoint dicts so
             # the frontend can render all 5 original gimbal directions per
@@ -1290,6 +1303,9 @@ async def import_kmz(
                             {"pitch": round(p["pitch"], 1), "yaw": round(p["yaw"], 1)}
                             for p in poses
                         ]
+                    # Needed for shutter-rate shot simulation in the viewer:
+                    # shots per pass segment = dist / speed / shutter_interval.
+                    wd["speed_ms"] = round(float(enu_wps[i].get("speed_ms", 2.0)), 3)
             # Attach raw reconstructed mesh so the viewer can render it.
             # Forward the already-gzipped+base64 buffers: re-serializing via
             # .tolist() + JSON for a multi-hundred-k-face mesh is the single
@@ -1622,28 +1638,11 @@ def refine_kmz_building(building_id: str, req: RefineKmzRequest):
                     fd_overrides=fd_overrides_refine,
                 )
                 _kmz_facade_runtime_cache_put(facade_key, building.facades)
-            # Restrict to facades inside the DJI flight envelope (waypoint hull + 2 m margin)
-            from ..kmz_import import ParsedWaypoint as _ParsedWaypoint_ref, waypoints_to_enu as _wp_enu_ref
-            _waypoints_raw_ref = props.get("waypoints_raw", [])
-            if _waypoints_raw_ref:
-                _parsed_wps_ref = [
-                    _ParsedWaypoint_ref(
-                        index=int(w.get("index", i)),
-                        lon=float(w["lon"]), lat=float(w["lat"]),
-                        alt_egm96=float(w["alt_egm96"]),
-                        heading_deg=float(w["heading_deg"]),
-                        gimbal_pitch_deg=float(w["gimbal_pitch_deg"]),
-                        speed_ms=float(w.get("speed_ms", 2.0)),
-                        gimbal_yaw_raw_deg=float(w.get("gimbal_yaw_raw_deg", 0.0)),
-                        gimbal_heading_mode=str(w.get("gimbal_heading_mode", "smoothTransition")),
-                        gimbal_yaw_base=str(w.get("gimbal_yaw_base", "aircraft")),
-                        smart_oblique_poses=[],
-                    )
-                    for i, w in enumerate(_waypoints_raw_ref)
-                ]
-                _enu_wps_r = _wp_enu_ref(_parsed_wps_ref, ref_lat, ref_lon, ref_alt)
-                _hull_poly_r = _waypoint_hull_polygon([(w["x"], w["y"]) for w in _enu_wps_r], expand_m=2.0)
-                building.facades = _filter_facades_by_camera_coverage(building.facades, _hull_poly_r)
+            building.facades = _filter_facades_by_dji_bbox(
+                building.facades,
+                props.get("mission_area_wgs84"),
+                ref_lat, ref_lon, ref_alt,
+            )
 
             # --- Pre-compute pc_b64 now; DB write happens after response is built. ---
             _set_upload_progress(task_id, 0.85, "Updating building record…")
@@ -1719,14 +1718,12 @@ def refine_kmz_building(building_id: str, req: RefineKmzRequest):
 
             from ..kmz_import import (
                 ImportedKmz as _ImportedKmz,
-                mapping_bbox_to_enu as _mbox_to_enu,
                 resolve_capture_intrinsics as _resolve_intr,
             )
             refine_intrinsics = _resolve_intr(_ImportedKmz(
                 name=name, ref_lat=ref_lat, ref_lon=ref_lon, ref_alt=ref_alt,
                 waypoints=parsed_wps, mission_area_wgs84=mission_area_wgs84,
                 mission_config_raw=mission_cfg_raw, point_cloud_ply=None,
-                mapping_bbox_raw=props.get("mapping_bbox_raw"),
             ))
             summary = {
                 "waypoint_count": len(waypoints),
@@ -1750,9 +1747,6 @@ def refine_kmz_building(building_id: str, req: RefineKmzRequest):
                 building, waypoints,
                 point_cloud={"positions": pc_positions, "colors": pc_colors},
                 mission_area=area_enu,
-                mapping_bbox=_mbox_to_enu(
-                    props.get("mapping_bbox_raw"), ref_lat, ref_lon, ref_alt,
-                ),
             )
             vw = threejs_data.get("waypoints", []) if isinstance(threejs_data, dict) else []
             for i, wd in enumerate(vw):
@@ -1763,6 +1757,9 @@ def refine_kmz_building(building_id: str, req: RefineKmzRequest):
                             {"pitch": round(p["pitch"], 1), "yaw": round(p["yaw"], 1)}
                             for p in poses
                         ]
+                    # Needed for shutter-rate shot simulation in the viewer:
+                    # shots per pass segment = dist / speed / shutter_interval.
+                    wd["speed_ms"] = round(float(enu_wps[i].get("speed_ms", 2.0)), 3)
             raw_mesh = getattr(building, "_mesh_viewer_data", None)
             if raw_mesh and "positions_b64" in raw_mesh and "indices_b64" in raw_mesh:
                 threejs_data["rawMesh"] = {
@@ -2185,6 +2182,11 @@ def generate(request: GenerateRequest):
     # Build the building from one of three sources: uploaded, preset, or custom box
     raw_mesh = None  # raw 3D mesh data for viewer (mesh uploads only)
     mesh_obj = None  # trimesh object for LOS occlusion checks
+    kmz_source_type: str | None = None  # set to "kmz_raw"/"kmz_import" for KMZ buildings
+    kmz_mission_area_wgs84: list | None = None
+    kmz_ref_lat: float = 0.0
+    kmz_ref_lon: float = 0.0
+    kmz_ref_alt: float = 0.0
 
     if request.building_id:
         db = get_db()
@@ -2203,8 +2205,13 @@ def generate(request: GenerateRequest):
                     BuildingRecord.num_stories,
                     BuildingRecord.roof_type,
                     BuildingRecord.roof_pitch_deg,
+                    BuildingRecord.source_type,
                     BuildingRecord.geometry_data,
                     func.json_extract(BuildingRecord.properties_json, "$.mesh_viewer").label("mesh_viewer_str"),
+                    func.json_extract(BuildingRecord.properties_json, "$.mission_area_wgs84").label("mission_area_str"),
+                    func.json_extract(BuildingRecord.properties_json, "$.ref_lat").label("ref_lat"),
+                    func.json_extract(BuildingRecord.properties_json, "$.ref_lon").label("ref_lon"),
+                    func.json_extract(BuildingRecord.properties_json, "$.ref_alt").label("ref_alt"),
                 )
                 .filter(BuildingRecord.id == request.building_id)
                 .first()
@@ -2213,6 +2220,12 @@ def generate(request: GenerateRequest):
                 raise HTTPException(status_code=404, detail="Building not found")
 
             raw_mesh = json.loads(row.mesh_viewer_str) if row.mesh_viewer_str else None
+            if row.source_type and row.source_type.startswith("kmz_"):
+                kmz_source_type = row.source_type
+                kmz_mission_area_wgs84 = json.loads(row.mission_area_str) if row.mission_area_str else None
+                kmz_ref_lat = float(row.ref_lat if row.ref_lat is not None else row.lat)
+                kmz_ref_lon = float(row.ref_lon if row.ref_lon is not None else row.lon)
+                kmz_ref_alt = float(row.ref_alt if row.ref_alt is not None else 0.0)
 
             if raw_mesh:
                 # Reconstruct mesh from stored vertices/indices and re-run
@@ -2334,6 +2347,17 @@ def generate(request: GenerateRequest):
 
     t_building = time.perf_counter()
 
+    # KMZ buildings: restrict planning to facades inside DJI's declared mapped
+    # volume (3D-Tiles tileset.json Mapping OBB). Runs before candidate-facade
+    # enablement so the filter applies to the extracted set only — a user can
+    # still force-enable a candidate outside the OBB if they want.
+    if kmz_source_type is not None:
+        building.facades = _filter_facades_by_dji_bbox(
+            building.facades,
+            kmz_mission_area_wgs84,
+            kmz_ref_lat, kmz_ref_lon, kmz_ref_alt,
+        )
+
     # Append enabled candidate facades (rejected during extraction but force-included by user)
     if request.enabled_candidates:
         from ..building_import import last_rejected_candidates
@@ -2449,6 +2473,10 @@ def generate(request: GenerateRequest):
         },
         "facade_coverage": compute_facade_coverage(building, waypoints),
     }
+    # Stamp the original KMZ source type so the sidebar keeps the DJI/inspection
+    # mode toggle visible after regeneration.
+    if kmz_source_type is not None:
+        summary["source"] = kmz_source_type
 
     t_summary = time.perf_counter()
 
@@ -2466,7 +2494,10 @@ def generate(request: GenerateRequest):
 
     # Prepare viewer data (include rejected facade candidates for manual enabling)
     from ..building_import import last_rejected_candidates
-    threejs_data = prepare_threejs_data(building, waypoints, candidate_facades=last_rejected_candidates)
+    threejs_data = prepare_threejs_data(
+        building, waypoints,
+        candidate_facades=last_rejected_candidates,
+    )
     if raw_mesh:
         # Forward the already-gzipped+base64 mesh blobs directly when present:
         # decoding to Python lists and re-serializing as JSON costs ~1 GB of

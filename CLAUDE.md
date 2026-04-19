@@ -138,7 +138,7 @@ DJI Smart3D / AutoExplore KMZ missions ship a point cloud (sparse, noisy) plus a
 4. **Parallel-snap regularization** — Verdie et al. 2015 ("LOD Generation for Urban Scenes"). CGAL's C++ `regularize_planes` isn't exposed in the Python bindings, so the parallel-snap step is done inline in numpy: planes whose normals agree within 5° share one refit normal (weighted by inlier count). Fixes the "plates slicing through each other" artifact where slightly-misaligned regions would otherwise render as overlapping rectangles. Coplanar-merge (the companion step) is OFF by default — for NEN-2767 inspection we *want* spatially-separated facets on the same wall plane to stay separate, so the gimbal can square up on each one.
 5. **Density gate** — reject any plane with inlier density < `min_density_per_m2` (default 25). Kills "ghost planes" where scattered inliers span a huge floating rectangle.
 6. **PCA-oriented rectangle** — each region's bounding rectangle is built in its own plane frame (PCA u/v axes, 5/95 percentile clamp), so pitched roofs, dormers, chamfers, and canopies keep their real tilt instead of being flattened to an axis-aligned XY box.
-7. **Camera-coverage filter** — `_filter_facades_by_camera_coverage` drops any facade whose XY centroid falls outside the waypoint-convex-hull + 2m margin. The DJI KMZ already declares where the drone photographed; facades outside that envelope are terrain noise by definition.
+7. **RC Plus mission-polygon filter** — `_filter_facades_by_dji_bbox` drops any facade whose XY centroid falls outside the DJI `mission_area_wgs84` polygon (from `template.kml`), expanded by a 2m margin so facades hugging the polygon edge still survive. This polygon is what the RC Plus shows on-controller as the mapped region and is the single source of truth for facade planning scope — the same polygon drives the viewer's "Mapping box" toggle via `PolygonBoxView`. Applied at KMZ import, refine, AND at `/generate` so every regeneration (including the NEN-2767 inspection mission) honours the same gate.
 
 ### Why region_growing over efficient_RANSAC for inspection
 
@@ -166,3 +166,57 @@ These knobs are interlocked. For reasonable DJI Smart3D clouds:
 | ransac cluster_ε | ≈ 4–5 × voxel | max inlier gap |
 | regularize parallel_tol | 5° | snap near-parallel to exact |
 | regularize coplanar_tol | 1.5 × ε | merge near-coplanar |
+
+## Smart3D rosette pitch — what the KMZ encodes vs what the drone shoots
+
+DJI Smart3D missions have two layers of "where the camera was pointing," and they are NOT the same:
+
+### What the KMZ encodes (mission *intent*)
+
+Three pitch fields appear in `wpmz/waylines.wpml`:
+
+| Field | Meaning | Range observed in our KMZs |
+|---|---|---|
+| `smartObliqueEulerPitch` | Per-pose rosette pitch, 5 poses per `startSmartOblique` action | **−90° to +30°** (MijandeExtra tops out at +20°) |
+| `waypointGimbalPitchAngle` | Single gimbal pitch for non-rosette WPs | always negative (e.g. MijandeExtra: −89° to −10°) |
+| `gimbalPitchRotateAngle` | Action-driven gimbal rotation target (rare) | mission-specific |
+
+**Convention:** `0° = horizontal forward`, `−90° = nadir (straight down)`, positive = looking up. Matches DJI's standard WPML convention.
+
+**Hardware bound:** Matrice 4E gimbal soft/controllable limit is **−90° to +35°** (mechanical −140° to +50°). `models.py` `GIMBAL_TILT_MIN/MAX_DEG` matches. **No KMZ in `/kmz/` exceeds +30°** — there is no "straight up to the sky" pose anywhere in our sample missions.
+
+In MijandeExtra specifically: 584 waypoints, only 248 have a rosette block; the rest are transit WPs with a single `waypointGimbalPitchAngle`. Per-WP rosette structure is consistently `[center, +Δ, +Δ, −Δ, −Δ]` with ±30° yaw offsets — a 5-pose fan around the WP heading.
+
+### What the drone actually shoots (capture *reality*)
+
+`smartObliqueCycleMode=unlimited` means the gimbal keeps cycling through the active rosette while flying *between* capture WPs. Combined with action-triggered shutter, the photo count >> rosette pose count (MijandeExtra: 1333 photos / 248 rosette WPs ≈ 5.4 photos per rosette). **You cannot determine which physical photo index corresponds to which pose from the KMZ alone** — that mapping depends on runtime gimbal slew speed, flight speed, and shutter timing.
+
+### `waypointSpeed`/`autoFlightSpeed` in WPML are NOT the actual flight speed
+
+DJI Smart3D missions report `autoFlightSpeed=0.7 m/s` and per-WP `waypointSpeed=1.0 m/s` in the WPML, but the drone actually flies the inspection passes at ~2 m/s. Empirical calibration from MijandeExtra:
+
+- Total inspection-pass length ≈ 850 m
+- DJI-reported total photos: 1333
+- DJI-reported total pass time: 421.7 s
+- → effective speed ≈ 2.02 m/s, inter-shot spacing ≈ **0.64 m**
+
+Using the WPML speed × shutter interval to compute "shots per segment" yields ~5×-too-dense and ~2.4×-too-long output. The viewer's `OriginalGimbalArrows` (`Viewer3D.tsx`) samples by **distance** (`DJI_SMART3D_INTER_SHOT_DIST_M = 0.65`) instead of by time, sidestepping the bad speed field. The pose cycle counter walks continuously across the whole flight without resetting at WP boundaries — `cycleMode=unlimited` cycles 0→1→2→3→4→0 forever, with each `startSmartOblique` block only updating *which direction* poses 0-4 point, not restarting the counter.
+
+### MijandeExtra rosette-template drift
+
+248 overlapping `startSmartOblique` action groups, each spanning 2-3 WPs, 69 unique pose templates. Pitches drift smoothly across waypoints (e.g. `−37,−7,−67` → `−35,−5,−65` → `−21,9,−51`...) as DJI re-aims the rosette to track the building during flight. **Don't reset the pose-cycle counter on template change** — DJI just hot-swaps which way each pose-index points, the cycle keeps walking.
+
+### Ground truth lives in the JPEG EXIF/XMP
+
+The actual gimbal angles at exposure are stamped into every captured JPEG by DJI's flight controller:
+
+- `drone-dji:GimbalPitchDegree` — actual pitch at shutter
+- `drone-dji:GimbalYawDegree` — actual yaw at shutter
+- `drone-dji:GimbalRollDegree` — actual roll at shutter (always ~0)
+- `drone-dji:FlightPitchDegree` / `FlightYawDegree` / `FlightRollDegree` — aircraft body angles
+
+If a user reports "this photo looks straight up but the KMZ doesn't say so," the resolution path is:
+
+1. Read the JPEG XMP, not the WPML — XMP has the truth
+2. If XMP confirms a pitch outside the rosette spec, DJI's runtime is overriding the mission (e.g. autonomous calibration shots, gimbal overshoot during slew). The WPML alone cannot model this.
+3. The frontend's `OriginalGimbalArrows` / `RosetteDiagnostic` (`Viewer3D.tsx`) renders mission-intent poses from `waypoint.smart_oblique_poses`. Visualizing actual capture orientation would require ingesting the photos' XMP — not currently implemented.

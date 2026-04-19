@@ -13,7 +13,7 @@ function SimulationTab() {
   const [tasks, setTasks] = useState<SimulationStatus[]>([]);
   const [activeTaskId, setActiveTaskId] = useState<string | null>(null);
   const [viewerData, setViewerData] = useState<ViewerData | null>(null);
-  const [activeResult, setActiveResult] = useState<SimulationStatus['result']>(null);
+  const [activeResult, setActiveResult] = useState<SimulationStatus['result']>(undefined);
   const [loading, setLoading] = useState(false);
 
   const refreshTasks = async () => {
@@ -59,7 +59,7 @@ function SimulationTab() {
     if (activeTaskId === taskId) {
       setActiveTaskId(null);
       setViewerData(null);
-      setActiveResult(null);
+      setActiveResult(undefined);
     }
     refreshTasks();
   };

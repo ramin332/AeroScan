@@ -31,17 +31,7 @@ def _stub_building() -> Building:
     )
 
 
-def test_prepare_threejs_data_emits_mapping_box_when_provided():
-    b = _stub_building()
-    mapping = {
-        "center": [1.0, 2.0, 3.0],
-        "axes": [[10.0, 0.0, 0.0], [0.0, 20.0, 0.0], [0.0, 0.0, 5.0]],
-    }
-    out = prepare_threejs_data(b, [], mapping_bbox=mapping)
-    assert out["mappingBox"] == mapping
-
-
-def test_prepare_threejs_data_no_mapping_box_by_default():
+def test_prepare_threejs_data_no_mapping_box_field():
     b = _stub_building()
     out = prepare_threejs_data(b, [])
     assert "mappingBox" not in out

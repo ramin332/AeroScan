@@ -1,6 +1,6 @@
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
-import type { AlgorithmParams, BuildingParams, ExclusionZone, GenerateResponse, MissionParams, SimulationResult, UploadedBuilding, VersionSummary } from './api/types';
+import type { AlgorithmParams, BuildingParams, ExclusionZone, GenerateResponse, MissionParams, SimulationResult, VersionSummary } from './api/types';
 import * as api from './api/client';
 
 export const DEFAULT_BUILDING: BuildingParams = {
@@ -201,16 +201,10 @@ interface AppState {
   stripRosetteOnly: () => Promise<void>;
   showOriginalGimbals: boolean;
   setShowOriginalGimbals: (v: boolean) => void;
-  // When false, one frustum per waypoint (planned pose) — matches DJI's
-  // Capture Quality Report. When true, all 5 rosette poses are drawn.
-  showRosettePoses: boolean;
-  setShowRosettePoses: (v: boolean) => void;
+  showRosetteDiagnostic: boolean;
+  setShowRosetteDiagnostic: (v: boolean) => void;
   showMappingBox: boolean;
   setShowMappingBox: (v: boolean) => void;
-  // 'polygon' = mission-area polygon extent (matches RC Plus on-controller);
-  // 'tileset' = 3D-Tiles root OBB (whole reconstructed cloud extent).
-  mappingBoxSource: 'polygon' | 'tileset';
-  setMappingBoxSource: (v: 'polygon' | 'tileset') => void;
   // Per-field overrides for the camera intrinsics used to draw frustums.
   // Null keys mean "use summary.camera value verbatim"; set by the sidebar to
   // let operators dial the frustum without re-importing.
@@ -595,15 +589,10 @@ export const useStore = create<AppState>()(persist((set, get) => ({
   },
   showOriginalGimbals: true,
   setShowOriginalGimbals: (v: boolean) => set({ showOriginalGimbals: v }),
-  // Default OFF: match DJI Capture Quality Report, which draws one frustum
-  // per waypoint (the planned aircraft pose) even though SmartOblique fires
-  // a 5-photo rosette at each apex. Toggle ON to see all 5 individual poses.
-  showRosettePoses: false,
-  setShowRosettePoses: (v: boolean) => set({ showRosettePoses: v }),
+  showRosetteDiagnostic: false,
+  setShowRosetteDiagnostic: (v: boolean) => set({ showRosetteDiagnostic: v }),
   showMappingBox: false,
   setShowMappingBox: (v: boolean) => set({ showMappingBox: v }),
-  mappingBoxSource: 'polygon',
-  setMappingBoxSource: (v) => set({ mappingBoxSource: v }),
   cameraFovOverride: { fov_h_deg: null, fov_v_deg: null, distance_m: null },
   setCameraFovOverride: (patch) => set((s) => ({
     cameraFovOverride: { ...s.cameraFovOverride, ...patch },
