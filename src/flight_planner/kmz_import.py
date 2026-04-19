@@ -566,6 +566,63 @@ def mapping_bbox_to_enu(
     }
 
 
+def resolve_capture_intrinsics(parsed: ImportedKmz) -> dict:
+    """Resolve the Smart3D capture camera's intrinsics for a parsed KMZ.
+
+    DJI Smart3D mapping missions always use the M4E wide lens regardless of
+    the drone body (M4E payloadEnumValue=88, M3E=99). The WPML ships no
+    focal-length or zoom hints, so the lens is fixed by mission type.
+
+    Returns the same dict shape ``/api/generate`` already emits under
+    ``summary.camera`` — ``{name, fov_h_deg, fov_v_deg, distance_m,
+    focal_length_mm}`` — so the viewer payload is shape-compatible whether
+    the mission was planned by AeroScan or imported from DJI.
+
+    ``distance_m`` is estimated from the flown geometry: median horizontal
+    distance from each waypoint to the mission-area centroid (≈ orbit
+    radius for Smart3D's concentric flight pattern). Falls back to the
+    waypoints' own centroid when the KMZ ships no mission polygon.
+    """
+    from .models import CAMERAS, CameraName
+
+    spec = CAMERAS[CameraName.WIDE]
+    fov_h_deg = round(2 * math.degrees(math.atan(spec.sensor_width_mm / (2 * spec.focal_length_mm))), 1)
+    fov_v_deg = round(2 * math.degrees(math.atan(spec.sensor_height_mm / (2 * spec.focal_length_mm))), 1)
+    distance_m = _estimate_orbit_radius(parsed)
+    return {
+        "name": spec.name.value,
+        "fov_h_deg": fov_h_deg,
+        "fov_v_deg": fov_v_deg,
+        "distance_m": round(distance_m, 2),
+        "focal_length_mm": spec.focal_length_mm,
+    }
+
+
+def _estimate_orbit_radius(parsed: ImportedKmz) -> float:
+    """Median horizontal distance from waypoints to the subject centroid.
+
+    The subject is the mission-area polygon centroid when present (Smart3D),
+    otherwise the waypoint centroid (autoExplore). Both fall back to the
+    M4E Smart3D-typical 8m when there aren't enough waypoints to measure.
+    """
+    if not parsed.waypoints:
+        return 8.0
+    wp_enu = waypoints_to_enu(
+        parsed.waypoints, parsed.ref_lat, parsed.ref_lon, parsed.ref_alt
+    )
+    wp_xy = np.array([[w["x"], w["y"]] for w in wp_enu], dtype=np.float64)
+    if parsed.mission_area_wgs84:
+        poly = polygon_to_enu(
+            parsed.mission_area_wgs84, parsed.ref_lat, parsed.ref_lon, parsed.ref_alt
+        )
+        subject_xy = np.mean([[p[0], p[1]] for p in poly], axis=0)
+    else:
+        subject_xy = np.mean(wp_xy, axis=0)
+    dists = np.linalg.norm(wp_xy - subject_xy, axis=1)
+    median = float(np.median(dists))
+    return median if median > 0.1 else 8.0
+
+
 def tight_footprint_from_cloud_xy(
     points_xyz: np.ndarray,
     low_pct: float = 30.0,

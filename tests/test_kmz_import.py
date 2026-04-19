@@ -10,6 +10,7 @@ from flight_planner.kmz_import import (
     mapping_bbox_to_enu,
     parse_kmz,
     polygon_to_enu,
+    resolve_capture_intrinsics,
     waypoints_to_enu,
 )
 
@@ -195,3 +196,48 @@ def test_mapping_bbox_to_enu_contains_point_cloud(sample_kmz):
         inside &= np.abs(proj) <= mag + 1e-6
     frac = inside.sum() / len(pts)
     assert frac >= 0.99, f"Only {frac:.4f} of cloud points lie inside OBB"
+
+
+# ---------------------------------------------------------------------------
+# resolve_capture_intrinsics — payload → lens → FOV
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_capture_intrinsics_mijande_m4e_wide(sample_kmz):
+    """Smart3D always flies the wide lens. M4E (payloadEnumValue=88) or M3E
+    (99) both resolve to the wide CameraSpec.
+    """
+    parsed = parse_kmz(sample_kmz("mijande"), name="Mijande")
+    intr = resolve_capture_intrinsics(parsed)
+
+    # Wide M4E: 2·atan(17.3/(2·12)) ≈ 71.5° H, 2·atan(13/(2·12)) ≈ 56.9° V.
+    assert intr["name"] == "wide"
+    assert intr["focal_length_mm"] == pytest.approx(12.0)
+    assert intr["fov_h_deg"] == pytest.approx(71.5, abs=0.2)
+    assert intr["fov_v_deg"] == pytest.approx(56.9, abs=0.2)
+    assert intr["distance_m"] > 0.0
+
+
+def test_resolve_capture_intrinsics_distance_matches_orbit_radius(sample_kmz):
+    """Smart3D orbit missions fly roughly concentric around the subject. The
+    resolved ``distance_m`` should sit in the waypoint-to-area-centroid range
+    (roughly the orbit radius), not a zero stub.
+    """
+    parsed = parse_kmz(sample_kmz("mijande"), name="Mijande")
+    intr = resolve_capture_intrinsics(parsed)
+
+    # Sanity bound: M4E Smart3D shoots at 5–60 m typical standoff. Zero means
+    # the function returned the old stub.
+    assert 5.0 <= intr["distance_m"] <= 60.0
+
+
+def test_resolve_capture_intrinsics_auto_explore(sample_kmz):
+    """autoExplore KMZs have no mission_area polygon and different payload
+    metadata — function must still return non-zero FOV (falls back to wide).
+    """
+    parsed = parse_kmz(sample_kmz("auto_explore"), name="auto_explore")
+    intr = resolve_capture_intrinsics(parsed)
+
+    assert intr["fov_h_deg"] > 0.0
+    assert intr["fov_v_deg"] > 0.0
+    assert intr["focal_length_mm"] > 0.0
