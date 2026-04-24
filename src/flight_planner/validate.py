@@ -241,6 +241,44 @@ def validate_mission(
             message=f"{zone_removed} waypoints removed by {', '.join(zone_desc)} zone(s)",
         ))
 
+    # Facade coverage health: flag LARGE facades (≥ 2m²) that ended up with
+    # no inspection waypoints after the full pipeline. Small facets (sills,
+    # parapets, dormers) often legitimately get zero WPs because a single
+    # grid step covers more than the facet's extent — warning about those
+    # is noisy. The 2m² threshold keeps walls and significant roof panels
+    # in scope while ignoring trim.
+    if building is not None and building.facades:
+        covered = {wp.facade_index for wp in inspection_wps if wp.facade_index is not None and wp.facade_index >= 0}
+        large_uncovered = [
+            f.index for f in building.facades
+            if f.index not in covered and (f.width * f.height) >= 2.0
+        ]
+        if large_uncovered:
+            issues.append(ValidationIssue(
+                severity=Severity.WARNING,
+                code="facades_uncovered",
+                message=(
+                    f"{len(large_uncovered)} facade(s) ≥ 2m² have no inspection waypoints — "
+                    f"the mission will ship zero photos of these walls"
+                ),
+            ))
+
+    # Mapping-polygon clip (KMZ-imported missions only): inspection
+    # waypoints dropped because their XY fell outside the DJI
+    # `mission_area_wgs84` envelope — the pilot's on-controller scope.
+    poly_clipped = stats.get("mapping_polygon_clipped_waypoints", 0)
+    if poly_clipped > 0:
+        affected = stats.get("mapping_polygon_clipped_facades") or []
+        facade_suffix = f" (facades: {', '.join(str(i) for i in affected)})" if affected else ""
+        issues.append(ValidationIssue(
+            severity=Severity.WARNING,
+            code="mapping_polygon_clipped",
+            message=(
+                f"{poly_clipped} waypoint(s) dropped for falling outside the DJI mapping "
+                f"polygon{facade_suffix} — reduce standoff or accept coverage loss near the polygon edge"
+            ),
+        ))
+
     # Point-cloud safety filter (KMZ-imported missions only): waypoints
     # dropped because the raw DJI cloud had an obstacle (tree, wire, fence,
     # adjacent building) inside the WP's clearance ball, outside the target

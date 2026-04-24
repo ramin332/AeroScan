@@ -329,15 +329,27 @@ def generate_waypoints_for_facade(
     u_min, u_max = float(u_coords.min()), float(u_coords.max())
     v_min, v_max = float(v_coords.min()), float(v_coords.max())
 
-    # Add small inset to avoid edge photos
-    inset = algo.facade_edge_inset_m
+    # Add small inset to avoid edge photos, but cap it at 25% of the
+    # smaller facade dimension so sub-metre facets (sills, parapets,
+    # dormer walls) don't get their entire extent insetted away.
+    raw_u = u_max - u_min
+    raw_v = v_max - v_min
+    inset = min(
+        algo.facade_edge_inset_m,
+        0.25 * raw_u,
+        0.25 * raw_v,
+    )
     u_min += inset
     u_max -= inset
     v_min += inset
     v_max -= inset
 
+    # Even after the adaptive inset, a degenerate facade (effectively 1D)
+    # should still contribute one photo — a single WP at its centroid is
+    # better than dropping coverage entirely.
     if u_max <= u_min or v_max <= v_min:
-        return []
+        u_min = u_max = 0.0
+        v_min = v_max = 0.0
 
     # Generate grid positions
     n_cols = max(1, int(math.ceil((u_max - u_min) / h_step)) + 1)
@@ -372,15 +384,22 @@ def generate_waypoints_for_facade(
     # Normal orientation is handled during facade extraction (centroid check +
     # fix_normals on mesh load). No additional check needed here.
 
-    # LOS sample offsets for multi-ray visibility check
+    # LOS sample offsets for multi-ray visibility check. Clamp the lateral
+    # reach to no more than 40% of the facade's extent so that small
+    # facets don't sample space outside their own surface — otherwise a
+    # narrow sill has its LOS rays landing in thin air next to it and
+    # reports itself as "not visible", and we lose coverage on walls
+    # smaller than the photo footprint.
     _los_samples = None
     if mesh is not None and algo.enable_waypoint_los:
+        los_u = min(h_step * 0.3, max(0.05, raw_u * 0.4))
+        los_v = min(v_step * 0.3, max(0.05, raw_v * 0.4))
         _los_samples = [
             np.zeros(3),
-            u_axis * h_step * 0.3,
-            -u_axis * h_step * 0.3,
-            v_axis * v_step * 0.3,
-            -v_axis * v_step * 0.3,
+            u_axis * los_u,
+            -u_axis * los_u,
+            v_axis * los_v,
+            -v_axis * los_v,
         ]
 
     waypoints = []

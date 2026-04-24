@@ -31,6 +31,7 @@ from flight_planner.models import (
     meters_per_deg,
 )
 from flight_planner.server.api import (
+    _clip_waypoints_to_dji_bbox,
     _derive_dji_mission_seeds,
     _filter_waypoints_by_pointcloud,
 )
@@ -65,7 +66,77 @@ def test_rectangular_building_has_no_transition_waypoints_when_path_is_clear():
 
 
 # ---------------------------------------------------------------------------
-# Track C (revised): _filter_waypoints_by_pointcloud
+# Polygon clip: _clip_waypoints_to_dji_bbox
+# ---------------------------------------------------------------------------
+
+
+def _enu_to_lonlat(x: float, y: float, ref_lat: float, ref_lon: float) -> tuple[float, float, float]:
+    m_per_lat, m_per_lon = meters_per_deg(math.radians(ref_lat))
+    return (ref_lon + x / m_per_lon, ref_lat + y / m_per_lat, 0.0)
+
+
+def _square_polygon_wgs84(half_m: float, ref_lat: float, ref_lon: float):
+    corners_enu = [
+        (-half_m, -half_m), (half_m, -half_m),
+        (half_m, half_m), (-half_m, half_m),
+    ]
+    return [_enu_to_lonlat(x, y, ref_lat, ref_lon) for x, y in corners_enu]
+
+
+def _plain_wp(x: float, y: float, *, facade_index: int = 0, index: int = 0, is_transition: bool = False) -> Waypoint:
+    return Waypoint(
+        x=x, y=y, z=5.0,
+        heading_deg=0.0, gimbal_pitch_deg=0.0,
+        speed_ms=2.0, actions=[],
+        facade_index=facade_index, index=index,
+        is_transition=is_transition,
+    )
+
+
+def test_polygon_clip_drops_outside_inspection_wps():
+    ref_lat, ref_lon = 52.0, 5.0
+    polygon = _square_polygon_wgs84(10.0, ref_lat, ref_lon)
+    wps = [
+        _plain_wp(0, 0, facade_index=0, index=0),      # inside
+        _plain_wp(20, 0, facade_index=1, index=1),     # outside east
+        _plain_wp(0, -20, facade_index=2, index=2),    # outside south
+    ]
+    kept, removed, removed_facades = _clip_waypoints_to_dji_bbox(
+        wps, polygon, ref_lat, ref_lon, 0.0,
+    )
+    assert removed == 2
+    assert set(removed_facades) == {1, 2}
+    assert len(kept) == 1
+
+
+def test_polygon_clip_preserves_transit_wps():
+    """Transit waypoints can legitimately slew across the polygon edge;
+    they carry no photo obligation, so the clip must leave them alone."""
+    ref_lat, ref_lon = 52.0, 5.0
+    polygon = _square_polygon_wgs84(10.0, ref_lat, ref_lon)
+    wps = [
+        _plain_wp(0, 0, facade_index=0, index=0),                        # inside insp
+        _plain_wp(20, 0, facade_index=-1, index=1, is_transition=True),  # outside transit
+    ]
+    kept, removed, _ = _clip_waypoints_to_dji_bbox(
+        wps, polygon, ref_lat, ref_lon, 0.0,
+    )
+    assert removed == 0
+    assert len(kept) == 2
+
+
+def test_polygon_clip_noop_without_polygon():
+    wps = [_plain_wp(100, 100, index=0)]
+    kept, removed, facades = _clip_waypoints_to_dji_bbox(
+        wps, None, 0.0, 0.0, 0.0,
+    )
+    assert kept == wps
+    assert removed == 0
+    assert facades == []
+
+
+# ---------------------------------------------------------------------------
+# Pointcloud safety: _filter_waypoints_by_pointcloud
 # ---------------------------------------------------------------------------
 
 

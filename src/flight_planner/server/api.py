@@ -143,6 +143,70 @@ def _filter_facades_by_dji_bbox(
     return kept
 
 
+def _clip_waypoints_to_dji_bbox(
+    waypoints,
+    mission_area_wgs84: list | None,
+    ref_lat: float,
+    ref_lon: float,
+    ref_alt: float,
+    *,
+    margin_m: float = 2.0,
+):
+    """Drop inspection waypoints whose XY falls outside the DJI mapping polygon.
+
+    Transit waypoints bypass the clip — they may legitimately cross outside
+    the polygon briefly while slewing between facades.
+
+    The DJI `mission_area_wgs84` polygon from the imported KMZ is the
+    authoritative flight envelope the pilot approved. A 2m margin matches
+    the facade filter so edge-hugging WPs survive consistently. Returns
+    ``(kept_waypoints, removed_count, removed_facade_indices)``.
+    """
+    import numpy as _np
+    from ..kmz_import import polygon_to_enu as _poly_to_enu
+    if not waypoints or not mission_area_wgs84:
+        return list(waypoints), 0, []
+    poly_enu = _poly_to_enu(mission_area_wgs84, ref_lat, ref_lon, ref_alt)
+    poly_enu = _expand_polygon_xy(poly_enu, margin_m)
+    if not poly_enu or len(poly_enu) < 3:
+        return list(waypoints), 0, []
+    poly = _np.asarray(poly_enu, dtype=float).reshape(-1, 3)[:, :2]
+
+    def _inside(x: float, y: float) -> bool:
+        inside = False
+        n = len(poly)
+        j = n - 1
+        for i in range(n):
+            xi, yi = poly[i]
+            xj, yj = poly[j]
+            if ((yi > y) != (yj > y)) and (x < (xj - xi) * (y - yi) / (yj - yi + 1e-12) + xi):
+                inside = not inside
+            j = i
+        return inside
+
+    kept = []
+    removed_facades: set[int] = set()
+    removed = 0
+    for wp in waypoints:
+        # Transit WPs are allowed to clip outside briefly — they do not
+        # photograph, so crossing the mapping polygon edge mid-slew is fine.
+        if getattr(wp, "is_transition", False):
+            kept.append(wp)
+            continue
+        if _inside(wp.x, wp.y):
+            kept.append(wp)
+        else:
+            removed += 1
+            if wp.facade_index is not None and wp.facade_index >= 0:
+                removed_facades.add(int(wp.facade_index))
+    if removed:
+        print(
+            f"[kmz waypoints] mapping polygon clip (margin={margin_m}m): "
+            f"{len(waypoints)} → {len(kept)} (-{removed})"
+        )
+    return kept, removed, sorted(removed_facades)
+
+
 def _load_kmz_pointcloud_xyz(building_id: str) -> "np.ndarray | None":  # type: ignore[name-defined]
     """Decode the raw DJI point cloud stored on a KMZ-imported BuildingRecord.
 
@@ -2604,15 +2668,35 @@ def generate(request: GenerateRequest):
         exclusion_zones=zones,
     )
 
-    # Raw-point-cloud safety filter: drop waypoints whose clearance ball
-    # intersects any point in the DJI point cloud that is NOT part of the
-    # facade being photographed. The alpha-wrap mesh that powers the
-    # existing mesh-based collision checks smooths out thin obstacles
-    # (wires, railings, branches), so the raw cloud stays the most honest
-    # representation of what's actually around the drone.
+    # Two safety layers, applied in series on KMZ-sourced missions:
+    #
+    # 1. Polygon clip — keep inspection waypoints inside the DJI
+    #    `mission_area_wgs84` envelope. That polygon is what the pilot
+    #    already approved on-controller; straying outside it is a
+    #    planning hazard even when the space beyond is physically clear.
+    # 2. Raw-cloud obstacle filter — inside the polygon, drop any WP
+    #    whose clearance ball contains a non-target cloud point
+    #    (thin obstacles the alpha-wrap mesh smooths away: wires,
+    #    branches, fences, antennas).
+    #
+    # Transit WPs bypass the polygon clip — short slews across the edge
+    # are unavoidable when facades hug the boundary. They still get the
+    # cloud-obstacle check.
+    poly_clipped = 0
+    poly_clipped_facades: list[int] = []
     pc_rejected = 0
     pc_rejected_facades: list[int] = []
     if kmz_source_type is not None:
+        if kmz_mission_area_wgs84:
+            waypoints, poly_clipped, poly_clipped_facades = _clip_waypoints_to_dji_bbox(
+                waypoints,
+                kmz_mission_area_wgs84,
+                kmz_ref_lat, kmz_ref_lon, kmz_ref_alt,
+            )
+            if poly_clipped:
+                generation_stats["mapping_polygon_clipped_waypoints"] = poly_clipped
+                generation_stats["mapping_polygon_clipped_facades"] = poly_clipped_facades
+
         cloud_xyz = _load_kmz_pointcloud_xyz(request.building_id) if request.building_id else None
         if cloud_xyz is not None and len(cloud_xyz) > 0:
             waypoints, pc_rejected, pc_rejected_facades = _filter_waypoints_by_pointcloud(
@@ -2622,6 +2706,8 @@ def generate(request: GenerateRequest):
             if pc_rejected:
                 generation_stats["pointcloud_rejected_waypoints"] = pc_rejected
                 generation_stats["pointcloud_rejected_facades"] = pc_rejected_facades
+
+        if poly_clipped or pc_rejected:
             # Re-index so the downstream viewer + KMZ agree on per-wp indices.
             for _i, _wp in enumerate(waypoints):
                 _wp.index = _i
