@@ -118,10 +118,16 @@ The mesh → facade → waypoint pipeline has multiple safety layers:
 1. **`trimesh.repair.fix_normals()`** on mesh load — consistent face winding
 2. **Centroid-based normal orientation** — initial outward guess
 3. **Visibility ray test** — cast from far outside along ±normal to verify the facade is reachable from outside the building. Interior faces (not visible from any direction) are rejected
-4. **Per-facade normal check** — before generating waypoints, verify normal orientation via visibility ray
-5. **Open3D ray-parity containment filter** — replaces convex hull. Uses `RaycastingScene.count_intersections()` (odd = inside) which correctly handles non-convex buildings (L-shaped, U-shaped, courtyards). Works on non-watertight meshes.
-6. **LOS (line-of-sight) check** — per-waypoint ray cast to verify clear view to facade surface
-7. **Path segment collision check** — for each consecutive waypoint pair, casts a ray along the flight path segment and checks for mesh intersections. Collisions are resolved by inserting altitude detour waypoints routed outward from the building. Unresolvable collisions are flagged as validation errors.
+4. **Envelope post-filter** (`_extract_region_growing` in `building_import.py`) — after region growing produces the facade list, probe each facade at `center + normal * 2m` and ray-parity test against the full mesh (`RaycastingScene.count_intersections`). If the probe is inside the envelope, the facade's "outward" normal was flipped wrong (typical on L/U-shaped buildings where centroid-based flipping is ambiguous in concavities) and the facet is demoted to a `candidate_interior_*` candidate. Works on non-watertight photogrammetry meshes — don't gate on `mesh.is_watertight`. Caught ~11 interior facets per MijandeExtra import.
+5. **Per-facade normal check** — before generating waypoints, verify normal orientation via visibility ray
+6. **Open3D ray-parity containment filter** — replaces convex hull. Uses `RaycastingScene.count_intersections()` (odd = inside) which correctly handles non-convex buildings (L-shaped, U-shaped, courtyards). Works on non-watertight meshes.
+7. **LOS (line-of-sight) check** — per-waypoint ray cast to verify clear view to facade surface. LOS sample-offset reach is clamped to 40% of the facade's extent so narrow sills/parapets don't sample off-facade space and spuriously report "not visible".
+8. **Direct-line inter-facade transits** — `generate_mission_waypoints` concatenates facade groups into a single trajectory without inserting unconditional outward+altitude transit waypoints between every facade pair. The old behaviour routed outward +2m and up +2m between every facade regardless of geometry, producing zig-zag paths that frequently left the DJI polygon without any safety benefit when the direct line was already clear. Now the only transits are the collision-resolution detours (#9).
+9. **Path segment collision check** — for each consecutive waypoint pair, casts a ray along the flight path segment and checks for mesh intersections. Collisions are resolved by inserting altitude detour waypoints routed outward from the building. Unresolvable collisions are flagged as validation errors.
+10. **Polygon standoff clamp** (`_clamp_standoff_to_polygon` in `geometry.py`) — for KMZ-sourced missions, before generating the per-facade grid, cast a ray from the facade centroid along the outward normal and find where it exits the DJI `mission_area_wgs84` polygon; clamp the standoff distance to `(exit - 0.5m buffer)` with a floor at `max(min_photo_distance_m, obstacle_clearance_m)`. Without this, edge-hugging facades generate WPs at nominal GSD-driven standoff that all land outside the polygon and get clipped by #11, leaving the facade uncovered. Accepts a tighter-than-nominal GSD for those facades in exchange for actual coverage.
+11. **Mapping-polygon WP clip** (`_clip_waypoints_to_dji_bbox` in `server/api.py`) — for KMZ-sourced missions, drop inspection waypoints whose XY falls outside the DJI `mission_area_wgs84` polygon (2m margin, matches the facade filter). Transit waypoints bypass the clip — short slews across the edge are unavoidable when facades hug the boundary. Emits `mapping_polygon_clipped` validation warning listing affected facade indices.
+12. **Raw point-cloud obstacle filter** (`_filter_waypoints_by_pointcloud` in `server/api.py`) — for KMZ-sourced missions, KDTree over the raw DJI `cloud.ply`. Any WP whose `obstacle_clearance_m` ball contains a cloud point outside the 60° viewing cone toward its target facade is dropped. Catches thin obstacles the alpha-wrap mesh smooths away (wires, branches, fences, railings, antennas). Transit WPs use the full clearance ball with no cone relief. Runs *after* the polygon clip so we don't waste KDTree queries on WPs destined to be clipped anyway. Emits `pointcloud_obstacle` validation warning.
+13. **Coverage-health warning** (`validate.py`) — facades ≥ 2m² that end up with zero inspection WPs after the full pipeline surface as a `facades_uncovered` validation warning, so zero-photo walls are visible at plan time instead of at flight time.
 
 ### Mesh containment
 The old `mesh.convex_hull.contains()` approach failed for non-convex buildings (concave regions were incorrectly classified as "inside"). Open3D ray-parity (`count_intersections`, odd = inside) correctly handles all geometries including non-watertight photogrammetry meshes. `mesh.contains()` from trimesh still requires watertight meshes — avoid it.
@@ -166,6 +172,33 @@ These knobs are interlocked. For reasonable DJI Smart3D clouds:
 | ransac cluster_ε | ≈ 4–5 × voxel | max inlier gap |
 | regularize parallel_tol | 5° | snap near-parallel to exact |
 | regularize coplanar_tol | 1.5 × ε | merge near-coplanar |
+
+### What `mission_area_wgs84` actually is (and isn't)
+
+The polygon in `template.kml` is the **mapping target** (the on-RC approved region the DJI Smart3D pilot photographed), not a flight envelope. On MijandeExtra, ≈20% of DJI's own waypoints land *outside* the polygon because the drone orbits the target at standoff distance. Don't read the polygon as "the drone stayed in here" — it didn't, and neither can any custom inspection path that wants to photograph the same walls.
+
+What we use the polygon for:
+- **Facade scoping**: `_filter_facades_by_dji_bbox` drops facets whose centroid is outside (with a 2m margin) so the inspection mission only plans for walls the pilot actually mapped.
+- **Viewer rendering**: `PolygonBoxView` renders the polygon's XY extent as a translucent box ("Mapping box" toggle) so the pilot can visually compare custom-path coverage against DJI's scope. The box persists across the DJI-path / Custom-path mode switch because `/api/generate` plumbs `mission_area_wgs84` into both the Three.js `missionArea` and Leaflet `missionAreaPoly` payloads on every regeneration (not just at import time).
+- **Per-facade standoff clamp** (layer 10 in Facade Extraction & Waypoint Safety above): pull the camera in toward the wall when the nominal GSD-driven standoff would push it outside the polygon, rather than generating a WP that gets clipped.
+- **Inspection-WP clip** (layer 11): drop any inspection WP whose XY lands outside the polygon. Transit WPs bypass — short slews across the edge are unavoidable when facades hug the boundary.
+
+The authoritative safety source for "where the drone can physically fly" is the raw `cloud.ply`, not the polygon. Layer 12 (point-cloud obstacle filter) handles that.
+
+### Auto-populating the sidebar from the DJI KMZ
+
+On import, `_derive_dji_mission_seeds` pulls site-proven values off the KMZ and stores them in `MissionVersion.mission_params`, which flows through `config_snapshot.mission` on every `/generate` response:
+
+| Sidebar field | Derived from | Notes |
+|---|---|---|
+| `flight_speed_ms` | `autoFlightSpeed` (template.kml) | Already wired — used in DJI-replay mode. Not representative of actual flight speed (see Smart3D rosette section below). |
+| `front_overlap` | `orthoCameraOverlapW` | DJI stores 0–100, we convert to 0–1 fraction. |
+| `side_overlap` | `orthoCameraOverlapH` | Same conversion. |
+| `obstacle_clearance_m` | median of DJI-WP perpendicular distance to nearest facade plane (top 10% dropped as transit outliers), clamped to [1, 15]m | Site-proven standoff — what the aircraft actually flew at successfully. |
+
+Plus a `dji_extracted` sub-dict carrying the raw values for UI display. The sidebar renders a `DJI-extracted: front X%, side Y%, observed standoff Zm` hint under the overlap sliders when an imported KMZ is active.
+
+On entering Custom-path mode for the first time (`generateInspectionMission` in `store.ts`), the mission seed is `{ ...NEN2767_MISSION, ...dji_seeds }` — the NEN-2767 preset supplies inspection-specific values (GSD, speed, gimbal margin) while DJI seeds override site-specific ones (overlap, clearance). Subsequent slider edits stick (no re-seeding).
 
 ## Smart3D rosette pitch — what the KMZ encodes vs what the drone shoots
 
