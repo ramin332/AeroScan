@@ -2660,12 +2660,29 @@ def generate(request: GenerateRequest):
         for z in request.exclusion_zones
     ]
 
+    # For KMZ-sourced buildings, pass the mapping polygon down so the
+    # per-facade grid generator can clamp standoff to keep WPs inside
+    # the DJI envelope rather than generating them at nominal standoff
+    # and then losing them to the polygon clip downstream.
+    gen_polygon_xy: list[tuple[float, float]] | None = None
+    if kmz_source_type is not None and kmz_mission_area_wgs84:
+        try:
+            from ..kmz_import import polygon_to_enu as _poly_to_enu_gen
+            poly_enu_gen = _poly_to_enu_gen(
+                kmz_mission_area_wgs84,
+                kmz_ref_lat, kmz_ref_lon, kmz_ref_alt,
+            )
+            gen_polygon_xy = [(float(x), float(y)) for x, y, *_ in poly_enu_gen]
+        except Exception:
+            gen_polygon_xy = None
+
     # Generate waypoints (pass mesh for LOS checks / surface sampling on mesh buildings)
     waypoints, generation_stats = generate_mission_waypoints(
         building, config, algo, mesh=mesh_obj,
         waypoint_strategy=request.waypoint_strategy,
         disabled_facades=request.disabled_facades,
         exclusion_zones=zones,
+        polygon_xy=gen_polygon_xy,
     )
 
     # Two safety layers, applied in series on KMZ-sourced missions:

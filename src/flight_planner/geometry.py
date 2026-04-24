@@ -253,17 +253,82 @@ def _generate_boustrophedon_grid(
     return points
 
 
+def _point_in_polygon_xy(x: float, y: float, poly: list[tuple[float, float]]) -> bool:
+    n = len(poly)
+    inside = False
+    j = n - 1
+    for i in range(n):
+        xi, yi = poly[i]
+        xj, yj = poly[j]
+        if ((yi > y) != (yj > y)) and x < (xj - xi) * (y - yi) / (yj - yi + 1e-12) + xi:
+            inside = not inside
+        j = i
+    return inside
+
+
+def _clamp_standoff_to_polygon(
+    facade: Facade,
+    requested_distance: float,
+    polygon_xy: list[tuple[float, float]],
+    *,
+    min_standoff: float,
+    buffer_m: float = 0.5,
+) -> float:
+    """Reduce facade standoff so the camera stays inside the DJI polygon.
+
+    Casts a ray from the facade centroid along the outward normal; finds
+    where it leaves the polygon; returns the largest safe standoff
+    (polygon exit distance minus buffer), bounded below by min_standoff.
+    If the centroid itself is already outside the polygon, returns the
+    original distance (the facade will be clipped upstream anyway).
+    """
+    cx, cy = float(facade.center[0]), float(facade.center[1])
+    nx, ny = float(facade.normal[0]), float(facade.normal[1])
+    horizontal_norm = (nx * nx + ny * ny) ** 0.5
+    if horizontal_norm < 1e-6:
+        return requested_distance  # roof/flat facade — normal has no XY
+    nx /= horizontal_norm
+    ny /= horizontal_norm
+
+    if not _point_in_polygon_xy(cx, cy, polygon_xy):
+        return requested_distance
+
+    # Step outward in 0.25m increments until we exit the polygon or hit
+    # the requested distance. O(requested_distance / 0.25) steps per
+    # facade — cheap.
+    step = 0.25
+    s = step
+    exit_at = requested_distance
+    while s <= requested_distance:
+        if not _point_in_polygon_xy(cx + nx * s, cy + ny * s, polygon_xy):
+            exit_at = s
+            break
+        s += step
+
+    clamped = max(min_standoff, exit_at - buffer_m)
+    return min(requested_distance, clamped)
+
+
 def generate_waypoints_for_facade(
     facade: Facade,
     config: MissionConfig,
     algo: AlgorithmConfig | None = None,
     mesh: object | None = None,
+    polygon_xy: list[tuple[float, float]] | None = None,
 ) -> list[Waypoint]:
     """Generate a grid of waypoints for a single facade.
 
     The grid is parallel to the facade plane, offset along the outward normal
     by the distance needed to achieve the target GSD. Waypoints are ordered
     in a boustrophedon (lawnmower) pattern.
+
+    ``polygon_xy`` — optional mapping-polygon XY vertices (ENU). When
+    supplied, the camera standoff for this facade is clamped so that a
+    ray from the facade centroid along its outward normal stops *inside*
+    the polygon: otherwise edge-hugging facades generate WPs that all
+    fall outside the DJI envelope and get clipped away, leaving the
+    facade uncovered. This accepts a tighter-than-nominal GSD for those
+    facades in exchange for keeping at least some coverage.
     """
     if algo is None:
         algo = AlgorithmConfig()
@@ -273,6 +338,19 @@ def generate_waypoints_for_facade(
 
     # Ensure minimum obstacle clearance
     distance = max(distance, config.obstacle_clearance_m)
+
+    # Polygon-edge clamp: if the nominal standoff would push the camera
+    # outside the DJI mapping polygon, shrink distance to the polygon
+    # boundary (minus a 0.5m buffer) so WPs stay inside. Only applies
+    # when the facade centroid is itself inside the polygon — if the
+    # facade sits outside the polygon, let the upstream polygon clip
+    # handle it rather than pulling the camera into the building.
+    if polygon_xy and len(polygon_xy) >= 3:
+        distance = _clamp_standoff_to_polygon(
+            facade, distance, polygon_xy,
+            min_standoff=max(config.min_photo_distance_m, config.obstacle_clearance_m),
+            buffer_m=0.5,
+        )
 
     footprint = compute_footprint(camera, distance)
     h_step, v_step = compute_grid_spacing(footprint, config.front_overlap, config.side_overlap)
@@ -956,6 +1034,7 @@ def generate_mission_waypoints(
     waypoint_strategy: str = "facade_grid",
     disabled_facades: list[int] | None = None,
     exclusion_zones: list[ExclusionZone] | None = None,
+    polygon_xy: list[tuple[float, float]] | None = None,
 ) -> tuple[list[Waypoint], dict]:
     """Generate all waypoints for a building inspection mission.
 
@@ -991,7 +1070,9 @@ def generate_mission_waypoints(
         for facade in building.facades:
             if facade.index in disabled_set:
                 continue
-            facade_wps = generate_waypoints_for_facade(facade, config, algo, mesh=mesh)
+            facade_wps = generate_waypoints_for_facade(
+                facade, config, algo, mesh=mesh, polygon_xy=polygon_xy,
+            )
             before = len(facade_wps)
             total_before_dedup += before
             if facade_wps:
