@@ -507,6 +507,19 @@ export function Sidebar() {
           min={0.3} max={0.9} step={0.05}
           format={(v) => `${Math.round(v * 100)}%`}
           onChange={(v) => setMission({ side_overlap: v })} onCommit={autoGen} />
+        {(() => {
+          const dji = (result?.config_snapshot?.mission as { dji_extracted?: { front_overlap?: number | null; side_overlap?: number | null; observed_standoff_m?: number | null } } | undefined)?.dji_extracted;
+          if (!isKmz || !dji) return null;
+          const pct = (v: number | null | undefined) =>
+            v == null ? '—' : `${Math.round(v * 100)}%`;
+          const m = (v: number | null | undefined) =>
+            v == null ? '—' : `${v.toFixed(1)} m`;
+          return (
+            <div className="field-hint">
+              DJI-extracted: front {pct(dji.front_overlap)}, side {pct(dji.side_overlap)}, observed standoff {m(dji.observed_standoff_m)}
+            </div>
+          );
+        })()}
       </Section>
 
       {/* ======== FLIGHT ======== */}

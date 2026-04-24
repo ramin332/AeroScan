@@ -241,6 +241,20 @@ def validate_mission(
             message=f"{zone_removed} waypoints removed by {', '.join(zone_desc)} zone(s)",
         ))
 
+    # Mapping-polygon clip (KMZ-imported missions only)
+    poly_clipped = stats.get("mapping_polygon_clipped_waypoints", 0)
+    if poly_clipped > 0:
+        affected = stats.get("mapping_polygon_clipped_facades") or []
+        facade_suffix = f" (facades: {', '.join(str(i) for i in affected)})" if affected else ""
+        issues.append(ValidationIssue(
+            severity=Severity.WARNING,
+            code="mapping_polygon_clipped",
+            message=(
+                f"{poly_clipped} waypoint(s) dropped for falling outside the DJI mapping "
+                f"polygon{facade_suffix} — reduce standoff or accept coverage loss near the polygon edge"
+            ),
+        ))
+
     # Path collision checks
     path_unresolved = stats.get("path_collisions_unresolved", 0)
     if path_unresolved > 0:

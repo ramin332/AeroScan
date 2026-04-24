@@ -480,91 +480,6 @@ def generate_waypoints_for_facade(
     return waypoints
 
 
-def _make_transition_waypoint(
-    x: float, y: float, z: float,
-    heading_deg: float,
-    speed_ms: float,
-    min_altitude_m: float = MIN_ALTITUDE_M,
-) -> Waypoint:
-    """Create a transit waypoint (no photo, higher speed)."""
-    return Waypoint(
-        x=x, y=y, z=max(z, min_altitude_m),
-        heading_deg=heading_deg,
-        gimbal_pitch_deg=0.0,
-        speed_ms=speed_ms,
-        actions=[],
-        is_transition=True,
-    )
-
-
-def _generate_transition_waypoints(
-    prev_wp: Waypoint,
-    next_wp: Waypoint,
-    prev_facade: Facade,
-    next_facade: Facade,
-    clearance: float,
-    speed: float,
-    algo: AlgorithmConfig | None = None,
-) -> list[Waypoint]:
-    """Generate clearance waypoints for transitioning between facades.
-
-    Flies out from the last waypoint along the facade normal,
-    then approaches the next facade from outside. This prevents
-    the drone from flying through the building at corners.
-    """
-    import numpy as np
-
-    if algo is None:
-        algo = AlgorithmConfig()
-
-    # For transitions to/from roof, just go straight (already above building)
-    if abs(prev_facade.normal[2]) > algo.roof_normal_threshold or abs(next_facade.normal[2]) > algo.roof_normal_threshold:
-        return []
-
-    # Exit point: fly further out along prev facade normal
-    exit_pos = np.array([prev_wp.x, prev_wp.y, prev_wp.z])
-    exit_pos[:2] += prev_facade.normal[:2] * clearance
-
-    # Entry point: approach next facade from outside
-    entry_pos = np.array([next_wp.x, next_wp.y, next_wp.z])
-    entry_pos[:2] += next_facade.normal[:2] * clearance
-
-    # Use a safe altitude for transition (highest of exit/entry + margin)
-    transit_z = max(exit_pos[2], entry_pos[2], prev_wp.z, next_wp.z) + algo.transition_altitude_margin_m
-
-    transition_wps = []
-
-    # Exit waypoint: pull out from facade
-    transition_wps.append(_make_transition_waypoint(
-        float(exit_pos[0]), float(exit_pos[1]), transit_z,
-        prev_wp.heading_deg, speed, algo.min_altitude_m,
-    ))
-
-    # Corner waypoint (if exit and entry are far apart)
-    dist = np.linalg.norm(exit_pos[:2] - entry_pos[:2])
-    if dist > clearance:
-        # Add a midpoint at the corner to avoid clipping
-        mid = (exit_pos + entry_pos) / 2
-        # Push the midpoint outward from building center
-        mid_dir = mid[:2].copy()
-        mid_norm = np.linalg.norm(mid_dir)
-        if mid_norm > 0.1:
-            mid_dir /= mid_norm
-            mid[:2] += mid_dir * clearance * 0.5
-        transition_wps.append(_make_transition_waypoint(
-            float(mid[0]), float(mid[1]), transit_z,
-            next_wp.heading_deg, speed, algo.min_altitude_m,
-        ))
-
-    # Entry waypoint: approach next facade
-    transition_wps.append(_make_transition_waypoint(
-        float(entry_pos[0]), float(entry_pos[1]), transit_z,
-        next_wp.heading_deg, speed, algo.min_altitude_m,
-    ))
-
-    return transition_wps
-
-
 def _nearest_neighbor_order(groups: list[list[Waypoint]]) -> list[list[Waypoint]]:
     """Reorder facade waypoint groups by nearest-neighbor to minimize transit.
 
@@ -1082,27 +997,16 @@ def generate_mission_waypoints(
         tsp_method=algo.tsp_method,
     )
 
-    # Insert transition waypoints between facade groups to prevent
-    # building-corner collisions. Each transition pulls out along the
-    # previous facade normal, optionally adds a corner clearance point,
-    # then approaches the next facade from outside.
+    # Concatenate facade groups into a single trajectory. Inter-facade transits
+    # are flown as direct lines: the path-segment collision pass below
+    # (_check_path_collisions / _resolve_path_collision) only inserts detour
+    # waypoints when the straight segment actually intersects the mesh.
+    # Unconditionally routing outward+up between every facade produced long
+    # zig-zags that frequently left the DJI mapping polygon and added transit
+    # without any safety benefit when the direct line was already clear.
     all_waypoints: list[Waypoint] = []
-    facade_lookup = {f.index: f for f in building.facades}
-    for gi, group in enumerate(facade_groups):
+    for group in facade_groups:
         all_waypoints.extend(group)
-        if gi < len(facade_groups) - 1:
-            next_group = facade_groups[gi + 1]
-            prev_facade = facade_lookup.get(group[-1].facade_index)
-            next_facade = facade_lookup.get(next_group[0].facade_index)
-            if prev_facade is not None and next_facade is not None:
-                trans = _generate_transition_waypoints(
-                    group[-1], next_group[0],
-                    prev_facade, next_facade,
-                    clearance=config.obstacle_clearance_m,
-                    speed=config.flight_speed_ms,
-                    algo=algo,
-                )
-                all_waypoints.extend(trans)
 
     # Filter waypoints inside exclusion zones
     zone_removed = 0
