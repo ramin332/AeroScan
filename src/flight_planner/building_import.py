@@ -489,8 +489,12 @@ def _extract_region_growing(
     try:
         if facades:
             import open3d as _o3d
+            # 2m probe: far enough from the surface to get out of numerical
+            # noise at the facade boundary, short enough to land inside
+            # concavity interiors for a typical building wall. A 1m probe
+            # misses facets whose normals are only slightly inverted.
             probes = np.array(
-                [f.center + f.normal * 1.0 for f in facades],
+                [f.center + f.normal * 2.0 for f in facades],
                 dtype=np.float32,
             )
             scene = _o3d.t.geometry.RaycastingScene()
