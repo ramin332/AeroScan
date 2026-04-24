@@ -125,9 +125,11 @@ export interface UploadedBuilding {
   heading_deg: number;
   properties: Record<string, unknown>;
   created_at: string;
-  available_modes?: Array<'dji' | 'inspection'>;
-  active_mode?: 'dji' | 'inspection' | null;
+  available_modes?: Array<KmzMode>;
+  active_mode?: KmzMode | null;
 }
+
+export type KmzMode = 'dji' | 'dji_pinned' | 'inspection';
 
 export interface BuildingUploadRequest {
   name: string;

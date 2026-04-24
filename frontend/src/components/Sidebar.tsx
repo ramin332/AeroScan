@@ -38,9 +38,9 @@ export function Sidebar() {
     kmzFdMinWallArea, kmzFdMinRoofArea, kmzFdMinDensity, kmzFdNormalThreshold,
     setKmzFacadeParams,
     kmzMode, switchMode,
-    buildings, refreshBuildings, selectBuilding, deleteBuilding, stripRosetteOnly,
+    buildings, refreshBuildings, selectBuilding, deleteBuilding,
     simStatus, simProgress, simMessage, startSimulation,
-    rewriteGimbals, generateInspectionMission, toggleKmzFacades, lastKmzFile,
+    toggleKmzFacades, lastKmzFile,
     triggerMissionUpdate,
     showMappingBox, setShowMappingBox,
     showOriginalGimbals, setShowOriginalGimbals,
@@ -205,6 +205,12 @@ export function Sidebar() {
                           padding: '1px 5px', borderRadius: 3, fontSize: 9, fontWeight: 600,
                         }}>DJI</span>
                       )}
+                      {modes.includes('dji_pinned') && (
+                        <span style={{
+                          background: 'rgba(168,85,247,0.25)', color: 'rgb(216,180,254)',
+                          padding: '1px 5px', borderRadius: 3, fontSize: 9, fontWeight: 600,
+                        }}>DJI+F</span>
+                      )}
                       {modes.includes('inspection') && (
                         <span style={{
                           background: 'rgba(6,182,212,0.25)', color: 'rgb(103,232,249)',
@@ -236,31 +242,48 @@ export function Sidebar() {
       )}
 
       {/* ======== PATH MODE SELECTOR (KMZ only) ========
-          Mutually-exclusive choice of which flight path is active.
-          Each mode is a persisted snapshot on the selected building — click
-          switches instantly. If a mode hasn't been generated yet, its
-          "Generate" action appears inside the mode-specific panel below. */}
+          Three mutually-exclusive flight paths. Each is a persisted snapshot
+          on the building — click switches instantly. If a snapshot isn't
+          generated yet, clicking auto-generates it (see store.selectBuilding
+          fallback). Modes 2 and 3 need extracted facades; the button is
+          disabled until the user runs facade detection. */}
       {isKmz && selectedBuildingId && (() => {
         const selected = buildings.find((b) => b.id === selectedBuildingId);
         const availableModes = selected?.available_modes ?? [];
-        const hasDji = availableModes.includes('dji');
-        const hasInsp = availableModes.includes('inspection');
+        const hasFacades = (result?.summary.facade_count ?? 0) > 0;
         const MODES: Array<{
-          key: 'dji' | 'inspection';
+          key: 'dji' | 'dji_pinned' | 'inspection';
           label: string;
           subtitle: string;
-          has: boolean;
+          saved: boolean;
+          needsFacades: boolean;
+          gradient: string;
           tooltip: string;
         }> = [
           {
-            key: 'dji', label: 'DJI path', subtitle: hasDji ? 'saved' : 'default',
-            has: hasDji,
-            tooltip: "Original DJI flight path. Tune mesh + facade detection to drive gimbal rewrites. Waypoints stay as DJI flew them.",
+            key: 'dji', label: 'DJI path',
+            saved: availableModes.includes('dji'), needsFacades: false,
+            subtitle: availableModes.includes('dji') ? 'saved' : 'default',
+            gradient: 'linear-gradient(135deg, #2563eb 0%, #3b82f6 100%)',
+            tooltip: 'Original DJI flight path, as imported. 5-pose rosette intact, DJI gimbal angles preserved.',
           },
           {
-            key: 'inspection', label: 'Custom path', subtitle: hasInsp ? 'saved' : 'not generated',
-            has: hasInsp,
-            tooltip: "Fresh NEN-2767 inspection mission from detected facades. Per-facade boustrophedon, perpendicular gimbals, stop-and-shoot.",
+            key: 'dji_pinned', label: 'DJI path + facade gimbals',
+            saved: availableModes.includes('dji_pinned'), needsFacades: true,
+            subtitle: availableModes.includes('dji_pinned')
+              ? 'saved'
+              : (hasFacades ? 'click to generate' : 'detect facades first'),
+            gradient: 'linear-gradient(135deg, #7c3aed 0%, #a855f7 100%)',
+            tooltip: "DJI's trajectory preserved, but every gimbal re-aimed perpendicular to the nearest facade. One photo per WP, 3 m/s cap.",
+          },
+          {
+            key: 'inspection', label: 'Own path + facade gimbals',
+            saved: availableModes.includes('inspection'), needsFacades: true,
+            subtitle: availableModes.includes('inspection')
+              ? 'saved'
+              : (hasFacades ? 'click to generate' : 'detect facades first'),
+            gradient: 'linear-gradient(135deg, #0891b2 0%, #06b6d4 100%)',
+            tooltip: 'Fresh NEN-2767 boustrophedon planned from detected facades. Stop-and-shoot, perpendicular gimbals.',
           },
         ];
         return (
@@ -268,32 +291,32 @@ export function Sidebar() {
             <h3 style={{ margin: 0, marginBottom: 8, fontSize: 12, letterSpacing: 0.5, textTransform: 'uppercase', color: 'var(--text-dim)' }}>
               Flight path
             </h3>
-            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 6 }}>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
               {MODES.map((m) => {
                 const active = kmzMode === m.key;
+                const disabled = m.needsFacades && !hasFacades && !m.saved;
                 return (
                   <button
                     key={m.key}
-                    onClick={() => void switchMode(m.key)}
-                    title={m.tooltip}
+                    onClick={() => { if (!disabled) void switchMode(m.key); }}
+                    disabled={disabled}
+                    title={disabled ? 'Run facade detection first' : m.tooltip}
                     style={{
-                      background: active
-                        ? (m.key === 'inspection'
-                            ? 'linear-gradient(135deg, #0891b2 0%, #06b6d4 100%)'
-                            : 'linear-gradient(135deg, #2563eb 0%, #3b82f6 100%)')
-                        : 'transparent',
+                      background: active ? m.gradient : 'transparent',
                       color: active ? 'white' : 'inherit',
                       border: `1px solid ${active ? 'transparent' : 'var(--border)'}`,
-                      borderRadius: 6, padding: '8px 10px', cursor: 'pointer',
+                      borderRadius: 6, padding: '8px 10px',
+                      cursor: disabled ? 'not-allowed' : 'pointer',
                       display: 'flex', flexDirection: 'column', alignItems: 'flex-start', gap: 2,
-                      opacity: m.has || active ? 1 : 0.75,
+                      opacity: disabled ? 0.45 : 1,
+                      textAlign: 'left',
                     }}
                   >
                     <span style={{ fontWeight: 600, fontSize: 13 }}>{m.label}</span>
                     <span style={{ fontSize: 10, opacity: 0.8, display: 'flex', gap: 4, alignItems: 'center' }}>
                       <span style={{
                         width: 6, height: 6, borderRadius: '50%',
-                        background: m.has ? '#10b981' : '#6b7280',
+                        background: m.saved ? '#10b981' : '#6b7280',
                         display: 'inline-block',
                       }} />
                       {m.subtitle}
@@ -302,42 +325,6 @@ export function Sidebar() {
                 );
               })}
             </div>
-            {/* Mode-specific action buttons */}
-            {kmzMode === 'dji' && result?.version_id && result.summary.facade_count > 0 && (
-              <div style={{ marginTop: 8, display: 'flex', flexDirection: 'column', gap: 6 }}>
-                <button
-                  className="btn-primary"
-                  style={{ width: '100%', fontSize: 12, padding: '6px 10px', fontWeight: 600 }}
-                  onClick={() => rewriteGimbals()}
-                  title="Rewrite gimbals perpendicular to each facade, cap speed to 3 m/s, strip SmartOblique rosette. Saves a new DJI snapshot."
-                >
-                  Rewrite gimbals
-                </button>
-                <button
-                  className="btn-secondary"
-                  style={{ width: '100%', fontSize: 12, padding: '6px 10px' }}
-                  onClick={() => stripRosetteOnly()}
-                  title="Keep DJI gimbals EXACTLY. Strip only the 5-pose rosette, cap speed to 3 m/s. Saves a new DJI snapshot."
-                >
-                  Strip rosette only
-                </button>
-              </div>
-            )}
-            {kmzMode === 'inspection' && (
-              <div style={{ marginTop: 8 }}>
-                <button
-                  className="btn-primary"
-                  style={{
-                    width: '100%', fontSize: 12, padding: '6px 10px', fontWeight: 600,
-                    background: 'linear-gradient(135deg, #3b82f6 0%, #06b6d4 100%)',
-                  }}
-                  onClick={() => generateInspectionMission()}
-                  title="Generate a fresh NEN-2767 inspection mission from the detected facades. Persists as the inspection snapshot."
-                >
-                  {hasInsp ? 'Regenerate NEN-2767 path' : 'Generate NEN-2767 path'}
-                </button>
-              </div>
-            )}
           </div>
         );
       })()}

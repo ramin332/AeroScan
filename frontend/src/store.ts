@@ -1,6 +1,6 @@
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
-import type { AlgorithmParams, BuildingParams, ExclusionZone, GenerateResponse, MissionParams, SimulationResult, VersionSummary } from './api/types';
+import type { AlgorithmParams, BuildingParams, ExclusionZone, GenerateResponse, KmzMode, MissionParams, SimulationResult, VersionSummary } from './api/types';
 import * as api from './api/client';
 
 export const DEFAULT_BUILDING: BuildingParams = {
@@ -193,16 +193,15 @@ interface AppState {
     kmzFdMinRoofArea: number | null; kmzFdMinDensity: number | null;
     kmzFdNormalThreshold: number | null;
   }>) => void;
-  // DJI vs Inspection mode (UI-only split; affects which sliders are shown).
-  kmzMode: 'dji' | 'inspection';
-  setKmzMode: (v: 'dji' | 'inspection') => void;
+  // Flight-path mode (raw DJI / DJI-with-facade-pinned-gimbals / our own NEN-2767 path).
+  kmzMode: KmzMode;
+  setKmzMode: (v: KmzMode) => void;
   // Saved buildings (persisted on backend sqlite). Displayed as "Saved buildings" list.
   buildings: import('./api/types').UploadedBuilding[];
   refreshBuildings: () => Promise<void>;
-  selectBuilding: (id: string, mode?: 'dji' | 'inspection') => Promise<void>;
+  selectBuilding: (id: string, mode?: KmzMode) => Promise<void>;
   deleteBuilding: (id: string) => Promise<void>;
-  switchMode: (mode: 'dji' | 'inspection') => Promise<void>;
-  stripRosetteOnly: () => Promise<void>;
+  switchMode: (mode: KmzMode) => Promise<void>;
   showOriginalGimbals: boolean;
   setShowOriginalGimbals: (v: boolean) => void;
   showRosetteDiagnostic: boolean;
@@ -357,22 +356,25 @@ export const useStore = create<AppState>()(persist((set, get) => ({
   },
 
   rewriteGimbals: async () => {
+    // Produces the 'dji_pinned' snapshot: DJI trajectory preserved, gimbals
+    // re-aimed perpendicular to the nearest facade, 5-pose rosette collapsed
+    // to one TAKE_PHOTO per WP, speed capped at 3 m/s. Caller must ensure the
+    // currently loaded version is the DJI source (raw KMZ import).
     const current = get().result;
     if (!current?.version_id) return;
     set({ loading: true });
     try {
       const res = await api.rewriteGimbals(current.version_id);
       await get().loadVersion(res.version_id);
-      // Persist the tweaked DJI path as the new dji snapshot.
       const buildingId = get().result?.building_id ?? get().selectedBuildingId;
-      const mode = get().kmzMode;
-      if (buildingId && (mode === 'dji' || mode === 'inspection')) {
+      if (buildingId) {
         try {
-          await api.saveBuildingSnapshot(buildingId, mode, res.version_id);
+          await api.saveBuildingSnapshot(buildingId, 'dji_pinned', res.version_id);
         } catch (snapErr) {
-          console.warn('Persist snapshot after rewrite failed:', snapErr);
+          console.warn('Persist dji_pinned snapshot failed:', snapErr);
         }
       }
+      set({ kmzMode: 'dji_pinned' });
       await Promise.all([get().refreshVersions(), get().refreshBuildings()]);
     } catch (e) {
       console.error('Rewrite gimbals failed:', e);
@@ -494,15 +496,25 @@ export const useStore = create<AppState>()(persist((set, get) => ({
       set(patch);
       await get().refreshVersions();
     } catch (e) {
-      console.warn('Fast load failed, falling back to refine:', e);
+      // Snapshot missing. Auto-generate for the requested mode:
+      //   'dji'         → refine the raw KMZ (alpha_wrap + facade detection)
+      //   'dji_pinned'  → load dji source first, then rewrite gimbals to facades
+      //   'inspection'  → run our NEN-2767 boustrophedon generator
+      console.warn(`No '${mode ?? 'dji'}' snapshot; auto-generating. Reason:`, e);
       set({ loading: false });
-      if (!mode || mode === 'dji') get().triggerRefine();
+      const resolved = mode ?? 'dji';
+      if (resolved === 'dji') {
+        get().triggerRefine();
+      } else if (resolved === 'dji_pinned') {
+        await get().selectBuilding(id, 'dji');
+        await get().rewriteGimbals();
+      } else if (resolved === 'inspection') {
+        await get().generateInspectionMission();
+      }
     }
   },
   switchMode: async (mode) => {
-    // Mode toggle: load the requested snapshot. If not yet generated,
-    // surface the failure so the UI can offer the appropriate generate
-    // button (triggerRefine for dji, generateInspectionMission for inspection).
+    // Load the requested snapshot; selectBuilding auto-generates if missing.
     const id = get().selectedBuildingId;
     set({ kmzMode: mode });
     if (!id) return;
@@ -527,34 +539,6 @@ export const useStore = create<AppState>()(persist((set, get) => ({
       });
     } catch (e) {
       console.error('Delete building failed:', e);
-    }
-  },
-  stripRosetteOnly: async () => {
-    // Keep DJI's gimbals, only strip the SmartOblique rosette + cap speed.
-    // Uses the rewrite-gimbals endpoint with a very lenient pitch_margin
-    // so no gimbal angle changes materially — and we still get the
-    // smart_oblique strip + speed cap.
-    const current = get().result;
-    if (!current?.version_id) return;
-    set({ loading: true });
-    try {
-      const res = await api.rewriteGimbals(current.version_id, {
-        rewrite_angles: false,
-        strip_smart_oblique: true,
-      });
-      await get().loadVersion(res.version_id);
-      const buildingId = get().result?.building_id ?? get().selectedBuildingId;
-      if (buildingId) {
-        try {
-          await api.saveBuildingSnapshot(buildingId, 'dji', res.version_id);
-        } catch (snapErr) {
-          console.warn('Persist snapshot after strip failed:', snapErr);
-        }
-      }
-      await Promise.all([get().refreshVersions(), get().refreshBuildings()]);
-    } catch (e) {
-      console.error('Strip rosette failed:', e);
-      set({ loading: false });
     }
   },
   refineRunning: false,

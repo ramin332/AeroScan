@@ -4,6 +4,7 @@ import type {
   DroneSpec,
   GenerateRequest,
   GenerateResponse,
+  KmzMode,
   PresetsResponse,
   SimulationStatus,
   UploadedBuilding,
@@ -67,28 +68,15 @@ export function kmzDownloadUrl(versionId: string): string {
 
 export async function rewriteGimbals(
   versionId: string,
-  params?: {
-    max_distance_m?: number;
-    pitch_margin_deg?: number;
-    preserve_heading?: boolean;
-    rewrite_angles?: boolean;
-    flight_speed_ms?: number | null;
-    strip_smart_oblique?: boolean;
-  },
 ): Promise<{
   version_id: string;
   parent_version_id: string;
-  rewritten_count: number;
   total_waypoints: number;
   timestamp: string;
   summary: Record<string, unknown>;
   viewer_data: { threejs: unknown; leaflet: unknown };
 }> {
-  return request(`/versions/${versionId}/rewrite-gimbals`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(params ?? {}),
-  });
+  return request(`/versions/${versionId}/rewrite-gimbals`, { method: 'POST' });
 }
 
 // --- Building CRUD ---
@@ -128,12 +116,12 @@ export interface LoadedBuildingSettings {
 
 export async function loadBuilding(
   id: string,
-  mode?: 'dji' | 'inspection',
+  mode?: KmzMode,
 ): Promise<{
   result: GenerateResponse;
   settings: LoadedBuildingSettings;
-  mode: 'dji' | 'inspection';
-  available_modes: Array<'dji' | 'inspection'>;
+  mode: KmzMode;
+  available_modes: Array<KmzMode>;
 }> {
   const qs = mode ? `?mode=${mode}` : '';
   return request(`/buildings/${id}/load${qs}`, { method: 'POST' });
@@ -141,7 +129,7 @@ export async function loadBuilding(
 
 export async function saveBuildingSnapshot(
   buildingId: string,
-  mode: 'dji' | 'inspection',
+  mode: KmzMode,
   versionId: string,
   settings?: Record<string, unknown>,
 ): Promise<{ ok: true; mode: string; version_id: string }> {
@@ -154,7 +142,7 @@ export async function saveBuildingSnapshot(
 
 export async function deleteBuildingSnapshot(
   buildingId: string,
-  mode: 'dji' | 'inspection',
+  mode: KmzMode,
 ): Promise<{ ok: true; removed: boolean }> {
   return request(`/buildings/${buildingId}/snapshots/${mode}`, { method: 'DELETE' });
 }

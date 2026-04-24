@@ -620,7 +620,7 @@ def _facade_cache_put(key: str, value) -> None:
         db.close()
 
 
-SNAPSHOT_MODES = ("dji", "inspection")
+SNAPSHOT_MODES = ("dji", "dji_pinned", "inspection")
 
 
 # ---- Smart recomputation cache for the refine-KMZ slider loop ----
@@ -2216,14 +2216,31 @@ def load_building(building_id: str, mode: str | None = None):
         ))
 
     # Minimal Building stub — full geometry lives in viewer_data.rawMesh already.
-    from ..models import Building
+    # Reconstruct Facade dataclasses from viewer_data.threejs so the
+    # /rewrite-gimbals endpoint (which reads building.facades) works on loaded
+    # snapshots. threejs.facades has {vertices, normal, label, index, component}.
+    from ..models import Building, Facade
+    import numpy as _np
+    rehydrated_facades: list[Facade] = []
+    threejs_blob = (stored_response.get("viewer_data") or {}).get("threejs") or {}
+    for f in threejs_blob.get("facades") or []:
+        try:
+            rehydrated_facades.append(Facade(
+                vertices=_np.asarray(f["vertices"], dtype=_np.float64),
+                normal=_np.asarray(f["normal"], dtype=_np.float64),
+                component_tag=str(f.get("component") or ""),
+                label=str(f.get("label") or ""),
+                index=int(f.get("index", len(rehydrated_facades))),
+            ))
+        except (KeyError, TypeError, ValueError):
+            continue
     building_stub = Building(
         lat=ref_lat, lon=ref_lon,
         width=float(props.get("width", 10.0)),
         depth=float(props.get("depth", 10.0)),
         height=float(props.get("auto_height", record.height or 10.0)),
         heading_deg=0.0,
-        facades=[], label=name,
+        facades=rehydrated_facades, label=name,
     )
     config = MissionConfig(
         flight_speed_ms=2.0,
@@ -2980,69 +2997,46 @@ def download_kmz(version_id: str):
     )
 
 
-class RewriteGimbalsRequest(BaseModel):
-    max_distance_m: float = Field(default=60.0, gt=0.0, le=500.0)
-    pitch_margin_deg: float = Field(default=2.0, ge=0.0, le=20.0)
-    preserve_heading: bool = True
-    # If False, the perpendicular gimbal rewrite is skipped entirely — useful
-    # when the DJI gimbals already point correctly and the caller only wants
-    # to strip the SmartOblique rosette + cap speed.
-    rewrite_angles: bool = True
-    # NEN-2767 enrichment: cap flight speed + collapse SmartOblique rosette to
-    # a single per-waypoint photo. Null/False means keep the DJI defaults.
-    flight_speed_ms: float | None = Field(default=3.0, ge=0.5, le=15.0)
-    strip_smart_oblique: bool = True
+# NEN-2767 flight post-processing hardcoded constants (see /rewrite-gimbals).
+_DJI_PINNED_SPEED_MS = 3.0
+_DJI_PINNED_MAX_FACADE_DIST_M = 60.0
+_DJI_PINNED_PITCH_MARGIN_DEG = 2.0
 
 
 @router.post("/versions/{version_id}/rewrite-gimbals")
-def rewrite_gimbals(version_id: str, req: RewriteGimbalsRequest | None = None):
-    """Rewrite gimbal angles for every waypoint in the given version so the
-    camera is perpendicular to the nearest outward-facing facade.
+def rewrite_gimbals(version_id: str):
+    """Produce the ``dji_pinned`` snapshot from a DJI-imported version:
+    keep DJI's trajectory, re-aim every gimbal perpendicular to the nearest
+    outward-facing facade, strip the 5-pose SmartOblique rosette to one
+    ``TAKE_PHOTO`` per waypoint, and cap speed at 3 m/s for stop-and-shoot.
 
-    Produces a brand-new MissionVersion (the original is kept). Requires the
-    source version to have facades — raw KMZ imports must go through facade
-    extraction first.
+    Emits a fresh MissionVersion (original preserved). Requires extracted
+    facades — gate at the UI.
     """
-    from dataclasses import replace as _dc_replace
-
     from ..gimbal_rewrite import rewrite_gimbals_perpendicular
 
     version = session.get(version_id)
     if not version:
         raise HTTPException(status_code=404, detail="Version not found")
 
-    params = req or RewriteGimbalsRequest()
-    # Facades are only required when rewriting angles. Strip-rosette-only
-    # (rewrite_angles=False) just clones the waypoints and edits actions/speed,
-    # so a raw-KMZ version without extracted facades is fine.
-    if params.rewrite_angles and not version.building.facades:
+    if not version.building.facades:
         raise HTTPException(
             status_code=400,
-            detail="Source version has no facades. Run facade extraction first "
-                   "(re-import the KMZ in Facades mode, or run /generate).",
+            detail="Source version has no facades. Run facade extraction first.",
         )
-    if params.rewrite_angles:
-        new_waypoints = rewrite_gimbals_perpendicular(
-            waypoints=version.waypoints,
-            facades=version.building.facades,
-            max_distance_m=params.max_distance_m,
-            pitch_margin_deg=params.pitch_margin_deg,
-            preserve_heading=params.preserve_heading,
-        )
-    else:
-        # Preserve DJI gimbals exactly — just clone the waypoints so the
-        # downstream speed/rosette edits produce a new version.
-        new_waypoints = [_dc_replace(w) for w in version.waypoints]
 
-    # NEN-2767 enrichment: override speed + strip SmartOblique rosette so every
-    # waypoint captures a single perpendicular photo. Trajectory stays DJI's.
-    if params.flight_speed_ms is not None or params.strip_smart_oblique:
-        from ..models import ActionType as _ActionType, CameraAction as _CameraAction, CameraName as _CameraName
-        for w in new_waypoints:
-            if params.flight_speed_ms is not None:
-                w.speed_ms = float(params.flight_speed_ms)
-            if params.strip_smart_oblique:
-                w.actions = [_CameraAction(action_type=_ActionType.TAKE_PHOTO, camera=_CameraName.WIDE)]
+    new_waypoints = rewrite_gimbals_perpendicular(
+        waypoints=version.waypoints,
+        facades=version.building.facades,
+        max_distance_m=_DJI_PINNED_MAX_FACADE_DIST_M,
+        pitch_margin_deg=_DJI_PINNED_PITCH_MARGIN_DEG,
+        preserve_heading=True,
+    )
+
+    from ..models import ActionType as _ActionType, CameraAction as _CameraAction, CameraName as _CameraName
+    for w in new_waypoints:
+        w.speed_ms = _DJI_PINNED_SPEED_MS
+        w.actions = [_CameraAction(action_type=_ActionType.TAKE_PHOTO, camera=_CameraName.WIDE)]
 
     threejs_data = prepare_threejs_data(version.building, new_waypoints)
     # Preserve the original point cloud + mission area if they were attached.
@@ -3113,6 +3107,7 @@ def rewrite_gimbals(version_id: str, req: RewriteGimbalsRequest | None = None):
     updated_summary["gimbal_diff"] = gimbal_diff
     updated_summary["facade_coverage"] = compute_facade_coverage(version.building, new_waypoints)
 
+    from dataclasses import replace as _dc_replace
     new_version = session.store(
         building_params=version.building_params,
         mission_params={**version.mission_params, "mission_name": f"NEN-2767: {version.config.mission_name}"},
@@ -3128,7 +3123,6 @@ def rewrite_gimbals(version_id: str, req: RewriteGimbalsRequest | None = None):
     return {
         "version_id": new_version.version_id,
         "parent_version_id": version.version_id,
-        "rewritten_count": sum(1 for w in new_waypoints if w.facade_index >= 0),
         "total_waypoints": len(new_waypoints),
         "timestamp": new_version.timestamp,
         "summary": updated_summary,
