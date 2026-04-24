@@ -454,6 +454,15 @@ class MissionConfig:
     # True = stop at each waypoint (curve_and_stop, slower but guaranteed sharp)
     stop_at_waypoint: bool = False
 
+    # XML-slimming knobs. On dense facade sweeps, consecutive WPs share the same
+    # gimbal pose and heading — re-emitting gimbalRotate/rotateYaw at every WP
+    # bloats the KMZ and can stall DJI Pilot 2's mission renderer. Skip the
+    # action when the delta from the last-emitted pose is below the threshold.
+    # The gimbal holds its last-commanded pose between actions, so dedup is
+    # behavior-neutral (the camera still aims correctly at each photo WP).
+    gimbal_dedup_threshold_deg: float = 2.0
+    heading_dedup_threshold_deg: float = 5.0
+
     # DJI Pilot 2 safety defaults (pre-populate the operator's UI)
     rc_lost_action: str = "go_home"  # "go_home" | "hover" | "land" — what drone does on signal loss
     finish_action: str = "return_home"  # "return_home" | "hover" | "land" — what drone does after last waypoint

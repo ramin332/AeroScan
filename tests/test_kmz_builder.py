@@ -414,3 +414,92 @@ class TestWPML106Compliance:
         dist_el = root.find(f".//{{{_WPML_NS}}}distance")
         assert dist_el is not None
         assert abs(float(dist_el.text) - expected) < 0.01
+
+
+def _count_actions(xml: str, func_name: str) -> int:
+    """Count actionActuatorFunc elements matching func_name."""
+    root = ET.fromstring(xml)
+    n = 0
+    for el in root.iter(f"{{{_WPML_NS}}}actionActuatorFunc"):
+        if el.text == func_name:
+            n += 1
+    return n
+
+
+class TestPoseDedup:
+    """Redundant gimbalRotate / rotateYaw actions are elided on dense sweeps."""
+
+    def test_identical_pose_across_waypoints_emits_one_gimbalRotate(self):
+        """5 WPs with identical pose → 1 gimbalRotate in template.kml (the first)."""
+        wps = _make_test_waypoints(5)  # all pitch=0, heading=180
+        data = build_kmz_bytes(wps, MissionConfig())
+        with zipfile.ZipFile(io.BytesIO(data)) as zf:
+            tpl = zf.read("wpmz/template.kml").decode("utf-8")
+        assert _count_actions(tpl, "gimbalRotate") == 1
+        assert _count_actions(tpl, "rotateYaw") == 1
+
+    def test_per_wp_takePhoto_preserved_in_default_mode(self):
+        """Dedup doesn't touch takePhoto — still one per WP in default capture mode."""
+        wps = _make_test_waypoints(5)
+        data = build_kmz_bytes(wps, MissionConfig())
+        with zipfile.ZipFile(io.BytesIO(data)) as zf:
+            tpl = zf.read("wpmz/template.kml").decode("utf-8")
+        assert _count_actions(tpl, "takePhoto") == 5
+
+    def test_pose_change_above_threshold_emits_new_action(self):
+        """When pitch changes by > threshold, a fresh gimbalRotate is emitted."""
+        wps = _make_test_waypoints(5)
+        wps[2].gimbal_pitch_deg = -30.0  # big jump from default 0°
+        data = build_kmz_bytes(wps, MissionConfig())
+        with zipfile.ZipFile(io.BytesIO(data)) as zf:
+            tpl = zf.read("wpmz/template.kml").decode("utf-8")
+        # WP0 emits, WP1 dedup, WP2 jumps to -30° emit, WP3 returns to 0° emit,
+        # WP4 dedup → 3 total.
+        assert _count_actions(tpl, "gimbalRotate") == 3
+
+    def test_pose_change_below_threshold_stays_deduped(self):
+        """Tiny pitch jitter stays within gimbal_dedup_threshold_deg (default 2°)."""
+        wps = _make_test_waypoints(5)
+        wps[2].gimbal_pitch_deg = 1.5  # under 2° threshold
+        data = build_kmz_bytes(wps, MissionConfig())
+        with zipfile.ZipFile(io.BytesIO(data)) as zf:
+            tpl = zf.read("wpmz/template.kml").decode("utf-8")
+        assert _count_actions(tpl, "gimbalRotate") == 1
+
+    def test_heading_dedup_respects_threshold(self):
+        """rotateYaw dedup uses heading_dedup_threshold_deg."""
+        wps = _make_test_waypoints(5)
+        wps[2].heading_deg = 200.0  # 20° jump from default 180° — above 5° threshold
+        data = build_kmz_bytes(wps, MissionConfig())
+        with zipfile.ZipFile(io.BytesIO(data)) as zf:
+            tpl = zf.read("wpmz/template.kml").decode("utf-8")
+        # WP0 emits (180), WP1 dedup, WP2 jumps to 200 emit, WP3 back to 180 emit,
+        # WP4 dedup → 3 total.
+        assert _count_actions(tpl, "rotateYaw") == 3
+
+    def test_threshold_is_configurable(self):
+        """Raising the threshold elides even large jumps."""
+        wps = _make_test_waypoints(5)
+        wps[2].gimbal_pitch_deg = -10.0
+        config = MissionConfig(gimbal_dedup_threshold_deg=30.0)
+        data = build_kmz_bytes(wps, config)
+        with zipfile.ZipFile(io.BytesIO(data)) as zf:
+            tpl = zf.read("wpmz/template.kml").decode("utf-8")
+        assert _count_actions(tpl, "gimbalRotate") == 1
+
+
+class TestActionIdRenumbering:
+    """actionIds within each actionGroup should be sequential 0,1,2,... after dedup."""
+
+    def test_action_ids_sequential_within_group(self):
+        wps = _make_test_waypoints(5)
+        data = build_kmz_bytes(wps, MissionConfig())
+        with zipfile.ZipFile(io.BytesIO(data)) as zf:
+            tpl = zf.read("wpmz/template.kml").decode("utf-8")
+        root = ET.fromstring(tpl)
+        for ag in root.iter(f"{{{_WPML_NS}}}actionGroup"):
+            ids = [
+                int(a.find(f"{{{_WPML_NS}}}actionId").text)
+                for a in ag.findall(f"{{{_WPML_NS}}}action")
+            ]
+            assert ids == list(range(len(ids))), f"non-sequential IDs in group: {ids}"

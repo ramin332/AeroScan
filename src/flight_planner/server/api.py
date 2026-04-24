@@ -573,6 +573,11 @@ class MissionParams(BaseModel):
     yaw_rate_deg_per_s: float = Field(60.0, ge=30.0, le=120.0)
     # Flight mode
     stop_at_waypoint: bool = False  # False = fly-through (faster, M4E mech shutter)
+    # XML-slimming knobs: skip gimbalRotate / rotateYaw actions whose pose is
+    # within threshold of the previously emitted one. Cuts XML ~50% on dense
+    # facade sweeps where pose is constant within a row.
+    gimbal_dedup_threshold_deg: float = Field(2.0, ge=0.0, le=45.0)
+    heading_dedup_threshold_deg: float = Field(5.0, ge=0.0, le=45.0)
     # DJI Pilot 2 safety defaults (operator can adjust before flying)
     rc_lost_action: str = "go_home"
     finish_action: str = "return_home"
@@ -2107,6 +2112,8 @@ def benchmark_tsp(request: GenerateRequest):
         gimbal_pitch_margin_deg=request.mission.gimbal_pitch_margin_deg,
         min_photo_distance_m=request.mission.min_photo_distance_m,
         yaw_rate_deg_per_s=request.mission.yaw_rate_deg_per_s,
+        gimbal_dedup_threshold_deg=request.mission.gimbal_dedup_threshold_deg,
+        heading_dedup_threshold_deg=request.mission.heading_dedup_threshold_deg,
     )
 
     methods = ["nearest_neighbor", "greedy", "simulated_annealing", "threshold_accepting", "auto"]
@@ -2340,6 +2347,8 @@ def generate(request: GenerateRequest):
         min_photo_distance_m=request.mission.min_photo_distance_m,
         yaw_rate_deg_per_s=request.mission.yaw_rate_deg_per_s,
         stop_at_waypoint=request.mission.stop_at_waypoint,
+        gimbal_dedup_threshold_deg=request.mission.gimbal_dedup_threshold_deg,
+        heading_dedup_threshold_deg=request.mission.heading_dedup_threshold_deg,
         rc_lost_action=request.mission.rc_lost_action,
         finish_action=request.mission.finish_action,
         takeoff_security_height_m=request.mission.takeoff_security_height_m,

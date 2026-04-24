@@ -27,6 +27,8 @@ export const DEFAULT_MISSION: MissionParams = {
   min_photo_distance_m: 1.5,
   yaw_rate_deg_per_s: 60.0,
   stop_at_waypoint: false,
+  gimbal_dedup_threshold_deg: 2.0,
+  heading_dedup_threshold_deg: 5.0,
 };
 
 // NEN-2767 inspection preset: stop-and-shoot, perpendicular gimbal, moderate
@@ -44,6 +46,8 @@ export const NEN2767_MISSION: MissionParams = {
   min_photo_distance_m: 4.0,
   yaw_rate_deg_per_s: 60.0,
   stop_at_waypoint: true,
+  gimbal_dedup_threshold_deg: 2.0,
+  heading_dedup_threshold_deg: 5.0,
 };
 
 export const DEFAULT_ALGORITHM: AlgorithmParams = {
@@ -829,6 +833,19 @@ export const useStore = create<AppState>()(persist((set, get) => ({
   },
 }), {
   name: 'aeroscan-settings',
+  // Bump version whenever a new field is added to MissionParams/BuildingParams/AlgorithmParams.
+  // The merge() below fills missing fields from the current defaults.
+  version: 2,
+  merge: (persisted, current) => {
+    const p = (persisted ?? {}) as Partial<AppState>;
+    return {
+      ...current,
+      ...p,
+      building: { ...DEFAULT_BUILDING, ...(p.building ?? {}) },
+      mission: { ...DEFAULT_MISSION, ...(p.mission ?? {}) },
+      algorithm: { ...DEFAULT_ALGORITHM, ...(p.algorithm ?? {}) },
+    };
+  },
   partialize: (state) => ({
     lightMode: state.lightMode,
     activeTab: state.activeTab,

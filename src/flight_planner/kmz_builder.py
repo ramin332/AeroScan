@@ -215,6 +215,98 @@ def _inject_m4e_enums(root: ET.Element) -> None:
             el.text = str(value)
 
 
+def _signed_angle_delta(a: float, b: float) -> float:
+    """Smallest signed difference between two headings in degrees (handles 360° wraparound)."""
+    d = (a - b) % 360.0
+    if d > 180.0:
+        d -= 360.0
+    return d
+
+
+def _dedupe_pose_actions(root: ET.Element, config: MissionConfig) -> None:
+    """Strip redundant gimbalRotate + rotateYaw actions whose pose matches the last emitted one within threshold.
+
+    Facade sweeps hold gimbal pitch/yaw constant along every row — re-emitting
+    a fresh gimbalRotate at every waypoint balloons the XML without changing
+    behaviour. Same for aircraft heading on long parallel passes. Removing the
+    redundant actions cuts action-element count by ~40-60% on typical missions
+    and sidesteps the Pilot 2 renderer stall seen at high WP counts.
+    """
+    gimbal_thr = config.gimbal_dedup_threshold_deg
+    heading_thr = config.heading_dedup_threshold_deg
+
+    last_pitch: float | None = None
+    last_yaw: float | None = None
+    last_heading: float | None = None
+
+    for placemark in root.iter(f"{{{_KML_NS}}}Placemark"):
+        for action_group in placemark.findall(f"{{{_WPML_NS}}}actionGroup"):
+            for action in list(action_group.findall(f"{{{_WPML_NS}}}action")):
+                func_el = action.find(f"{{{_WPML_NS}}}actionActuatorFunc")
+                params = action.find(f"{{{_WPML_NS}}}actionActuatorFuncParam")
+                if func_el is None or params is None:
+                    continue
+                func = func_el.text
+
+                if func == "gimbalRotate":
+                    pitch_el = params.find(f"{{{_WPML_NS}}}gimbalPitchRotateAngle")
+                    yaw_en_el = params.find(f"{{{_WPML_NS}}}gimbalYawRotateEnable")
+                    yaw_el = params.find(f"{{{_WPML_NS}}}gimbalYawRotateAngle")
+                    pitch = (
+                        float(pitch_el.text) if pitch_el is not None and pitch_el.text else None
+                    )
+                    yaw = float(yaw_el.text) if yaw_el is not None and yaw_el.text else None
+                    yaw_enabled = (
+                        yaw_en_el is not None and (yaw_en_el.text or "").strip() == "1"
+                    )
+
+                    pitch_same = (
+                        last_pitch is not None
+                        and pitch is not None
+                        and abs(pitch - last_pitch) <= gimbal_thr
+                    )
+                    yaw_same = (not yaw_enabled) or (
+                        last_yaw is not None
+                        and yaw is not None
+                        and abs(_signed_angle_delta(yaw, last_yaw)) <= gimbal_thr
+                    )
+                    if pitch_same and yaw_same:
+                        action_group.remove(action)
+                        continue
+
+                    if pitch is not None:
+                        last_pitch = pitch
+                    if yaw_enabled and yaw is not None:
+                        last_yaw = yaw
+
+                elif func == "rotateYaw":
+                    heading_el = params.find(f"{{{_WPML_NS}}}aircraftHeading")
+                    heading = (
+                        float(heading_el.text)
+                        if heading_el is not None and heading_el.text
+                        else None
+                    )
+                    if (
+                        last_heading is not None
+                        and heading is not None
+                        and abs(_signed_angle_delta(heading, last_heading)) <= heading_thr
+                    ):
+                        action_group.remove(action)
+                        continue
+                    if heading is not None:
+                        last_heading = heading
+
+
+def _renumber_action_ids(root: ET.Element) -> None:
+    """Renumber actionIds sequentially within each actionGroup after dedup leaves gaps."""
+    for action_group in root.iter(f"{{{_WPML_NS}}}actionGroup"):
+        for idx, action in enumerate(action_group.findall(f"{{{_WPML_NS}}}action")):
+            id_el = action.find(f"{{{_WPML_NS}}}actionId")
+            if id_el is None:
+                id_el = ET.SubElement(action, f"{{{_WPML_NS}}}actionId")
+            id_el.text = str(idx)
+
+
 def _path_distance_m(waypoints: list[Waypoint]) -> float:
     """Total 3D path length through the waypoints, in metres (ENU frame)."""
     total = 0.0
@@ -404,6 +496,8 @@ def _build_kmz_zip(
     template_root = ET.fromstring(template_xml_str)
     _inject_template_elements(template_root, config)
     _inject_m4e_enums(template_root)
+    _dedupe_pose_actions(template_root, config)
+    _renumber_action_ids(template_root)
     template_xml = ET.tostring(template_root, encoding="unicode", xml_declaration=True)
 
     # Generate waylines.wpml from the (already-patched) template

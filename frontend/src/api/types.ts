@@ -24,6 +24,8 @@ export interface MissionParams {
   min_photo_distance_m: number;
   yaw_rate_deg_per_s: number;
   stop_at_waypoint: boolean;
+  gimbal_dedup_threshold_deg: number;
+  heading_dedup_threshold_deg: number;
 }
 
 export interface ValidationIssue {

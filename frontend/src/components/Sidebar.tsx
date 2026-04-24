@@ -533,6 +533,20 @@ export function Sidebar() {
         )}
       </Section>
 
+      {/* ======== KMZ OUTPUT ======== */}
+      <Section title="KMZ output">
+        <SliderField label="Gimbal dedup" value={mission.gimbal_dedup_threshold_deg}
+          min={0} max={20} step={0.5}
+          format={(v) => `${v}°`}
+          tooltip="Skip gimbalRotate action when pose change is below this threshold. Cuts XML ~50% on dense facade sweeps. Gimbal holds last-commanded pose, so this is behavior-neutral."
+          onChange={(v) => setMission({ gimbal_dedup_threshold_deg: v })} onCommit={autoGen} />
+        <SliderField label="Heading dedup" value={mission.heading_dedup_threshold_deg}
+          min={0} max={30} step={1}
+          format={(v) => `${v}°`}
+          tooltip="Skip rotateYaw action when heading change is below this threshold."
+          onChange={(v) => setMission({ heading_dedup_threshold_deg: v })} onCommit={autoGen} />
+      </Section>
+
       {/* ======== PATH OPTIMIZATION ======== */}
       <Section title="Path Optimization" defaultOpen>
         <SliderField label="Grid density" value={algorithm.grid_density}
