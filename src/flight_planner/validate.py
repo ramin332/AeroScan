@@ -241,17 +241,21 @@ def validate_mission(
             message=f"{zone_removed} waypoints removed by {', '.join(zone_desc)} zone(s)",
         ))
 
-    # Mapping-polygon clip (KMZ-imported missions only)
-    poly_clipped = stats.get("mapping_polygon_clipped_waypoints", 0)
-    if poly_clipped > 0:
-        affected = stats.get("mapping_polygon_clipped_facades") or []
+    # Point-cloud safety filter (KMZ-imported missions only): waypoints
+    # dropped because the raw DJI cloud had an obstacle (tree, wire, fence,
+    # adjacent building) inside the WP's clearance ball, outside the target
+    # viewing cone.
+    pc_rejected = stats.get("pointcloud_rejected_waypoints", 0)
+    if pc_rejected > 0:
+        affected = stats.get("pointcloud_rejected_facades") or []
         facade_suffix = f" (facades: {', '.join(str(i) for i in affected)})" if affected else ""
         issues.append(ValidationIssue(
             severity=Severity.WARNING,
-            code="mapping_polygon_clipped",
+            code="pointcloud_obstacle",
             message=(
-                f"{poly_clipped} waypoint(s) dropped for falling outside the DJI mapping "
-                f"polygon{facade_suffix} — reduce standoff or accept coverage loss near the polygon edge"
+                f"{pc_rejected} waypoint(s) dropped because the raw point cloud had an "
+                f"obstacle within {OBSTACLE_CLEARANCE_M}m of the camera "
+                f"position{facade_suffix} — reduce standoff or accept coverage loss near site obstacles"
             ),
         ))
 

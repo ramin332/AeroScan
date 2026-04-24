@@ -143,64 +143,117 @@ def _filter_facades_by_dji_bbox(
     return kept
 
 
-def _clip_waypoints_to_dji_bbox(
-    waypoints,
-    mission_area_wgs84: list | None,
-    ref_lat: float,
-    ref_lon: float,
-    ref_alt: float,
-    *,
-    margin_m: float = 2.0,
-):
-    """Drop waypoints whose XY falls outside the DJI mapping polygon.
+def _load_kmz_pointcloud_xyz(building_id: str) -> "np.ndarray | None":  # type: ignore[name-defined]
+    """Decode the raw DJI point cloud stored on a KMZ-imported BuildingRecord.
 
-    The DJI `mission_area_wgs84` polygon from the imported KMZ is the
-    authoritative flight envelope: the RC Plus refuses to execute anything
-    outside it. Inspection-mission waypoints that land outside (e.g., a
-    facade tucked against the edge where the standoff distance pushes the
-    camera beyond the polygon) would be silently rejected by the aircraft.
-    We clip proactively and report the count so the user sees coverage loss
-    instead of a mid-flight abort.
+    Returns ``None`` if the record has no cloud attached (non-KMZ building
+    or a degraded import). The cloud stays in the same ENU frame as the
+    rest of the viewer data, so it composes with waypoint XYZs directly.
+    """
+    import base64 as _base64
+    import gzip as _gzip
+    import numpy as _np
+    db = get_db()
+    try:
+        row = (
+            db.query(
+                func.json_extract(BuildingRecord.properties_json, "$.pc_b64").label("pc_b64"),
+            )
+            .filter(BuildingRecord.id == building_id)
+            .first()
+        )
+        if row is None or not row.pc_b64:
+            return None
+        raw = _gzip.decompress(_base64.b64decode(row.pc_b64))
+        arr = _np.frombuffer(raw, dtype=_np.float32)
+        half = arr.size // 2
+        if half * 2 != arr.size or half == 0:
+            return None
+        # The cached blob is positions (3N floats) + colors (3N floats),
+        # concatenated. Take just the first half = positions.
+        return arr[:half].reshape(-1, 3)
+    finally:
+        db.close()
+
+
+def _filter_waypoints_by_pointcloud(
+    waypoints,
+    cloud_xyz,  # np.ndarray shape (N, 3)
+    facades,
+    clearance_m: float,
+    *,
+    view_cone_half_angle_deg: float = 60.0,
+):
+    """Drop waypoints whose clearance ball contains non-target point-cloud points.
+
+    For inspection waypoints, points that fall inside a cone toward the
+    target facade (half-angle ``view_cone_half_angle_deg``) are treated as
+    the photo subject and ignored — otherwise the facade itself would
+    always reject its own inspection WPs. Anything *else* within
+    ``clearance_m`` (trees, wires, railings, adjacent buildings, etc.) is
+    a real obstacle and the WP is dropped.
+
+    Transit waypoints (no facade attachment) apply the full clearance
+    ball with no cone relief.
 
     Returns ``(kept_waypoints, removed_count, removed_facade_indices)``.
-    Safely no-ops when no polygon is supplied.
     """
+    import math as _m
     import numpy as _np
-    from ..kmz_import import polygon_to_enu as _poly_to_enu
-    if not waypoints or not mission_area_wgs84:
-        return list(waypoints), 0, []
-    poly_enu = _poly_to_enu(mission_area_wgs84, ref_lat, ref_lon, ref_alt)
-    poly_enu = _expand_polygon_xy(poly_enu, margin_m)
-    if not poly_enu or len(poly_enu) < 3:
-        return list(waypoints), 0, []
-    poly = _np.asarray(poly_enu, dtype=float).reshape(-1, 3)[:, :2]
+    from scipy.spatial import cKDTree  # type: ignore
 
-    def _inside(x: float, y: float) -> bool:
-        inside = False
-        n = len(poly)
-        j = n - 1
-        for i in range(n):
-            xi, yi = poly[i]
-            xj, yj = poly[j]
-            if ((yi > y) != (yj > y)) and (x < (xj - xi) * (y - yi) / (yj - yi + 1e-12) + xi):
-                inside = not inside
-            j = i
-        return inside
+    if cloud_xyz is None or len(cloud_xyz) == 0 or not waypoints:
+        return list(waypoints), 0, []
+
+    tree = cKDTree(_np.asarray(cloud_xyz, dtype=_np.float64))
+    face_by_idx = {int(f.index): f for f in (facades or [])}
+    cos_thresh = _m.cos(_m.radians(view_cone_half_angle_deg))
 
     kept = []
     removed_facades: set[int] = set()
     removed = 0
+
     for wp in waypoints:
-        if _inside(wp.x, wp.y):
+        wp_pos = _np.array([wp.x, wp.y, wp.z], dtype=_np.float64)
+        neighbour_idx = tree.query_ball_point(wp_pos, r=clearance_m)
+        if not neighbour_idx:
             kept.append(wp)
-        else:
+            continue
+
+        view_dir = None
+        if not getattr(wp, "is_transition", False):
+            f = face_by_idx.get(int(getattr(wp, "facade_index", -1)))
+            if f is not None:
+                view_dir = -_np.asarray(f.normal, dtype=_np.float64)
+
+        is_obstacle = False
+        for idx in neighbour_idx:
+            pt = cloud_xyz[idx]
+            vec = pt - wp_pos
+            dist = float(_np.linalg.norm(vec))
+            if dist < 1e-6:
+                # WP sits on a cloud point — definitely unsafe.
+                is_obstacle = True
+                break
+            if view_dir is not None:
+                cos_a = float(_np.dot(vec / dist, view_dir))
+                if cos_a > cos_thresh:
+                    continue  # target-cone point, ignore
+            is_obstacle = True
+            break
+
+        if is_obstacle:
             removed += 1
-            if wp.facade_index is not None and wp.facade_index >= 0:
-                removed_facades.add(int(wp.facade_index))
+            fi = getattr(wp, "facade_index", None)
+            if fi is not None and fi >= 0:
+                removed_facades.add(int(fi))
+        else:
+            kept.append(wp)
+
     if removed:
         print(
-            f"[kmz waypoints] mapping polygon clip (margin={margin_m}m): "
-            f"{len(waypoints)} → {len(kept)} (-{removed})"
+            f"[kmz waypoints] point-cloud safety filter (clearance={clearance_m}m, "
+            f"cone={view_cone_half_angle_deg}°): {len(waypoints)} → {len(kept)} (-{removed})"
         )
     return kept, removed, sorted(removed_facades)
 
@@ -2551,23 +2604,27 @@ def generate(request: GenerateRequest):
         exclusion_zones=zones,
     )
 
-    # Clip to the DJI mapping polygon. Waypoints outside the polygon would be
-    # refused by the RC Plus at flight time; better to drop them in planning
-    # and surface the coverage loss. Only applies to KMZ-sourced buildings.
-    poly_clipped = 0
-    poly_clipped_facades: list[int] = []
-    if kmz_source_type is not None and kmz_mission_area_wgs84:
-        waypoints, poly_clipped, poly_clipped_facades = _clip_waypoints_to_dji_bbox(
-            waypoints,
-            kmz_mission_area_wgs84,
-            kmz_ref_lat, kmz_ref_lon, kmz_ref_alt,
-        )
-        if poly_clipped:
-            generation_stats["mapping_polygon_clipped_waypoints"] = poly_clipped
-            generation_stats["mapping_polygon_clipped_facades"] = poly_clipped_facades
-        # Re-index so the downstream viewer + KMZ agree on per-wp indices.
-        for _i, _wp in enumerate(waypoints):
-            _wp.index = _i
+    # Raw-point-cloud safety filter: drop waypoints whose clearance ball
+    # intersects any point in the DJI point cloud that is NOT part of the
+    # facade being photographed. The alpha-wrap mesh that powers the
+    # existing mesh-based collision checks smooths out thin obstacles
+    # (wires, railings, branches), so the raw cloud stays the most honest
+    # representation of what's actually around the drone.
+    pc_rejected = 0
+    pc_rejected_facades: list[int] = []
+    if kmz_source_type is not None:
+        cloud_xyz = _load_kmz_pointcloud_xyz(request.building_id) if request.building_id else None
+        if cloud_xyz is not None and len(cloud_xyz) > 0:
+            waypoints, pc_rejected, pc_rejected_facades = _filter_waypoints_by_pointcloud(
+                waypoints, cloud_xyz, building.facades,
+                clearance_m=config.obstacle_clearance_m,
+            )
+            if pc_rejected:
+                generation_stats["pointcloud_rejected_waypoints"] = pc_rejected
+                generation_stats["pointcloud_rejected_facades"] = pc_rejected_facades
+            # Re-index so the downstream viewer + KMZ agree on per-wp indices.
+            for _i, _wp in enumerate(waypoints):
+                _wp.index = _i
 
     t_waypoints = time.perf_counter()
 

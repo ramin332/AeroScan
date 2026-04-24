@@ -1,16 +1,14 @@
-"""Regression tests for the four behaviours changed by the "custom path"
-mapping-polygon fix:
+"""Regression tests for the "custom path" behaviour changes:
 
 * Facade-to-facade transit waypoints are NOT inserted unconditionally any
-  more — the path-segment collision detour only fires when the direct line
-  hits the mesh.
-* ``_clip_waypoints_to_dji_bbox`` drops WPs whose XY leaves the DJI
-  mapping polygon, reports the count, and tracks the affected facades.
+  more — the mesh path-segment collision detour only fires when the
+  direct line hits the mesh.
+* ``_filter_waypoints_by_pointcloud`` drops inspection WPs whose clearance
+  ball contains non-target cloud points (obstacles: trees, wires,
+  adjacent structures), while keeping WPs whose only nearby cloud points
+  are on the facade being photographed.
 * ``_derive_dji_mission_seeds`` converts DJI overlap percentages to
   fractions and computes a site-proven standoff from observed waypoints.
-* ``_check_path_collisions`` still inserts a detour when the direct line
-  between two facades would clip through the building — i.e. removing the
-  unconditional transitions did not remove the safety layer.
 """
 
 from __future__ import annotations
@@ -33,8 +31,8 @@ from flight_planner.models import (
     meters_per_deg,
 )
 from flight_planner.server.api import (
-    _clip_waypoints_to_dji_bbox,
     _derive_dji_mission_seeds,
+    _filter_waypoints_by_pointcloud,
 )
 
 
@@ -67,81 +65,100 @@ def test_rectangular_building_has_no_transition_waypoints_when_path_is_clear():
 
 
 # ---------------------------------------------------------------------------
-# Track C: _clip_waypoints_to_dji_bbox
+# Track C (revised): _filter_waypoints_by_pointcloud
 # ---------------------------------------------------------------------------
 
 
-def _enu_to_lonlat(x: float, y: float, ref_lat: float, ref_lon: float) -> tuple[float, float, float]:
-    m_per_lat, m_per_lon = meters_per_deg(math.radians(ref_lat))
-    return (ref_lon + x / m_per_lon, ref_lat + y / m_per_lat, 0.0)
-
-
-def _square_polygon_wgs84(half_m: float, ref_lat: float, ref_lon: float):
-    """Square polygon [-half_m, half_m] x [-half_m, half_m] in ENU, as
-    WGS84 (lon, lat, alt) triples."""
-    corners_enu = [
-        (-half_m, -half_m),
-        (half_m, -half_m),
-        (half_m, half_m),
-        (-half_m, half_m),
-    ]
-    return [_enu_to_lonlat(x, y, ref_lat, ref_lon) for x, y in corners_enu]
-
-
-def _wp(x: float, y: float, *, facade_index: int = 0, index: int = 0) -> Waypoint:
+def _wp(x: float, y: float, z: float = 5.0, *, facade_index: int = 0, index: int = 0, is_transition: bool = False) -> Waypoint:
     return Waypoint(
-        x=x, y=y, z=5.0,
+        x=x, y=y, z=z,
         heading_deg=0.0, gimbal_pitch_deg=0.0,
         speed_ms=2.0, actions=[],
         facade_index=facade_index, index=index,
+        is_transition=is_transition,
     )
 
 
-def test_clip_waypoints_keeps_inside_drops_outside():
-    ref_lat, ref_lon = 52.0, 5.0
-    polygon = _square_polygon_wgs84(10.0, ref_lat, ref_lon)
-
-    waypoints = [
-        _wp(0, 0, facade_index=0, index=0),      # inside
-        _wp(5, 5, facade_index=0, index=1),      # inside
-        _wp(20, 0, facade_index=1, index=2),     # outside (east)
-        _wp(0, -20, facade_index=2, index=3),    # outside (south)
-        _wp(-9.9, 0, facade_index=0, index=4),   # inside edge (within margin)
-    ]
-
-    kept, removed_count, removed_facades = _clip_waypoints_to_dji_bbox(
-        waypoints, polygon, ref_lat, ref_lon, 0.0,
+def _south_facade(index: int = 0) -> Facade:
+    """A wall at y=0 facing -y (south). Inspection WPs sit at y<0 looking north."""
+    return Facade(
+        vertices=np.array([
+            [-5.0, 0.0, 0.0], [5.0, 0.0, 0.0],
+            [5.0, 0.0, 10.0], [-5.0, 0.0, 10.0],
+        ]),
+        normal=np.array([0.0, -1.0, 0.0]),
+        label=f"wall{index}",
+        component_tag="21.1",
+        index=index,
     )
-    assert removed_count == 2
-    assert set(removed_facades) == {1, 2}
-    assert len(kept) == 3
-    # Inside waypoints survive
-    for wp in kept:
-        assert abs(wp.x) <= 12.0 + 1e-3 and abs(wp.y) <= 12.0 + 1e-3
 
 
-def test_clip_waypoints_noop_without_polygon():
-    waypoints = [_wp(100, 100, index=0), _wp(200, 200, index=1)]
-    kept, removed, facades = _clip_waypoints_to_dji_bbox(
-        waypoints, None, 0.0, 0.0, 0.0,
+def test_pointcloud_filter_keeps_wp_when_only_target_facade_is_near():
+    """WP at y=-3 photographing a wall at y=0. The wall's own cloud points
+    are within clearance, but they're all in the viewing cone, so the WP
+    must survive."""
+    facade = _south_facade(0)
+    # Cloud points sampled along the wall plane (target surface).
+    cloud = np.array([[x, 0.0, z] for x in np.linspace(-3, 3, 7) for z in np.linspace(1, 9, 5)])
+    wp = _wp(0.0, -3.0, 5.0, facade_index=0, index=0)  # 3m standoff
+
+    kept, removed, facades = _filter_waypoints_by_pointcloud(
+        [wp], cloud, [facade], clearance_m=4.0,
     )
-    assert kept == waypoints
+    assert removed == 0
+    assert kept == [wp]
+    assert facades == []
+
+
+def test_pointcloud_filter_rejects_wp_with_off_axis_obstacle():
+    """Same WP, but now there's a cloud point OFF to the side (tree trunk
+    beside the drone) — that must reject the WP."""
+    facade = _south_facade(0)
+    cloud = np.array([
+        [-4.0, -3.0, 5.0],  # tree 4m west of the WP, dist ~4m — outside clearance
+        [-1.5, -3.0, 5.0],  # close obstacle 1.5m west of WP — INSIDE clearance
+    ])
+    wp = _wp(0.0, -3.0, 5.0, facade_index=0, index=0)
+
+    kept, removed, facades = _filter_waypoints_by_pointcloud(
+        [wp], cloud, [facade], clearance_m=2.0,
+    )
+    assert removed == 1
+    assert kept == []
+    assert facades == [0]
+
+
+def test_pointcloud_filter_noop_without_cloud():
+    wp = _wp(0.0, -3.0, index=0)
+    kept, removed, facades = _filter_waypoints_by_pointcloud(
+        [wp], None, [_south_facade(0)], clearance_m=2.0,
+    )
+    assert kept == [wp]
     assert removed == 0
     assert facades == []
 
 
-def test_clip_waypoints_margin_preserves_edge_huggers():
-    """A waypoint sitting exactly on the polygon boundary must survive the
-    2m margin (matches facade filter behaviour)."""
-    ref_lat, ref_lon = 52.0, 5.0
-    polygon = _square_polygon_wgs84(10.0, ref_lat, ref_lon)
+def test_pointcloud_filter_transit_wp_has_no_view_cone_relief():
+    """Transit waypoints (no facade target) have no viewing cone, so any
+    cloud point within clearance rejects them."""
+    cloud = np.array([[0.0, 1.0, 0.0]])  # point 1m north of WP
+    wp = _wp(0.0, 0.0, 0.0, facade_index=-1, index=0, is_transition=True)
 
-    edge_wp = _wp(10.0, 0.0, facade_index=0, index=0)  # exactly on boundary
-    kept, removed, _ = _clip_waypoints_to_dji_bbox(
-        [edge_wp], polygon, ref_lat, ref_lon, 0.0,
+    kept, removed, _ = _filter_waypoints_by_pointcloud(
+        [wp], cloud, [], clearance_m=2.0,
     )
-    assert removed == 0
-    assert len(kept) == 1
+    assert removed == 1
+    assert kept == []
+
+
+def test_pointcloud_filter_wp_at_exact_cloud_point_is_rejected():
+    cloud = np.array([[0.0, -3.0, 5.0]])  # exactly on the WP
+    wp = _wp(0.0, -3.0, 5.0, facade_index=0, index=0)
+    kept, removed, _ = _filter_waypoints_by_pointcloud(
+        [wp], cloud, [_south_facade(0)], clearance_m=2.0,
+    )
+    assert removed == 1
+    assert kept == []
 
 
 # ---------------------------------------------------------------------------
