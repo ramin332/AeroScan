@@ -143,6 +143,267 @@ def _filter_facades_by_dji_bbox(
     return kept
 
 
+def _clip_waypoints_to_dji_bbox(
+    waypoints,
+    mission_area_wgs84: list | None,
+    ref_lat: float,
+    ref_lon: float,
+    ref_alt: float,
+    *,
+    margin_m: float = 2.0,
+):
+    """Drop inspection waypoints whose XY falls outside the DJI mapping polygon.
+
+    Transit waypoints bypass the clip — they may legitimately cross outside
+    the polygon briefly while slewing between facades.
+
+    The DJI `mission_area_wgs84` polygon from the imported KMZ is the
+    authoritative flight envelope the pilot approved. A 2m margin matches
+    the facade filter so edge-hugging WPs survive consistently. Returns
+    ``(kept_waypoints, removed_count, removed_facade_indices)``.
+    """
+    import numpy as _np
+    from ..kmz_import import polygon_to_enu as _poly_to_enu
+    if not waypoints or not mission_area_wgs84:
+        return list(waypoints), 0, []
+    poly_enu = _poly_to_enu(mission_area_wgs84, ref_lat, ref_lon, ref_alt)
+    poly_enu = _expand_polygon_xy(poly_enu, margin_m)
+    if not poly_enu or len(poly_enu) < 3:
+        return list(waypoints), 0, []
+    poly = _np.asarray(poly_enu, dtype=float).reshape(-1, 3)[:, :2]
+
+    def _inside(x: float, y: float) -> bool:
+        inside = False
+        n = len(poly)
+        j = n - 1
+        for i in range(n):
+            xi, yi = poly[i]
+            xj, yj = poly[j]
+            if ((yi > y) != (yj > y)) and (x < (xj - xi) * (y - yi) / (yj - yi + 1e-12) + xi):
+                inside = not inside
+            j = i
+        return inside
+
+    kept = []
+    removed_facades: set[int] = set()
+    removed = 0
+    for wp in waypoints:
+        # Transit WPs are allowed to clip outside briefly — they do not
+        # photograph, so crossing the mapping polygon edge mid-slew is fine.
+        if getattr(wp, "is_transition", False):
+            kept.append(wp)
+            continue
+        if _inside(wp.x, wp.y):
+            kept.append(wp)
+        else:
+            removed += 1
+            if wp.facade_index is not None and wp.facade_index >= 0:
+                removed_facades.add(int(wp.facade_index))
+    if removed:
+        print(
+            f"[kmz waypoints] mapping polygon clip (margin={margin_m}m): "
+            f"{len(waypoints)} → {len(kept)} (-{removed})"
+        )
+    return kept, removed, sorted(removed_facades)
+
+
+def _load_kmz_pointcloud_xyz(building_id: str) -> "np.ndarray | None":  # type: ignore[name-defined]
+    """Decode the raw DJI point cloud stored on a KMZ-imported BuildingRecord.
+
+    Returns ``None`` if the record has no cloud attached (non-KMZ building
+    or a degraded import). The cloud stays in the same ENU frame as the
+    rest of the viewer data, so it composes with waypoint XYZs directly.
+    """
+    import base64 as _base64
+    import gzip as _gzip
+    import numpy as _np
+    db = get_db()
+    try:
+        row = (
+            db.query(
+                func.json_extract(BuildingRecord.properties_json, "$.pc_b64").label("pc_b64"),
+            )
+            .filter(BuildingRecord.id == building_id)
+            .first()
+        )
+        if row is None or not row.pc_b64:
+            return None
+        raw = _gzip.decompress(_base64.b64decode(row.pc_b64))
+        arr = _np.frombuffer(raw, dtype=_np.float32)
+        half = arr.size // 2
+        if half * 2 != arr.size or half == 0:
+            return None
+        # The cached blob is positions (3N floats) + colors (3N floats),
+        # concatenated. Take just the first half = positions.
+        return arr[:half].reshape(-1, 3)
+    finally:
+        db.close()
+
+
+def _filter_waypoints_by_pointcloud(
+    waypoints,
+    cloud_xyz,  # np.ndarray shape (N, 3)
+    facades,
+    clearance_m: float,
+    *,
+    view_cone_half_angle_deg: float = 60.0,
+):
+    """Drop waypoints whose clearance ball contains non-target point-cloud points.
+
+    For inspection waypoints, points that fall inside a cone toward the
+    target facade (half-angle ``view_cone_half_angle_deg``) are treated as
+    the photo subject and ignored — otherwise the facade itself would
+    always reject its own inspection WPs. Anything *else* within
+    ``clearance_m`` (trees, wires, railings, adjacent buildings, etc.) is
+    a real obstacle and the WP is dropped.
+
+    Transit waypoints (no facade attachment) apply the full clearance
+    ball with no cone relief.
+
+    Returns ``(kept_waypoints, removed_count, removed_facade_indices)``.
+    """
+    import math as _m
+    import numpy as _np
+    from scipy.spatial import cKDTree  # type: ignore
+
+    if cloud_xyz is None or len(cloud_xyz) == 0 or not waypoints:
+        return list(waypoints), 0, []
+
+    tree = cKDTree(_np.asarray(cloud_xyz, dtype=_np.float64))
+    face_by_idx = {int(f.index): f for f in (facades or [])}
+    cos_thresh = _m.cos(_m.radians(view_cone_half_angle_deg))
+
+    kept = []
+    removed_facades: set[int] = set()
+    removed = 0
+
+    for wp in waypoints:
+        wp_pos = _np.array([wp.x, wp.y, wp.z], dtype=_np.float64)
+        neighbour_idx = tree.query_ball_point(wp_pos, r=clearance_m)
+        if not neighbour_idx:
+            kept.append(wp)
+            continue
+
+        view_dir = None
+        if not getattr(wp, "is_transition", False):
+            f = face_by_idx.get(int(getattr(wp, "facade_index", -1)))
+            if f is not None:
+                view_dir = -_np.asarray(f.normal, dtype=_np.float64)
+
+        is_obstacle = False
+        for idx in neighbour_idx:
+            pt = cloud_xyz[idx]
+            vec = pt - wp_pos
+            dist = float(_np.linalg.norm(vec))
+            if dist < 1e-6:
+                # WP sits on a cloud point — definitely unsafe.
+                is_obstacle = True
+                break
+            if view_dir is not None:
+                cos_a = float(_np.dot(vec / dist, view_dir))
+                if cos_a > cos_thresh:
+                    continue  # target-cone point, ignore
+            is_obstacle = True
+            break
+
+        if is_obstacle:
+            removed += 1
+            fi = getattr(wp, "facade_index", None)
+            if fi is not None and fi >= 0:
+                removed_facades.add(int(fi))
+        else:
+            kept.append(wp)
+
+    if removed:
+        print(
+            f"[kmz waypoints] point-cloud safety filter (clearance={clearance_m}m, "
+            f"cone={view_cone_half_angle_deg}°): {len(waypoints)} → {len(kept)} (-{removed})"
+        )
+    return kept, removed, sorted(removed_facades)
+
+
+def _derive_dji_mission_seeds(
+    mission_config_raw: dict | None,
+    enu_wps: list[dict] | None,
+    facades: list | None,
+) -> dict:
+    """Extract site-proven seed values from a parsed DJI KMZ.
+
+    Returns a flat dict suitable for spreading into ``mission_params``:
+    - ``front_overlap`` / ``side_overlap``: from ``orthoCameraOverlapW/H``
+      (DJI stores percentages, we convert to fraction).
+    - ``obstacle_clearance_m``: median perpendicular WP→nearest-facade
+      distance, with the top 10% dropped as transit outliers.
+    - ``dji_extracted`` sub-dict: same values plus the raw flight speed, for
+      UI display (“show what we got from the DJI flight”).
+    Keys are only present when successfully derived — callers can spread
+    unconditionally.
+    """
+    out: dict = {}
+    raw = mission_config_raw or {}
+
+    def _overlap(key: str):
+        try:
+            v = raw.get(key)
+            if v is None or v == "":
+                return None
+            f = float(v)
+            if f > 1.0:
+                f = f / 100.0
+            return max(0.0, min(0.99, f))
+        except (TypeError, ValueError):
+            return None
+
+    fo = _overlap("orthoCameraOverlapW")
+    so = _overlap("orthoCameraOverlapH")
+
+    def _fget(key: str):
+        try:
+            v = raw.get(key)
+            return float(v) if v not in (None, "") else None
+        except (TypeError, ValueError):
+            return None
+
+    dji_speed = _fget("autoFlightSpeed")
+
+    standoff: float | None = None
+    try:
+        import numpy as _np
+        if enu_wps and facades:
+            fc = _np.array([f.center for f in facades])
+            fn = _np.array([f.normal for f in facades])
+            wp_xyz = _np.array([[w["x"], w["y"], w["z"]] for w in enu_wps])
+            dxy = _np.linalg.norm(
+                wp_xyz[:, None, :2] - fc[None, :, :2], axis=2,
+            )
+            nearest = _np.argmin(dxy, axis=1)
+            perp = _np.abs(_np.einsum(
+                "ij,ij->i",
+                wp_xyz - fc[nearest],
+                fn[nearest],
+            ))
+            perp_sorted = _np.sort(perp)
+            cutoff = max(1, int(len(perp_sorted) * 0.9))
+            standoff = float(_np.median(perp_sorted[:cutoff]))
+            standoff = max(1.0, min(15.0, standoff))
+    except Exception:
+        standoff = None
+
+    if fo is not None:
+        out["front_overlap"] = fo
+    if so is not None:
+        out["side_overlap"] = so
+    if standoff is not None:
+        out["obstacle_clearance_m"] = standoff
+    out["dji_extracted"] = {
+        "front_overlap": fo,
+        "side_overlap": so,
+        "flight_speed_ms": dji_speed,
+        "observed_standoff_m": standoff,
+    }
+    return out
+
+
 def _tighten_clip_polygon(mission_polygon_enu, points_xyz):
     """Return the tightest polygon to clip the reconstructed mesh against.
 
@@ -1265,6 +1526,7 @@ async def import_kmz(
                 flight_speed_ms=_fget("autoFlightSpeed", 2.0),
                 mission_name=f"Imported: {parsed.name}",
             )
+            dji_seeds = _derive_dji_mission_seeds(raw_cfg, enu_wps, building.facades)
 
             # Summary (light — no validation; these are DJI-native waypoints)
             total_path_m = 0.0
@@ -1343,6 +1605,10 @@ async def import_kmz(
                     "camera": "wide",
                     "flight_speed_ms": config.flight_speed_ms,
                     "mission_name": config.mission_name,
+                    # DJI-proven site seeds (overlap fractions, observed
+                    # standoff) — the frontend uses them to seed the sidebar
+                    # when entering inspection mode.
+                    **dji_seeds,
                 },
                 building=building,
                 waypoints=waypoints,
@@ -1787,6 +2053,7 @@ def refine_kmz_building(building_id: str, req: RefineKmzRequest):
                     "target_gsd_mm_per_px": 2.0, "camera": "wide",
                     "flight_speed_ms": config.flight_speed_ms,
                     "mission_name": config.mission_name,
+                    **_derive_dji_mission_seeds(mission_cfg_raw, enu_wps, building.facades),
                 },
                 building=building, waypoints=waypoints, config=config,
                 summary=summary, viewer_data=viewer_data,
@@ -2393,13 +2660,74 @@ def generate(request: GenerateRequest):
         for z in request.exclusion_zones
     ]
 
+    # For KMZ-sourced buildings, pass the mapping polygon down so the
+    # per-facade grid generator can clamp standoff to keep WPs inside
+    # the DJI envelope rather than generating them at nominal standoff
+    # and then losing them to the polygon clip downstream.
+    gen_polygon_xy: list[tuple[float, float]] | None = None
+    if kmz_source_type is not None and kmz_mission_area_wgs84:
+        try:
+            from ..kmz_import import polygon_to_enu as _poly_to_enu_gen
+            poly_enu_gen = _poly_to_enu_gen(
+                kmz_mission_area_wgs84,
+                kmz_ref_lat, kmz_ref_lon, kmz_ref_alt,
+            )
+            gen_polygon_xy = [(float(x), float(y)) for x, y, *_ in poly_enu_gen]
+        except Exception:
+            gen_polygon_xy = None
+
     # Generate waypoints (pass mesh for LOS checks / surface sampling on mesh buildings)
     waypoints, generation_stats = generate_mission_waypoints(
         building, config, algo, mesh=mesh_obj,
         waypoint_strategy=request.waypoint_strategy,
         disabled_facades=request.disabled_facades,
         exclusion_zones=zones,
+        polygon_xy=gen_polygon_xy,
     )
+
+    # Two safety layers, applied in series on KMZ-sourced missions:
+    #
+    # 1. Polygon clip — keep inspection waypoints inside the DJI
+    #    `mission_area_wgs84` envelope. That polygon is what the pilot
+    #    already approved on-controller; straying outside it is a
+    #    planning hazard even when the space beyond is physically clear.
+    # 2. Raw-cloud obstacle filter — inside the polygon, drop any WP
+    #    whose clearance ball contains a non-target cloud point
+    #    (thin obstacles the alpha-wrap mesh smooths away: wires,
+    #    branches, fences, antennas).
+    #
+    # Transit WPs bypass the polygon clip — short slews across the edge
+    # are unavoidable when facades hug the boundary. They still get the
+    # cloud-obstacle check.
+    poly_clipped = 0
+    poly_clipped_facades: list[int] = []
+    pc_rejected = 0
+    pc_rejected_facades: list[int] = []
+    if kmz_source_type is not None:
+        if kmz_mission_area_wgs84:
+            waypoints, poly_clipped, poly_clipped_facades = _clip_waypoints_to_dji_bbox(
+                waypoints,
+                kmz_mission_area_wgs84,
+                kmz_ref_lat, kmz_ref_lon, kmz_ref_alt,
+            )
+            if poly_clipped:
+                generation_stats["mapping_polygon_clipped_waypoints"] = poly_clipped
+                generation_stats["mapping_polygon_clipped_facades"] = poly_clipped_facades
+
+        cloud_xyz = _load_kmz_pointcloud_xyz(request.building_id) if request.building_id else None
+        if cloud_xyz is not None and len(cloud_xyz) > 0:
+            waypoints, pc_rejected, pc_rejected_facades = _filter_waypoints_by_pointcloud(
+                waypoints, cloud_xyz, building.facades,
+                clearance_m=config.obstacle_clearance_m,
+            )
+            if pc_rejected:
+                generation_stats["pointcloud_rejected_waypoints"] = pc_rejected
+                generation_stats["pointcloud_rejected_facades"] = pc_rejected_facades
+
+        if poly_clipped or pc_rejected:
+            # Re-index so the downstream viewer + KMZ agree on per-wp indices.
+            for _i, _wp in enumerate(waypoints):
+                _wp.index = _i
 
     t_waypoints = time.perf_counter()
 
@@ -2501,11 +2829,33 @@ def generate(request: GenerateRequest):
     ]
     has_errors = any(v.severity == "error" for v in validation)
 
+    # Carry the DJI mapping polygon (from the imported KMZ's template.kml) into
+    # the custom-mission viewer payload so the "Mapping box" toggle keeps
+    # working after switching to inspection mode. Without this, the custom path
+    # loses the box even though the polygon is the same DJI-approved scope.
+    area_enu_for_view: list[tuple[float, float, float]] | None = None
+    area_latlon_for_view: list[tuple[float, float]] | None = None
+    if kmz_source_type is not None and kmz_mission_area_wgs84:
+        try:
+            from ..kmz_import import polygon_to_enu as _poly_to_enu_view
+            area_enu_for_view = _poly_to_enu_view(
+                kmz_mission_area_wgs84,
+                kmz_ref_lat, kmz_ref_lon, kmz_ref_alt,
+            )
+            area_latlon_for_view = [
+                (float(lat), float(lon))
+                for lon, lat, *_ in kmz_mission_area_wgs84
+            ]
+        except Exception:
+            area_enu_for_view = None
+            area_latlon_for_view = None
+
     # Prepare viewer data (include rejected facade candidates for manual enabling)
     from ..building_import import last_rejected_candidates
     threejs_data = prepare_threejs_data(
         building, waypoints,
         candidate_facades=last_rejected_candidates,
+        mission_area=area_enu_for_view,
     )
     if raw_mesh:
         # Forward the already-gzipped+base64 mesh blobs directly when present:
@@ -2525,7 +2875,10 @@ def generate(request: GenerateRequest):
 
     viewer_data = {
         "threejs": threejs_data,
-        "leaflet": prepare_leaflet_data(building, waypoints),
+        "leaflet": prepare_leaflet_data(
+            building, waypoints,
+            mission_area_poly=area_latlon_for_view,
+        ),
     }
 
     # Store version

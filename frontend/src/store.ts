@@ -395,8 +395,25 @@ export const useStore = create<AppState>()(persist((set, get) => ({
     // First-time entry to inspection mode seeds the NEN-2767 preset; afterwards
     // the current mission params (driven by the sidebar sliders) are used so
     // GSD/overlap/speed/camera changes actually re-render the path.
+    //
+    // When the current version was imported from a DJI KMZ, its
+    // config_snapshot.mission carries DJI-proven site seeds (overlap,
+    // observed standoff). Those override the preset defaults so the
+    // custom path starts from values the pilot already validated.
     const wasInspection = get().kmzMode === 'inspection';
-    const seedMission: MissionParams = wasInspection ? get().mission : { ...NEN2767_MISSION };
+    const djiSeeded = (current?.config_snapshot?.mission ?? {}) as Partial<MissionParams> & {
+      dji_extracted?: { observed_standoff_m?: number | null } | null;
+    };
+    const seedMission: MissionParams = wasInspection
+      ? get().mission
+      : {
+          ...NEN2767_MISSION,
+          ...(djiSeeded.front_overlap != null ? { front_overlap: djiSeeded.front_overlap } : {}),
+          ...(djiSeeded.side_overlap != null ? { side_overlap: djiSeeded.side_overlap } : {}),
+          ...(djiSeeded.obstacle_clearance_m != null
+            ? { obstacle_clearance_m: djiSeeded.obstacle_clearance_m }
+            : {}),
+        };
     const { building, algorithm, disabledFacades, enabledCandidates, exclusionZones } = get();
     set({ loading: true, mission: seedMission, kmzMode: 'inspection' });
     try {
@@ -595,7 +612,12 @@ export const useStore = create<AppState>()(persist((set, get) => ({
   setShowOriginalGimbals: (v: boolean) => set({ showOriginalGimbals: v }),
   showRosetteDiagnostic: false,
   setShowRosetteDiagnostic: (v: boolean) => set({ showRosetteDiagnostic: v }),
-  showMappingBox: false,
+  // Default on: the PolygonBoxView component already no-ops when there's no
+  // missionArea payload, so this only renders for KMZ-sourced buildings. In
+  // custom (inspection) mode the box is load-bearing — it shows the envelope
+  // the pilot must stay inside, and it's how you visually verify the new
+  // waypoints still respect the DJI-approved scope.
+  showMappingBox: true,
   setShowMappingBox: (v: boolean) => set({ showMappingBox: v }),
   cameraFovOverride: { fov_h_deg: null, fov_v_deg: null, distance_m: null },
   setCameraFovOverride: (patch) => set((s) => ({

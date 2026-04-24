@@ -253,17 +253,82 @@ def _generate_boustrophedon_grid(
     return points
 
 
+def _point_in_polygon_xy(x: float, y: float, poly: list[tuple[float, float]]) -> bool:
+    n = len(poly)
+    inside = False
+    j = n - 1
+    for i in range(n):
+        xi, yi = poly[i]
+        xj, yj = poly[j]
+        if ((yi > y) != (yj > y)) and x < (xj - xi) * (y - yi) / (yj - yi + 1e-12) + xi:
+            inside = not inside
+        j = i
+    return inside
+
+
+def _clamp_standoff_to_polygon(
+    facade: Facade,
+    requested_distance: float,
+    polygon_xy: list[tuple[float, float]],
+    *,
+    min_standoff: float,
+    buffer_m: float = 0.5,
+) -> float:
+    """Reduce facade standoff so the camera stays inside the DJI polygon.
+
+    Casts a ray from the facade centroid along the outward normal; finds
+    where it leaves the polygon; returns the largest safe standoff
+    (polygon exit distance minus buffer), bounded below by min_standoff.
+    If the centroid itself is already outside the polygon, returns the
+    original distance (the facade will be clipped upstream anyway).
+    """
+    cx, cy = float(facade.center[0]), float(facade.center[1])
+    nx, ny = float(facade.normal[0]), float(facade.normal[1])
+    horizontal_norm = (nx * nx + ny * ny) ** 0.5
+    if horizontal_norm < 1e-6:
+        return requested_distance  # roof/flat facade — normal has no XY
+    nx /= horizontal_norm
+    ny /= horizontal_norm
+
+    if not _point_in_polygon_xy(cx, cy, polygon_xy):
+        return requested_distance
+
+    # Step outward in 0.25m increments until we exit the polygon or hit
+    # the requested distance. O(requested_distance / 0.25) steps per
+    # facade — cheap.
+    step = 0.25
+    s = step
+    exit_at = requested_distance
+    while s <= requested_distance:
+        if not _point_in_polygon_xy(cx + nx * s, cy + ny * s, polygon_xy):
+            exit_at = s
+            break
+        s += step
+
+    clamped = max(min_standoff, exit_at - buffer_m)
+    return min(requested_distance, clamped)
+
+
 def generate_waypoints_for_facade(
     facade: Facade,
     config: MissionConfig,
     algo: AlgorithmConfig | None = None,
     mesh: object | None = None,
+    polygon_xy: list[tuple[float, float]] | None = None,
 ) -> list[Waypoint]:
     """Generate a grid of waypoints for a single facade.
 
     The grid is parallel to the facade plane, offset along the outward normal
     by the distance needed to achieve the target GSD. Waypoints are ordered
     in a boustrophedon (lawnmower) pattern.
+
+    ``polygon_xy`` — optional mapping-polygon XY vertices (ENU). When
+    supplied, the camera standoff for this facade is clamped so that a
+    ray from the facade centroid along its outward normal stops *inside*
+    the polygon: otherwise edge-hugging facades generate WPs that all
+    fall outside the DJI envelope and get clipped away, leaving the
+    facade uncovered. This accepts a tighter-than-nominal GSD for those
+    facades in exchange for keeping at least some coverage.
     """
     if algo is None:
         algo = AlgorithmConfig()
@@ -273,6 +338,19 @@ def generate_waypoints_for_facade(
 
     # Ensure minimum obstacle clearance
     distance = max(distance, config.obstacle_clearance_m)
+
+    # Polygon-edge clamp: if the nominal standoff would push the camera
+    # outside the DJI mapping polygon, shrink distance to the polygon
+    # boundary (minus a 0.5m buffer) so WPs stay inside. Only applies
+    # when the facade centroid is itself inside the polygon — if the
+    # facade sits outside the polygon, let the upstream polygon clip
+    # handle it rather than pulling the camera into the building.
+    if polygon_xy and len(polygon_xy) >= 3:
+        distance = _clamp_standoff_to_polygon(
+            facade, distance, polygon_xy,
+            min_standoff=max(config.min_photo_distance_m, config.obstacle_clearance_m),
+            buffer_m=0.5,
+        )
 
     footprint = compute_footprint(camera, distance)
     h_step, v_step = compute_grid_spacing(footprint, config.front_overlap, config.side_overlap)
@@ -329,15 +407,27 @@ def generate_waypoints_for_facade(
     u_min, u_max = float(u_coords.min()), float(u_coords.max())
     v_min, v_max = float(v_coords.min()), float(v_coords.max())
 
-    # Add small inset to avoid edge photos
-    inset = algo.facade_edge_inset_m
+    # Add small inset to avoid edge photos, but cap it at 25% of the
+    # smaller facade dimension so sub-metre facets (sills, parapets,
+    # dormer walls) don't get their entire extent insetted away.
+    raw_u = u_max - u_min
+    raw_v = v_max - v_min
+    inset = min(
+        algo.facade_edge_inset_m,
+        0.25 * raw_u,
+        0.25 * raw_v,
+    )
     u_min += inset
     u_max -= inset
     v_min += inset
     v_max -= inset
 
+    # Even after the adaptive inset, a degenerate facade (effectively 1D)
+    # should still contribute one photo — a single WP at its centroid is
+    # better than dropping coverage entirely.
     if u_max <= u_min or v_max <= v_min:
-        return []
+        u_min = u_max = 0.0
+        v_min = v_max = 0.0
 
     # Generate grid positions
     n_cols = max(1, int(math.ceil((u_max - u_min) / h_step)) + 1)
@@ -372,15 +462,22 @@ def generate_waypoints_for_facade(
     # Normal orientation is handled during facade extraction (centroid check +
     # fix_normals on mesh load). No additional check needed here.
 
-    # LOS sample offsets for multi-ray visibility check
+    # LOS sample offsets for multi-ray visibility check. Clamp the lateral
+    # reach to no more than 40% of the facade's extent so that small
+    # facets don't sample space outside their own surface — otherwise a
+    # narrow sill has its LOS rays landing in thin air next to it and
+    # reports itself as "not visible", and we lose coverage on walls
+    # smaller than the photo footprint.
     _los_samples = None
     if mesh is not None and algo.enable_waypoint_los:
+        los_u = min(h_step * 0.3, max(0.05, raw_u * 0.4))
+        los_v = min(v_step * 0.3, max(0.05, raw_v * 0.4))
         _los_samples = [
             np.zeros(3),
-            u_axis * h_step * 0.3,
-            -u_axis * h_step * 0.3,
-            v_axis * v_step * 0.3,
-            -v_axis * v_step * 0.3,
+            u_axis * los_u,
+            -u_axis * los_u,
+            v_axis * los_v,
+            -v_axis * los_v,
         ]
 
     waypoints = []
@@ -478,91 +575,6 @@ def generate_waypoints_for_facade(
             waypoints = [waypoints[i] for i in sorted(keep)]
 
     return waypoints
-
-
-def _make_transition_waypoint(
-    x: float, y: float, z: float,
-    heading_deg: float,
-    speed_ms: float,
-    min_altitude_m: float = MIN_ALTITUDE_M,
-) -> Waypoint:
-    """Create a transit waypoint (no photo, higher speed)."""
-    return Waypoint(
-        x=x, y=y, z=max(z, min_altitude_m),
-        heading_deg=heading_deg,
-        gimbal_pitch_deg=0.0,
-        speed_ms=speed_ms,
-        actions=[],
-        is_transition=True,
-    )
-
-
-def _generate_transition_waypoints(
-    prev_wp: Waypoint,
-    next_wp: Waypoint,
-    prev_facade: Facade,
-    next_facade: Facade,
-    clearance: float,
-    speed: float,
-    algo: AlgorithmConfig | None = None,
-) -> list[Waypoint]:
-    """Generate clearance waypoints for transitioning between facades.
-
-    Flies out from the last waypoint along the facade normal,
-    then approaches the next facade from outside. This prevents
-    the drone from flying through the building at corners.
-    """
-    import numpy as np
-
-    if algo is None:
-        algo = AlgorithmConfig()
-
-    # For transitions to/from roof, just go straight (already above building)
-    if abs(prev_facade.normal[2]) > algo.roof_normal_threshold or abs(next_facade.normal[2]) > algo.roof_normal_threshold:
-        return []
-
-    # Exit point: fly further out along prev facade normal
-    exit_pos = np.array([prev_wp.x, prev_wp.y, prev_wp.z])
-    exit_pos[:2] += prev_facade.normal[:2] * clearance
-
-    # Entry point: approach next facade from outside
-    entry_pos = np.array([next_wp.x, next_wp.y, next_wp.z])
-    entry_pos[:2] += next_facade.normal[:2] * clearance
-
-    # Use a safe altitude for transition (highest of exit/entry + margin)
-    transit_z = max(exit_pos[2], entry_pos[2], prev_wp.z, next_wp.z) + algo.transition_altitude_margin_m
-
-    transition_wps = []
-
-    # Exit waypoint: pull out from facade
-    transition_wps.append(_make_transition_waypoint(
-        float(exit_pos[0]), float(exit_pos[1]), transit_z,
-        prev_wp.heading_deg, speed, algo.min_altitude_m,
-    ))
-
-    # Corner waypoint (if exit and entry are far apart)
-    dist = np.linalg.norm(exit_pos[:2] - entry_pos[:2])
-    if dist > clearance:
-        # Add a midpoint at the corner to avoid clipping
-        mid = (exit_pos + entry_pos) / 2
-        # Push the midpoint outward from building center
-        mid_dir = mid[:2].copy()
-        mid_norm = np.linalg.norm(mid_dir)
-        if mid_norm > 0.1:
-            mid_dir /= mid_norm
-            mid[:2] += mid_dir * clearance * 0.5
-        transition_wps.append(_make_transition_waypoint(
-            float(mid[0]), float(mid[1]), transit_z,
-            next_wp.heading_deg, speed, algo.min_altitude_m,
-        ))
-
-    # Entry waypoint: approach next facade
-    transition_wps.append(_make_transition_waypoint(
-        float(entry_pos[0]), float(entry_pos[1]), transit_z,
-        next_wp.heading_deg, speed, algo.min_altitude_m,
-    ))
-
-    return transition_wps
 
 
 def _nearest_neighbor_order(groups: list[list[Waypoint]]) -> list[list[Waypoint]]:
@@ -1022,6 +1034,7 @@ def generate_mission_waypoints(
     waypoint_strategy: str = "facade_grid",
     disabled_facades: list[int] | None = None,
     exclusion_zones: list[ExclusionZone] | None = None,
+    polygon_xy: list[tuple[float, float]] | None = None,
 ) -> tuple[list[Waypoint], dict]:
     """Generate all waypoints for a building inspection mission.
 
@@ -1057,7 +1070,9 @@ def generate_mission_waypoints(
         for facade in building.facades:
             if facade.index in disabled_set:
                 continue
-            facade_wps = generate_waypoints_for_facade(facade, config, algo, mesh=mesh)
+            facade_wps = generate_waypoints_for_facade(
+                facade, config, algo, mesh=mesh, polygon_xy=polygon_xy,
+            )
             before = len(facade_wps)
             total_before_dedup += before
             if facade_wps:
@@ -1082,27 +1097,16 @@ def generate_mission_waypoints(
         tsp_method=algo.tsp_method,
     )
 
-    # Insert transition waypoints between facade groups to prevent
-    # building-corner collisions. Each transition pulls out along the
-    # previous facade normal, optionally adds a corner clearance point,
-    # then approaches the next facade from outside.
+    # Concatenate facade groups into a single trajectory. Inter-facade transits
+    # are flown as direct lines: the path-segment collision pass below
+    # (_check_path_collisions / _resolve_path_collision) only inserts detour
+    # waypoints when the straight segment actually intersects the mesh.
+    # Unconditionally routing outward+up between every facade produced long
+    # zig-zags that frequently left the DJI mapping polygon and added transit
+    # without any safety benefit when the direct line was already clear.
     all_waypoints: list[Waypoint] = []
-    facade_lookup = {f.index: f for f in building.facades}
-    for gi, group in enumerate(facade_groups):
+    for group in facade_groups:
         all_waypoints.extend(group)
-        if gi < len(facade_groups) - 1:
-            next_group = facade_groups[gi + 1]
-            prev_facade = facade_lookup.get(group[-1].facade_index)
-            next_facade = facade_lookup.get(next_group[0].facade_index)
-            if prev_facade is not None and next_facade is not None:
-                trans = _generate_transition_waypoints(
-                    group[-1], next_group[0],
-                    prev_facade, next_facade,
-                    clearance=config.obstacle_clearance_m,
-                    speed=config.flight_speed_ms,
-                    algo=algo,
-                )
-                all_waypoints.extend(trans)
 
     # Filter waypoints inside exclusion zones
     zone_removed = 0
