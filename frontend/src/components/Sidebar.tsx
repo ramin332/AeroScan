@@ -500,11 +500,11 @@ export function Sidebar() {
           </select>
         </div>
         <SliderField label="Front overlap" value={mission.front_overlap}
-          min={0.6} max={0.95} step={0.05}
+          min={0.4} max={0.95} step={0.05}
           format={(v) => `${Math.round(v * 100)}%`}
           onChange={(v) => setMission({ front_overlap: v })} onCommit={autoGen} />
         <SliderField label="Side overlap" value={mission.side_overlap}
-          min={0.5} max={0.9} step={0.05}
+          min={0.3} max={0.9} step={0.05}
           format={(v) => `${Math.round(v * 100)}%`}
           onChange={(v) => setMission({ side_overlap: v })} onCommit={autoGen} />
       </Section>

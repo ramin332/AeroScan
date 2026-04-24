@@ -562,8 +562,8 @@ class BuildingParams(BaseModel):
 class MissionParams(BaseModel):
     target_gsd_mm_per_px: float = Field(2.0, ge=0.5, le=10.0)
     camera: Literal["wide", "medium_tele", "telephoto"] = "wide"
-    front_overlap: float = Field(0.80, ge=0.0, le=0.95)
-    side_overlap: float = Field(0.70, ge=0.0, le=0.95)
+    front_overlap: float = Field(0.60, ge=0.0, le=0.95)
+    side_overlap: float = Field(0.50, ge=0.0, le=0.95)
     flight_speed_ms: float = Field(2.0, ge=0.5, le=5.0)
     obstacle_clearance_m: float = Field(2.0, ge=1.0, le=20.0)
     mission_name: str = "AeroScan Inspection"

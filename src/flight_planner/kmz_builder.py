@@ -47,39 +47,45 @@ from .models import (
 )
 
 # ---------------------------------------------------------------------------
-# Register Matrice 4E in djikmz (library only knows M3E/M3D/M30/M300/M350).
-# PROVISIONAL: droneEnumValue unknown — using M3E values [77, 0] as stand-in.
-# DJI Pilot 2 validates against the connected drone at runtime, not at KMZ
-# import, so the mission will still load. To discover real values: create a
-# mission in DJI Pilot 2 on an M4E, export the KMZ, and inspect template.kml
-# for droneEnumValue / payloadEnumValue.
+# M4E drone / payload enum values — PROVISIONAL until confirmed against a
+# DJI-exported M4E mission. To discover the real values: create a mission in
+# DJI Pilot 2 with an M4E connected, export the KMZ, then run:
+#   python -m flight_planner.tools.inspect_kmz <exported.kmz> --patch
+# That tool prints the discovered values and rewrites these constants.
 # ---------------------------------------------------------------------------
-_M4E_DRONE_ENUM = 77  # PROVISIONAL (same as M3E)
-_M4E_DRONE_SUB_ENUM = 0  # PROVISIONAL
+M4E_DRONE_ENUM = 77       # PROVISIONAL — same as M3E
+M4E_DRONE_SUB_ENUM = 0    # PROVISIONAL
+M4E_PAYLOAD_ENUM = 66     # PROVISIONAL — same as M3E payload
+M4E_PAYLOAD_SUB_ENUM = 0  # PROVISIONAL
 
-# Extend DroneModel str enum at runtime
+# Register Matrice 4E in djikmz (library only ships M3E/M3D/M30/M300/M350).
+# djikmz's emitted enum values get overwritten in post-processing by
+# _inject_m4e_enums so these seed values are only a placeholder for the
+# library's internal validation.
 _m4e_member = str.__new__(DroneModel, "M4E")
 _m4e_member._name_ = "M4E"
 _m4e_member._value_ = "M4E"
 DroneModel._member_map_["M4E"] = _m4e_member
 DroneModel._value2member_map_["M4E"] = _m4e_member
 
-MODEL_TO_VAL[_m4e_member] = [_M4E_DRONE_ENUM, _M4E_DRONE_SUB_ENUM]
+MODEL_TO_VAL[_m4e_member] = [M4E_DRONE_ENUM, M4E_DRONE_SUB_ENUM]
 
 DRONE_CONFIGS["M4E"] = {
     "model": _m4e_member,
     "default_height": 80.0,
-    "default_speed": 2.0,  # inspection speed
-    "max_speed": 21.0,  # M4E hardware max (M3E was 15)
-    "supports_rtk": True,  # M4E has RTK
+    "default_speed": 2.0,
+    "max_speed": 21.0,
+    "supports_rtk": True,
     "takeoff_security_height": 5.0,
-    "default_payload": PayloadModel.M3E,  # PROVISIONAL (66)
+    "default_payload": PayloadModel.M3E,
 }
 
 _DEFAULT_DRONE_MODEL = "M4E"
 
-# WPML XML namespace
-_WPML_NS = "http://www.dji.com/wpmz/1.0.3"
+# WPML XML namespace — 1.0.6 matches what DJI Pilot 2 emits on current firmware.
+# djikmz internally writes 1.0.3; _rewrite_wpml_version bumps the output.
+_WPML_NS_LEGACY = "http://www.dji.com/wpmz/1.0.3"
+_WPML_NS = "http://www.dji.com/wpmz/1.0.6"
 _KML_NS = "http://www.opengis.net/kml/2.2"
 
 
@@ -175,6 +181,63 @@ def _build_mission(
 # XML post-processing: inject WPML elements that djikmz doesn't generate
 # ---------------------------------------------------------------------------
 
+
+def _rewrite_wpml_version(xml_str: str) -> str:
+    """Bump djikmz's emitted WPML namespace to the current spec version."""
+    return xml_str.replace(_WPML_NS_LEGACY, _WPML_NS)
+
+
+def _inject_m4e_enums(root: ET.Element) -> None:
+    """Force authoritative M4E drone/payload enum values into droneInfo + payloadInfo.
+
+    djikmz emits values based on its own enum table (derived from M3E). We
+    overwrite them here so the output matches what DJI Pilot 2 expects for an
+    M4E. Also emits payloadSubEnumValue, which djikmz omits.
+    """
+    for drone_info in root.iter(f"{{{_WPML_NS}}}droneInfo"):
+        for tag_name, value in (
+            ("droneEnumValue", M4E_DRONE_ENUM),
+            ("droneSubEnumValue", M4E_DRONE_SUB_ENUM),
+        ):
+            el = drone_info.find(f"{{{_WPML_NS}}}{tag_name}")
+            if el is None:
+                el = ET.SubElement(drone_info, f"{{{_WPML_NS}}}{tag_name}")
+            el.text = str(value)
+
+    for payload_info in root.iter(f"{{{_WPML_NS}}}payloadInfo"):
+        for tag_name, value in (
+            ("payloadEnumValue", M4E_PAYLOAD_ENUM),
+            ("payloadSubEnumValue", M4E_PAYLOAD_SUB_ENUM),
+        ):
+            el = payload_info.find(f"{{{_WPML_NS}}}{tag_name}")
+            if el is None:
+                el = ET.SubElement(payload_info, f"{{{_WPML_NS}}}{tag_name}")
+            el.text = str(value)
+
+
+def _path_distance_m(waypoints: list[Waypoint]) -> float:
+    """Total 3D path length through the waypoints, in metres (ENU frame)."""
+    total = 0.0
+    for i in range(1, len(waypoints)):
+        a, b = waypoints[i - 1], waypoints[i]
+        total += math.sqrt(
+            (b.x - a.x) ** 2 + (b.y - a.y) ** 2 + (b.z - a.z) ** 2
+        )
+    return total
+
+
+def _estimate_duration_s(waypoints: list[Waypoint], config: MissionConfig) -> float:
+    """Rough flight-time estimate: cruise time + per-waypoint action overhead.
+
+    DJI decelerates at turns and pauses for photo actions, so this is an
+    approximation — good enough for the wpml:duration display field.
+    """
+    dist = _path_distance_m(waypoints)
+    speed = max(config.flight_speed_ms, 0.1)
+    per_wp_overhead = 0.5
+    return dist / speed + len(waypoints) * per_wp_overhead
+
+
 def _inject_template_elements(root: ET.Element, config: MissionConfig) -> None:
     """Inject missing required WPML elements into template.kml DOM."""
     ns = {"wpml": _WPML_NS, "kml": _KML_NS}
@@ -195,8 +258,63 @@ def _inject_template_elements(root: ET.Element, config: MissionConfig) -> None:
         el = ET.SubElement(mission_config, f"{{{_WPML_NS}}}globalTransitionalSpeed")
         el.text = str(config.flight_speed_ms)
 
+    # waylineAvoidLimitAreaMode — controls geofence avoidance behaviour.
+    # 0 = do not avoid (default in DJI-exported KMZs).
+    if mission_config.find(f"{{{_WPML_NS}}}waylineAvoidLimitAreaMode") is None:
+        el = ET.SubElement(
+            mission_config, f"{{{_WPML_NS}}}waylineAvoidLimitAreaMode"
+        )
+        el.text = "0"
 
-def _generate_waylines_wpml(template_root: ET.Element, config: MissionConfig) -> ET.Element:
+
+def _build_start_action_group(initial_pitch_deg: float) -> ET.Element:
+    """Build the <wpml:startActionGroup> that primes the camera before flight.
+
+    Mirrors DJI-exported waylines: rotate gimbal to the first waypoint's pitch,
+    short hover to let the gimbal settle, then switch camera to manual focus.
+    """
+    group = ET.Element(f"{{{_WPML_NS}}}startActionGroup")
+
+    a0 = ET.SubElement(group, f"{{{_WPML_NS}}}action")
+    ET.SubElement(a0, f"{{{_WPML_NS}}}actionId").text = "0"
+    ET.SubElement(a0, f"{{{_WPML_NS}}}actionActuatorFunc").text = "gimbalRotate"
+    p0 = ET.SubElement(a0, f"{{{_WPML_NS}}}actionActuatorFuncParam")
+    for tag, val in (
+        ("gimbalHeadingYawBase", "aircraft"),
+        ("gimbalRotateMode", "absoluteAngle"),
+        ("gimbalPitchRotateEnable", "1"),
+        ("gimbalPitchRotateAngle", f"{_clamp_pitch(initial_pitch_deg):g}"),
+        ("gimbalRollRotateEnable", "0"),
+        ("gimbalRollRotateAngle", "0"),
+        ("gimbalYawRotateEnable", "1"),
+        ("gimbalYawRotateAngle", "0"),
+        ("gimbalRotateTimeEnable", "0"),
+        ("gimbalRotateTime", "10"),
+        ("payloadPositionIndex", "0"),
+    ):
+        ET.SubElement(p0, f"{{{_WPML_NS}}}{tag}").text = val
+
+    a1 = ET.SubElement(group, f"{{{_WPML_NS}}}action")
+    ET.SubElement(a1, f"{{{_WPML_NS}}}actionId").text = "1"
+    ET.SubElement(a1, f"{{{_WPML_NS}}}actionActuatorFunc").text = "hover"
+    p1 = ET.SubElement(a1, f"{{{_WPML_NS}}}actionActuatorFuncParam")
+    ET.SubElement(p1, f"{{{_WPML_NS}}}hoverTime").text = "0.5"
+
+    a2 = ET.SubElement(group, f"{{{_WPML_NS}}}action")
+    ET.SubElement(a2, f"{{{_WPML_NS}}}actionId").text = "2"
+    ET.SubElement(a2, f"{{{_WPML_NS}}}actionActuatorFunc").text = "setFocusType"
+    p2 = ET.SubElement(a2, f"{{{_WPML_NS}}}actionActuatorFuncParam")
+    ET.SubElement(p2, f"{{{_WPML_NS}}}cameraFocusType").text = "manual"
+    ET.SubElement(p2, f"{{{_WPML_NS}}}payloadPositionIndex").text = "0"
+
+    return group
+
+
+def _generate_waylines_wpml(
+    template_root: ET.Element,
+    config: MissionConfig,
+    waypoints: list[Waypoint],
+) -> ET.Element:
     """Generate waylines.wpml DOM from template.kml DOM.
 
     waylines.wpml is the execution file — what the flight controller actually
@@ -220,6 +338,10 @@ def _generate_waylines_wpml(template_root: ET.Element, config: MissionConfig) ->
             el = ET.SubElement(mission_config, f"{{{_WPML_NS}}}globalRTHHeight")
             el.text = str(config.takeoff_security_height_m)
 
+    initial_pitch = waypoints[0].gimbal_pitch_deg if waypoints else 0.0
+    total_distance = _path_distance_m(waypoints)
+    total_duration = _estimate_duration_s(waypoints, config)
+
     # Process each Folder (wayline) — Folder is in default KML namespace
     for folder in doc.findall(f"{{{_KML_NS}}}Folder"):
         # Add waylineId (required in waylines.wpml)
@@ -231,6 +353,18 @@ def _generate_waylines_wpml(template_root: ET.Element, config: MissionConfig) ->
         if folder.find(f"{{{_WPML_NS}}}executeHeightMode") is None:
             el = ET.SubElement(folder, f"{{{_WPML_NS}}}executeHeightMode")
             el.text = "relativeToStartPoint"
+
+        # Distance + duration metadata (shown in DJI Pilot 2 mission summary)
+        if folder.find(f"{{{_WPML_NS}}}distance") is None:
+            el = ET.SubElement(folder, f"{{{_WPML_NS}}}distance")
+            el.text = f"{total_distance:.3f}"
+        if folder.find(f"{{{_WPML_NS}}}duration") is None:
+            el = ET.SubElement(folder, f"{{{_WPML_NS}}}duration")
+            el.text = f"{total_duration:.3f}"
+
+        # startActionGroup — prime gimbal + camera focus before first waypoint
+        if folder.find(f"{{{_WPML_NS}}}startActionGroup") is None:
+            folder.append(_build_start_action_group(initial_pitch))
 
         # Process each waypoint Placemark (also in KML namespace)
         for placemark in folder.findall(f"{{{_KML_NS}}}Placemark"):
@@ -260,7 +394,7 @@ def _build_kmz_zip(
     """Build a complete KMZ (ZIP) with both template.kml and waylines.wpml."""
     mission = _build_mission(waypoints, config, algo)
     kml = mission.build()
-    template_xml_str = kml.to_xml()
+    template_xml_str = _rewrite_wpml_version(kml.to_xml())
 
     # Register namespaces so ET doesn't mangle prefixes
     ET.register_namespace("", _KML_NS)
@@ -269,10 +403,12 @@ def _build_kmz_zip(
     # Parse and inject missing required elements into template.kml
     template_root = ET.fromstring(template_xml_str)
     _inject_template_elements(template_root, config)
+    _inject_m4e_enums(template_root)
     template_xml = ET.tostring(template_root, encoding="unicode", xml_declaration=True)
 
     # Generate waylines.wpml from the (already-patched) template
-    waylines_root = _generate_waylines_wpml(template_root, config)
+    waylines_root = _generate_waylines_wpml(template_root, config, waypoints)
+    _inject_m4e_enums(waylines_root)
     waylines_xml = ET.tostring(waylines_root, encoding="unicode", xml_declaration=True)
 
     # Write both files to ZIP

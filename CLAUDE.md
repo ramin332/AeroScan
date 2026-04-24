@@ -220,3 +220,13 @@ If a user reports "this photo looks straight up but the KMZ doesn't say so," the
 1. Read the JPEG XMP, not the WPML — XMP has the truth
 2. If XMP confirms a pitch outside the rosette spec, DJI's runtime is overriding the mission (e.g. autonomous calibration shots, gimbal overshoot during slew). The WPML alone cannot model this.
 3. The frontend's `OriginalGimbalArrows` / `RosetteDiagnostic` (`Viewer3D.tsx`) renders mission-intent poses from `waypoint.smart_oblique_poses`. Visualizing actual capture orientation would require ingesting the photos' XMP — not currently implemented.
+
+## KMZ Execution Transport (Pilot 2 / PSDK / Manifold)
+
+AeroScan is the **authoring surface**: building geometry in, WPML-compliant KMZ out. The KMZ then needs an **execution transport** to reach the Matrice 4E. See `docs/architecture/kmz-flow.md` for the full writeup; the constraints that drive the current and future architectures:
+
+- **Today's path is manual SD-card sideload** into Pilot 2's mission library. Zero PSDK, works today, is what `kmz_builder.py` targets. Don't assume anything beyond this is in place.
+- **There is no PSDK API to inject a KMZ into Pilot 2's mission library.** User-facing library import is SD-card only. MOP (`dji_mop_channel.h`) is a PSDK↔MSDK/OSDK peer channel, not a Pilot 2 back-channel.
+- **PSDK Custom Widgets are live-link only** — they render on Pilot 2's live-flight view while the aircraft is powered and linked, and are not visible from the pre-flight mission library screen.
+- **The DJI-sanctioned on-drone automation path is Manifold + PSDK**: `DjiWaypointV3_UploadKmzFile(bytes, len)` uploads the KMZ directly to the aircraft, `DjiWaypointV3_Action(START|STOP|PAUSE|RESUME)` controls execution, and a Custom Widget on Pilot 2's live view gives the pilot a tap-to-fly button. Reference sample: `samples/sample_c/module_sample/waypoint_v3/` in the PSDK source. In this shape Pilot 2 is the monitoring surface, not the mission chooser — the pilot does not browse the KMZ from the library.
+- **Smart 3D Capture / Explore's output is not known to be an interceptable KMZ.** DJI's public docs describe Smart 3D as a single end-to-end automated mission (first-pass sparse cloud → on-RC facade route → autonomous flight) and do not document any KMZ export step. Any "Smart3D-first" architecture is gated on a device test confirming an accessible `.kmz` / `.wpml` on the RC or aircraft filesystem after a Smart 3D run. Until that test runs, the source-of-KMZ story stays AeroScan-first; `kmz_import.py` already accepts a Smart3D KMZ containing a *point cloud* as planner input, which is a distinct (and verified) path.

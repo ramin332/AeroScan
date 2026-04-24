@@ -18,8 +18,8 @@ export const DEFAULT_BUILDING: BuildingParams = {
 export const DEFAULT_MISSION: MissionParams = {
   target_gsd_mm_per_px: 2.0,
   camera: 'wide',
-  front_overlap: 0.80,
-  side_overlap: 0.70,
+  front_overlap: 0.60,
+  side_overlap: 0.50,
   flight_speed_ms: 2.0,
   obstacle_clearance_m: 2.0,
   mission_name: 'AeroScan Inspection',

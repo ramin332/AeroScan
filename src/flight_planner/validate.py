@@ -184,9 +184,9 @@ def validate_mission(
 
     if est_time_min > MAX_FLIGHT_TIME_WITH_MANIFOLD_MIN:
         issues.append(ValidationIssue(
-            severity=Severity.ERROR,
+            severity=Severity.WARNING,
             code="exceeds_flight_time",
-            message=f"Estimated flight time {est_time_min:.0f}min exceeds battery limit ({MAX_FLIGHT_TIME_WITH_MANIFOLD_MIN}min)",
+            message=f"Estimated flight time {est_time_min:.0f}min exceeds battery limit ({MAX_FLIGHT_TIME_WITH_MANIFOLD_MIN}min) — plan battery swaps or split into sorties",
         ))
     elif est_time_min > MAX_FLIGHT_TIME_WITH_MANIFOLD_MIN * algo.battery_warning_threshold:
         issues.append(ValidationIssue(
@@ -245,7 +245,7 @@ def validate_mission(
     path_unresolved = stats.get("path_collisions_unresolved", 0)
     if path_unresolved > 0:
         issues.append(ValidationIssue(
-            severity=Severity.ERROR,
+            severity=Severity.WARNING,
             code="path_collision",
             message=f"{path_unresolved} flight path segment(s) clip through the building — increase clearance or adjust waypoints",
         ))

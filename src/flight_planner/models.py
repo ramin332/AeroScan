@@ -427,9 +427,12 @@ class MissionConfig:
     # Camera to use
     camera: CameraName = CameraName.WIDE
 
-    # Photo overlap
-    front_overlap: float = 0.80  # 80%
-    side_overlap: float = 0.70  # 70%
+    # Photo overlap — inspection-grade defaults. 60/50 tiles photos with enough
+    # redundancy for NEN-2767 defect measurement while keeping flight time on
+    # a single battery. Raise (e.g. 0.80/0.70) for dense photogrammetric
+    # reconstruction; lower won't leave gaps but offers no SfM redundancy.
+    front_overlap: float = 0.60
+    side_overlap: float = 0.50
 
     # Flight parameters
     flight_speed_ms: float = INSPECTION_SPEED_MS
@@ -437,11 +440,6 @@ class MissionConfig:
 
     # Mission metadata
     mission_name: str = "AeroScan Inspection"
-
-    # Drone enum value — PROVISIONAL: using M3E values until DJI publishes M4E-specific
-    # WPML enum. DJI Pilot 2 validates against the connected drone at runtime.
-    drone_enum_value: int = 77  # PROVISIONAL (M3E=77, M4E TBD)
-    payload_enum_value: int = 66  # PROVISIONAL (M3E integrated camera=66)
 
     # Detail capture: take telephoto photos at flagged points
     enable_detail_capture: bool = False

@@ -53,8 +53,8 @@ def compute_footprint(camera: CameraSpec, distance_m: float) -> PhotoFootprint:
 
 def compute_grid_spacing(
     footprint: PhotoFootprint,
-    front_overlap: float = 0.80,
-    side_overlap: float = 0.70,
+    front_overlap: float = 0.60,
+    side_overlap: float = 0.50,
 ) -> tuple[float, float]:
     """Compute waypoint grid spacing from footprint and overlap requirements.
 

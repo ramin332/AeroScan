@@ -148,7 +148,7 @@ class TestKMZSafetyDefaults:
         """Every waypoint height should be >= 2m (MIN_ALTITUDE_M)."""
         xml = _extract_kml_xml()
         root = ET.fromstring(xml)
-        ns = "http://www.dji.com/wpmz/1.0.3"
+        ns = "http://www.dji.com/wpmz/1.0.6"
         for height_el in root.iter(f"{{{ns}}}height"):
             h = float(height_el.text)
             assert h >= 2.0, f"Waypoint height {h}m is below minimum 2.0m"
@@ -191,7 +191,7 @@ class TestM4ECompatibility:
         assert "droneEnumValue" in xml
 
 
-_WPML_NS = "http://www.dji.com/wpmz/1.0.3"
+_WPML_NS = "http://www.dji.com/wpmz/1.0.6"
 _KML_NS = "http://www.opengis.net/kml/2.2"
 
 
@@ -303,3 +303,114 @@ class TestGimbalYaw:
             xml = zf.read("wpmz/template.kml").decode("utf-8")
         assert "gimbalYawRotateEnable" in xml
         assert "90" in xml
+
+
+class TestWPML106Compliance:
+    """Structural features aligned with DJI Pilot 2's 1.0.6 exports."""
+
+    def test_wpml_namespace_is_106(self):
+        """Both template.kml and waylines.wpml declare the 1.0.6 namespace."""
+        tpl = _extract_kml_xml()
+        wpml = _extract_wpml_xml()
+        assert "wpmz/1.0.6" in tpl
+        assert "wpmz/1.0.6" in wpml
+        assert "wpmz/1.0.3" not in tpl
+        assert "wpmz/1.0.3" not in wpml
+
+    def test_m4e_enum_values_injected(self):
+        """Drone + payload enums match M4E_* constants, and payloadSubEnumValue is emitted."""
+        from flight_planner.kmz_builder import (
+            M4E_DRONE_ENUM,
+            M4E_DRONE_SUB_ENUM,
+            M4E_PAYLOAD_ENUM,
+            M4E_PAYLOAD_SUB_ENUM,
+        )
+
+        xml = _extract_kml_xml()
+        root = ET.fromstring(xml)
+        drone_info = root.find(f".//{{{_WPML_NS}}}droneInfo")
+        assert drone_info is not None
+        assert drone_info.find(f"{{{_WPML_NS}}}droneEnumValue").text == str(M4E_DRONE_ENUM)
+        assert (
+            drone_info.find(f"{{{_WPML_NS}}}droneSubEnumValue").text
+            == str(M4E_DRONE_SUB_ENUM)
+        )
+
+        payload_info = root.find(f".//{{{_WPML_NS}}}payloadInfo")
+        assert payload_info is not None
+        assert (
+            payload_info.find(f"{{{_WPML_NS}}}payloadEnumValue").text
+            == str(M4E_PAYLOAD_ENUM)
+        )
+        sub_el = payload_info.find(f"{{{_WPML_NS}}}payloadSubEnumValue")
+        assert sub_el is not None, "payloadSubEnumValue must be emitted"
+        assert sub_el.text == str(M4E_PAYLOAD_SUB_ENUM)
+
+    def test_wayline_avoid_limit_area_mode(self):
+        """missionConfig must carry waylineAvoidLimitAreaMode=0."""
+        xml = _extract_kml_xml()
+        root = ET.fromstring(xml)
+        el = root.find(f".//{{{_WPML_NS}}}waylineAvoidLimitAreaMode")
+        assert el is not None
+        assert el.text == "0"
+
+    def test_waylines_has_start_action_group(self):
+        """Each Folder in waylines.wpml has <wpml:startActionGroup> with gimbal + hover + focus."""
+        xml = _extract_wpml_xml()
+        root = ET.fromstring(xml)
+        folders = root.findall(f".//{{{_KML_NS}}}Folder")
+        assert folders, "expected at least one Folder"
+        for folder in folders:
+            group = folder.find(f"{{{_WPML_NS}}}startActionGroup")
+            assert group is not None, "Folder missing startActionGroup"
+            funcs = [
+                f.text for f in group.findall(f".//{{{_WPML_NS}}}actionActuatorFunc")
+            ]
+            assert funcs == ["gimbalRotate", "hover", "setFocusType"], funcs
+
+    def test_start_action_uses_first_waypoint_pitch(self):
+        """Initial gimbalRotate pitch should match the first waypoint's gimbal pitch."""
+        wps = _make_test_waypoints(3)
+        wps[0].gimbal_pitch_deg = -42.0
+        data = build_kmz_bytes(wps, MissionConfig())
+        with zipfile.ZipFile(io.BytesIO(data)) as zf:
+            wpml = zf.read("wpmz/waylines.wpml").decode("utf-8")
+        root = ET.fromstring(wpml)
+        pitch_el = root.find(
+            f".//{{{_WPML_NS}}}startActionGroup"
+            f"//{{{_WPML_NS}}}gimbalPitchRotateAngle"
+        )
+        assert pitch_el is not None
+        assert float(pitch_el.text) == -42.0
+
+    def test_waylines_has_distance_and_duration(self):
+        """Each Folder carries distance + duration metadata."""
+        xml = _extract_wpml_xml()
+        root = ET.fromstring(xml)
+        for folder in root.findall(f".//{{{_KML_NS}}}Folder"):
+            dist = folder.find(f"{{{_WPML_NS}}}distance")
+            dur = folder.find(f"{{{_WPML_NS}}}duration")
+            assert dist is not None, "missing distance"
+            assert dur is not None, "missing duration"
+            assert float(dist.text) > 0
+            assert float(dur.text) > 0
+
+    def test_distance_matches_path_length(self):
+        """Emitted distance should equal summed 3D segment lengths through the waypoints."""
+        import math
+        wps = _make_test_waypoints(5)
+        expected = sum(
+            math.sqrt(
+                (wps[i].x - wps[i - 1].x) ** 2
+                + (wps[i].y - wps[i - 1].y) ** 2
+                + (wps[i].z - wps[i - 1].z) ** 2
+            )
+            for i in range(1, len(wps))
+        )
+        data = build_kmz_bytes(wps, MissionConfig())
+        with zipfile.ZipFile(io.BytesIO(data)) as zf:
+            wpml = zf.read("wpmz/waylines.wpml").decode("utf-8")
+        root = ET.fromstring(wpml)
+        dist_el = root.find(f".//{{{_WPML_NS}}}distance")
+        assert dist_el is not None
+        assert abs(float(dist_el.text) - expected) < 0.01
