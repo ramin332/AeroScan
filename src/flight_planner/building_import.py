@@ -473,6 +473,57 @@ def _extract_region_growing(
                 rejected.append(facade)
                 reject_idx += 1
 
+    # Envelope post-filter: drop facades whose outward-probe point lies
+    # INSIDE the mesh envelope. On L/U-shaped or courtyarded buildings the
+    # single-centroid "outward" heuristic used above flips normals the
+    # wrong way for facets in concavities — those facets get a normal
+    # pointing *into* the mesh, and a probe 1m along that normal ends up
+    # inside.
+    #
+    # We use Open3D ray-parity (RaycastingScene.count_intersections) rather
+    # than trimesh.mesh.contains: photogrammetry meshes often fail trimesh's
+    # watertight check (stray open edges at chimneys/overhangs) even when
+    # the alpha-wrap is effectively closed, and ray-parity gives the right
+    # answer anyway. It's the same technique already used for WP mesh
+    # containment in geometry._points_inside_mesh.
+    try:
+        if facades:
+            import open3d as _o3d
+            probes = np.array(
+                [f.center + f.normal * 1.0 for f in facades],
+                dtype=np.float32,
+            )
+            scene = _o3d.t.geometry.RaycastingScene()
+            scene.add_triangles(
+                _o3d.core.Tensor(_vertices.astype(np.float32), dtype=_o3d.core.float32),
+                _o3d.core.Tensor(_faces.astype(np.uint32), dtype=_o3d.core.uint32),
+            )
+            rays = np.zeros((len(probes), 6), dtype=np.float32)
+            rays[:, :3] = probes
+            rays[:, 3] = 1.0  # +X direction
+            counts = scene.count_intersections(
+                _o3d.core.Tensor(rays, dtype=_o3d.core.float32)
+            ).numpy()
+            inside_mask = (counts % 2) == 1
+
+            kept: list[Facade] = []
+            for f, is_in in zip(facades, inside_mask):
+                if bool(is_in):
+                    f.label = f"candidate_interior_{f.index} (envelope)"
+                    rejected.append(f)
+                    _stats["filtered_by_envelope"] = _stats.get("filtered_by_envelope", 0) + 1
+                else:
+                    kept.append(f)
+            # Reindex survivors contiguously so downstream index lookups stay valid.
+            for new_idx, f in enumerate(kept):
+                f.index = new_idx
+            dropped = len(facades) - len(kept)
+            if dropped:
+                print(f"[facade extract] envelope post-filter: {len(facades)} → {len(kept)} (-{dropped} interior)")
+            facades = kept
+    except Exception as _env_exc:
+        print(f"[facade extract] envelope post-filter skipped: {_env_exc}")
+
     _stats["facades_extracted"] = len(facades)
     _stats["candidates_rejected"] = len(rejected)
     global last_extraction_stats, last_rejected_candidates
