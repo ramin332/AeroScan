@@ -169,9 +169,11 @@ private fun formatSize(bytes: Long): String = when {
 }
 
 private fun openPilot2(ctx: android.content.Context) {
-    val pkg = "dji.go.v5"  // DJI Pilot 2 package name on RC Plus 2
-    val intent = ctx.packageManager.getLaunchIntentForPackage(pkg)
-        ?: Intent(Intent.ACTION_VIEW)
+    // Industry Edition (M4E ships with this) is `com.dji.industry.pilot`;
+    // consumer Pilot 2 is `dji.go.v5`. Try Industry first, fall back to consumer.
+    val pkgs = listOf("com.dji.industry.pilot", "dji.go.v5")
+    val intent = pkgs.firstNotNullOfOrNull { ctx.packageManager.getLaunchIntentForPackage(it) }
+        ?: Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
     intent.flags = Intent.FLAG_ACTIVITY_NEW_TASK
     runCatching { ctx.startActivity(intent) }
 }
