@@ -12,3 +12,4 @@ frontend/node_modules/
 frontend/dist/
 *.db
 kmz/*
+Payload-SDK-Tutorial/

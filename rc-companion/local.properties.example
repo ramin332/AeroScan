@@ -1,0 +1,9 @@
+# Copy this file to `local.properties` (gitignored) and fill in real values.
+# Never commit `local.properties` — it carries the DJI App Key.
+
+# Path to the Android SDK on this machine (Android Studio fills this in automatically).
+# sdk.dir=/Users/you/Library/Android/sdk
+
+# DJI MSDK V5 app key for package `com.aeroscan.rccompanion`.
+# Register at https://developer.dji.com/ — SDK Type must be "Mobile SDK", NOT Payload SDK.
+DJI_APP_KEY=PASTE_YOUR_MSDK_V5_APP_KEY_HERE
