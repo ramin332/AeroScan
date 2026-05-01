@@ -30,7 +30,7 @@ import java.io.InputStream
 class MopFileSender(
     private val componentIndex: ComponentIndexType = ComponentIndexType.LEFT_OR_MAIN,
     private val channelId: Int = MopConstants.MOP_CHANNEL_ID,
-    private val deviceType: PipelineDeviceType = PipelineDeviceType.ONBOARD,
+    private val deviceType: PipelineDeviceType = PipelineDeviceType.PAYLOAD,
     private val mode: TransmissionControlType = TransmissionControlType.STABLE,
 ) {
 
