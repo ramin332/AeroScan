@@ -15,9 +15,6 @@
     <uses-feature
         android:name="android.hardware.usb.host"
         android:required="false" />
-    <uses-feature
-        android:name="android.hardware.usb.accessory"
-        android:required="true" />
 
     <application
         android:name=".AeroScanApp"
@@ -46,6 +43,9 @@
         <activity
             android:name=".UsbAttachActivity"
             android:exported="true"
+            android:launchMode="singleInstance"
+            android:noHistory="true"
+            android:excludeFromRecents="true"
             android:theme="@android:style/Theme.Translucent.NoTitleBar">
             <intent-filter>
                 <action android:name="android.hardware.usb.action.USB_ACCESSORY_ATTACHED" />
