@@ -263,3 +263,34 @@ AeroScan is the **authoring surface**: building geometry in, WPML-compliant KMZ 
 - **PSDK Custom Widgets are live-link only** — they render on Pilot 2's live-flight view while the aircraft is powered and linked, and are not visible from the pre-flight mission library screen.
 - **The DJI-sanctioned on-drone automation path is Manifold + PSDK**: `DjiWaypointV3_UploadKmzFile(bytes, len)` uploads the KMZ directly to the aircraft, `DjiWaypointV3_Action(START|STOP|PAUSE|RESUME)` controls execution, and a Custom Widget on Pilot 2's live view gives the pilot a tap-to-fly button. Reference sample: `samples/sample_c/module_sample/waypoint_v3/` in the PSDK source. In this shape Pilot 2 is the monitoring surface, not the mission chooser — the pilot does not browse the KMZ from the library.
 - **Smart 3D Capture / Explore's output is not known to be an interceptable KMZ.** DJI's public docs describe Smart 3D as a single end-to-end automated mission (first-pass sparse cloud → on-RC facade route → autonomous flight) and do not document any KMZ export step. Any "Smart3D-first" architecture is gated on a device test confirming an accessible `.kmz` / `.wpml` on the RC or aircraft filesystem after a Smart 3D run. Until that test runs, the source-of-KMZ story stays AeroScan-first; `kmz_import.py` already accepts a Smart3D KMZ containing a *point cloud* as planner input, which is a distinct (and verified) path.
+
+## Smart3D outputs on the Manifold (`/blackbox/`) — verified 2026-05-03
+
+A read-only investigation of the Manifold (`ssh dji@<manifold>`) shows that **the Smart Auto-Exploration mesh is on the Manifold's filesystem in plain PLY**, not just on the RC. This collapses the "we need to wirelessly transport a 20-100 MB KMZ from RC to Manifold" framing — for the mesh, no transport is needed.
+
+```
+/blackbox/the_latest_flight/         (DJI-maintained symlink → /blackbox/flightNNNN/)
+├── camera/
+├── dji_mcu/                         (encrypted MCU log)
+├── dji_perception/1/
+│   ├── mesh_binary_*.ply            ← BUILDING GEOMETRY: ~50 chunks × ~10 MB,
+│   │                                  binary little-endian PLY, vertex+normal
+│   │                                  point cloud (no faces), local meter-scale
+│   │                                  ENU frame anchored on takeoff. ~1 GB / flight.
+│   ├── *.enc                        (encrypted: expl_plan.bin.enc, raw_data.enc,
+│   │                                 vp.log.enc — opaque)
+│   └── vp_storage.json              (volume layout, NOT mission data)
+├── psdk/                            (PSDK app log, plain text)
+├── system/
+├── latest_Smart3DExplore            (1-byte marker — flight ran Smart3D)
+└── Smart3DExplore_dynamic_ch_v2.json  (IPC channel config, NOT mission data)
+```
+
+What this means for the planner:
+
+- **Mesh source:** AeroScan can pull `mesh_binary_*.ply` directly from `/blackbox/the_latest_flight/dji_perception/1/` over SSH (LAN at depot, USB-tether to M4E debug port at `192.168.42.120` in the field — DJI documents this for PCs in `Payload-SDK-Tutorial/docs/en/40.manifold-quick-start/04.development-environment-setup/01.hardware-environment-setup.md` line 69; hot-plug not supported, cable before aircraft power-on).
+- **Density vs KMZ cloud:** Manifold has the unfiltered cloud, ~18.8 M points across all chunks for a typical flight. The KMZ's `cloud.ply` is a curated/decimated version (~416 K points). The existing `facades_from_pointcloud_cgal` pipeline runs unchanged on the merged Manifold cloud (with a 10 cm voxel downsample) and produces ~2.8× more facades than from the same KMZ — denser source, finer structural detail.
+- **Flight plan source:** The flight plan (waypoints, gimbal commands, capture actions) is **not** on the Manifold in any plaintext form. `expl_plan.bin.enc` is encrypted and opaque. No `.kmz` or `.wpml` exists outside the PSDK sample tree. The flight plan therefore still has to come from the **Smart3D KMZ on the RC**, which the pilot exports via USB-MTP cable to the laptop in the existing manual workflow.
+- **Flight identification:** Use `/blackbox/the_latest_flight` (DJI-maintained symlink); don't try to track `flightNNNN` numbers.
+
+The architectural consequence: **AeroScan reads mesh from Manifold, reads flight plan from RC-exported KMZ, augments only gimbal pitch/yaw per waypoint, and pushes the modified KMZ back to the Manifold over the same wired link.** The wireless MOP transport (the rc-companion app) is preserved as a **control-message channel only** for sub-500 KB payloads (mission selection commands, status pulls). See `docs/architecture/rc-companion-summary-exec.md` for the full architecture and `docs/architecture/rc-companion-bringup.md` for the investigation that drove the pivot.
