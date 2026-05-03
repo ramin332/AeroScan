@@ -40,11 +40,23 @@ def _kmz_extract_best_facades(
     ``fd_overrides`` forwards CGAL Shape-Detection knobs (epsilon,
     cluster_epsilon, min_points, density/area gates, normal_threshold)
     from the UI through to ``facades_from_pointcloud_cgal``. ``None``
-    values are dropped so library defaults apply.
+    values are filled in by ``estimate_facade_detection_defaults`` so the
+    starting point scales with the cloud's actual density rather than
+    using the KMZ-tuned hardcoded constants regardless of input.
     """
-    fd_kwargs = {k: v for k, v in (fd_overrides or {}).items() if v is not None}
+    user_kwargs = {k: v for k, v in (fd_overrides or {}).items() if v is not None}
     try:
-        from ..kmz_import import facades_from_pointcloud_cgal as _ffc
+        from ..kmz_import import (
+            facades_from_pointcloud_cgal as _ffc,
+            estimate_facade_detection_defaults as _est,
+        )
+        # Auto-estimate defaults from the actual cloud, then let the user's
+        # explicit overrides win on top. Estimator returns at least
+        # epsilon / cluster_epsilon / min_points / min_density_per_m2 — the
+        # density-sensitive ones.
+        estimated = _est(points_xyz)
+        estimated.pop("_estimator", None)
+        fd_kwargs = {**estimated, **user_kwargs}
         cgal_out = _ffc(points_xyz, polygon_enu, **fd_kwargs)
         if len(cgal_out) >= 3:
             print(f"[kmz facades] cgal region_growing → {len(cgal_out)} facades")

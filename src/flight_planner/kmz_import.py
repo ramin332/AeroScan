@@ -617,6 +617,125 @@ def clip_mesh_to_polygon_xy(
 # ---------------------------------------------------------------------------
 
 
+def estimate_facade_detection_defaults(
+    points_enu: np.ndarray,
+    *,
+    nn_sample_size: int = 5000,
+    rng_seed: int = 42,
+) -> dict:
+    """Estimate sensible CGAL Shape-Detection knobs for a given input cloud.
+
+    The hardcoded defaults in :func:`facades_from_pointcloud_cgal` (epsilon=0.05,
+    cluster_epsilon=0.25, min_points=40, min_density_per_m2=25) were tuned for
+    the KMZ-curated cloud density (~10 cm point spacing, ~40 pts/m²). On
+    denser sources (e.g. the Manifold's raw perception PLYs at ~3 cm spacing,
+    ~160 pts/m²) those defaults over-segment: ε is loose enough to catch noise
+    as planes, the min-points seed is too low to reject tiny noise patches.
+
+    This estimator measures the cloud's actual nearest-neighbour spacing and
+    surface point density, then derives knobs that scale with them. Returns a
+    dict matching the kwargs of :func:`facades_from_pointcloud_cgal`. Use as
+    the *initial* values for the UI sliders so the user starts with something
+    proportionate to the cloud they loaded.
+
+    Heuristics, calibrated against the KMZ-curated cloud (NN ≈ 10 cm,
+    surface density ≈ 100 pts/m²) as the baseline that the existing
+    hardcoded defaults work for:
+
+    - ``epsilon`` ≈ 1× median NN spacing (≥ 2 cm, ≤ 8 cm). Plane-fit
+      tolerance tracks point precision — denser clouds can afford a tighter ε.
+    - ``cluster_epsilon`` ≈ 4× median NN spacing (≥ 10 cm, ≤ 50 cm). Max
+      gap within one region.
+    - ``min_points`` = 40 × (surface_density / baseline). Scales linearly
+      with density relative to the baseline KMZ cloud. Clamped [25, 250].
+      Denser cloud → higher min_points, so each region still requires the
+      same physical coverage as the baseline does.
+    - ``min_density_per_m2`` stays at the hardcoded 25 default — it's a
+      "is this a surface or a floater?" filter, not a density gate. Scaling
+      it up rejects real walls.
+    - ``min_wall_area_m2``, ``min_roof_area_m2`` stay at the existing 0.5 m²
+      floor — these are domain knobs (NEN-2767 inspection cares about small
+      facets), not density-scaled.
+
+    Surface density (pts per m² of a facade plane) is computed as
+    ``1 / median_nn²``. We use *surface* density, not *footprint* density
+    (cloud / bbox-XY-area): the two diverge wildly on dense clouds with
+    vertical walls because footprint density counts every wall point on the
+    same XY pixel.
+    """
+    BASELINE_SURFACE_DENSITY = 100.0  # KMZ-curated cloud: ~10cm spacing, ~100 pts/m²
+    BASELINE_MIN_POINTS = 40           # the hardcoded default, calibrated for that
+    BASELINE_MIN_DENSITY = 25.0        # same — kept fixed, scaling it rejects real surfaces
+    if points_enu is None or len(points_enu) < 200:
+        return {}
+
+    pts = np.asarray(points_enu)
+
+    # Estimate median nearest-neighbour spacing from a random subsample.
+    n_sample = min(nn_sample_size, len(pts))
+    rng = np.random.default_rng(rng_seed)
+    sample_idx = rng.choice(len(pts), size=n_sample, replace=False)
+    sample = pts[sample_idx]
+
+    try:
+        import open3d as o3d
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(pts)
+        tree = o3d.geometry.KDTreeFlann(pcd)
+        nn_dists = []
+        for p in sample:
+            _, _, d2 = tree.search_knn_vector_3d(p, 2)
+            if len(d2) >= 2:
+                nn_dists.append(float(np.sqrt(d2[1])))
+        median_nn = float(np.median(nn_dists)) if nn_dists else 0.10
+    except Exception:
+        # Fallback: estimate from bbox volume / point count (cube root density).
+        bbox = pts.max(axis=0) - pts.min(axis=0)
+        vol = max(float(np.prod(bbox)), 1.0)
+        median_nn = float((vol / max(len(pts), 1)) ** (1.0 / 3.0))
+
+    median_nn = float(np.clip(median_nn, 0.01, 0.50))
+
+    # Surface density (pts per m² of a facade plane) = 1 / NN_spacing².
+    # This is what CGAL's per-region filters reason about, not footprint
+    # density (which double-counts vertical walls).
+    surface_density = 1.0 / (median_nn ** 2)
+
+    # Footprint density is logged for diagnostics only.
+    bbox_xy = pts[:, :2].max(axis=0) - pts[:, :2].min(axis=0)
+    footprint_m2 = max(float(bbox_xy[0] * bbox_xy[1]), 1.0)
+    footprint_density = float(len(pts)) / footprint_m2
+
+    epsilon = float(np.clip(median_nn, 0.02, 0.08))
+    cluster_epsilon = float(np.clip(median_nn * 4.0, 0.10, 0.50))
+    density_ratio = surface_density / BASELINE_SURFACE_DENSITY
+    min_points = int(np.clip(
+        round(BASELINE_MIN_POINTS * density_ratio), 25, 250
+    ))
+    # Don't scale this — it's a floater filter, not a density gate.
+    min_density_per_m2 = BASELINE_MIN_DENSITY
+
+    return {
+        "epsilon": epsilon,
+        "cluster_epsilon": cluster_epsilon,
+        "min_points": min_points,
+        "min_density_per_m2": min_density_per_m2,
+        # Domain-bound knobs — kept at existing floors so NEN-2767 small-feature
+        # bias survives. Surface here so the UI can display them as "auto".
+        "min_wall_area_m2": 0.5,
+        "min_roof_area_m2": 0.5,
+        "normal_threshold": 0.92,
+        # Diagnostics for the UI / debug log.
+        "_estimator": {
+            "median_nn_m": median_nn,
+            "surface_density_per_m2": surface_density,
+            "footprint_density_per_m2": footprint_density,
+            "n_points": int(len(pts)),
+            "footprint_m2": footprint_m2,
+        },
+    }
+
+
 @timed("facades_from_pointcloud_cgal")
 def facades_from_pointcloud_cgal(
     points_enu: np.ndarray,
