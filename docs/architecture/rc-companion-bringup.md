@@ -4,6 +4,15 @@ How we got `rc-companion/` (Android MSDK V5 app on RC Plus 2) to push a KMZ over
 OcuSync → aircraft → E-Port → Manifold via DJI's MOP pipeline, and what was
 broken on the way. First successful end-to-end test: 2026-05-01 09:53.
 
+> **Note (2026-05-03):** This document captures *how the RC→Manifold MOP path
+> was made to work*. The wireless bulk-transport architecture has since been
+> superseded by reading the Smart3D mesh directly off the Manifold's
+> `/blackbox/the_latest_flight/dji_perception/1/` (faster, denser, no transport
+> needed). See `rc-companion-summary-exec.md` for the current architecture and
+> the **Step 0 findings** section at the bottom of this file for the
+> investigation that drove the pivot. The MOP path is kept as a control-message
+> channel and as a fallback for sub-500 KB payloads.
+
 ## TL;DR
 
 - **End-to-end MOP transport from RC to Manifold works.** The Android app picks
@@ -258,3 +267,82 @@ static const T_ProbeBindSpec s_probeBinds[] = {
 `DJI_MOP_CHANNEL_TRANS_RELIABLE` on PSDK side ↔ `TransmissionControlType.STABLE`
 on MSDK side. Mismatch produces silent transport-layer NACK without reaching
 `Accept`.
+
+---
+
+## Step 0 Findings (2026-05-03) — why the architecture pivoted
+
+After the wireless transport above was working, we did a read-only investigation
+of the Manifold's filesystem to answer "where does the data we're trying to move
+actually live?" Findings here drove the architecture pivot documented in
+`rc-companion-summary-exec.md`.
+
+### Manifold blackbox layout
+
+`/blackbox/` contains per-flight directories `flight0006` … `flight0036+`,
+owned by root, totalling 18 GB. Each Smart Auto-Exploration flight populates:
+
+```
+/blackbox/flightNNNN/
+├── camera/                      (empty in samples)
+├── dji_mcu/                     (encrypted MCU log + idx)
+├── dji_perception/1/
+│   ├── mesh_binary_*.ply        ← the building geometry, in 10 MB chunks
+│   ├── *.enc                    (encrypted raw data, expl_plan, vp_log, …)
+│   └── vp_storage.json          (storage layout config — not the mission)
+├── psdk/                        (the running PSDK app's log)
+├── system/
+├── latest_Smart3DExplore        (1-byte marker — "this flight ran Smart3D")
+└── Smart3DExplore_dynamic_ch_v2.json   (IPC channel config — not the mission)
+```
+
+DJI maintains symlinks `/blackbox/the_latest_flight → flightNNNN/` so we never
+need to know flight numbers — just follow the symlink.
+
+### What the PLY chunks contain
+
+Sample: `/blackbox/flight0016/dji_perception/1/mesh_binary_*.ply`
+- 54 PLY files, ~10 MB each (1.0 GB total for one flight).
+- Format: PLY binary little-endian, vertex+normal point cloud, no faces.
+- Local meter-scale ENU frame anchored on takeoff. Bbox of merged cloud:
+  ~111 × 60 × 20 m for a multi-building site.
+- **18.8 M points across all chunks**, vs 416 K points in the curated `cloud.ply`
+  inside the corresponding `Mijande.kmz` — the Manifold has the unfiltered,
+  much denser source.
+
+Existing `flight_planner.kmz_import.facades_from_pointcloud_cgal` runs unchanged
+on the merged Manifold cloud (after a 10 cm voxel downsample) and produces
+**4,700 facades** vs **1,651 facades** from the same KMZ's curated cloud. Both
+are valid; the Manifold version exposes more small structural detail.
+
+### What's NOT on the Manifold
+
+Searched comprehensively for the flight plan (waypoints, gimbal commands,
+capture actions). **It is not stored unencrypted anywhere on the Manifold:**
+- `expl_plan.bin.enc` is encrypted, opaque.
+- `Smart3DExplore_dynamic_ch_v2.json` is IPC channel/storage config, not a
+  mission.
+- `vp_storage.json` is volume layout, not waypoints.
+- No `*.kmz` or `*.wpml` exists anywhere on the filesystem outside the PSDK
+  sample-code tree.
+
+So the flight plan still has to come from the KMZ on the RC, which the pilot
+exports via USB-MTP cable to the laptop in the existing manual workflow. That
+manual export is the only viable route for the waypoint stream.
+
+### Implications for the architecture
+
+1. **Mesh transport is solved without code.** AeroScan reads the perception
+   PLYs from the Manifold over the wired link the dev workflow already uses
+   (`rsync dji@<manifold>:/blackbox/the_latest_flight/dji_perception/1/`).
+2. **Flight plan transport stays manual.** Smart3D KMZ → laptop via the pilot's
+   existing USB-MTP cable. This was already routine before AeroScan; we don't
+   change it.
+3. **AeroScan's job becomes a transformation, not a generation.** Combine the
+   KMZ's flight plan with the Manifold's mesh, override only gimbal pitch/yaw
+   per waypoint, and emit a modified KMZ. The drone re-flies a path it already
+   knows.
+4. **The MOP wireless path keeps mattering, but only for control messages.**
+   At ≤500 KB it's still useful for "fly mission X" commands and status
+   pulls. Sub-2-minute payloads, no infrastructure required. This bring-up
+   work is preserved in that role.

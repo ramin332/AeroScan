@@ -1,112 +1,73 @@
 # Draadloze Missie-overdracht via Controller — Directiesamenvatting
 
-**Datum:** 2026-05-01
-**Status:** Proof-of-concept afgerond. We adviseren deze transportlaag te
-**pauzeren** en voor productie te schakelen naar een alternatieve architectuur.
+**Datum:** 2026-05-03 (vervangt versie van 2026-05-01 — zie "Wat is veranderd" hieronder)
+**Status:** Pivot afgerond. We verplaatsen KMZ-bestanden **niet** via de radio. De Smart3D-mesh staat al op de Manifold; we lezen die daar uit, vullen aan met gimbal-richting per waypoint, en sturen de aangepaste KMZ terug via dezelfde bekabelde route die in de dev-workflow al gebruikt wordt.
+
+---
+
+## Wat is veranderd sinds de vorige versie
+
+De versie van 2026-05-01 adviseerde om **de draadloze transportlaag te pauzeren en te kantelen naar "missie genereren op de drone".** Dat advies was gebaseerd op drie aannames die we nu beter begrijpen:
+
+1. We dachten dat het KMZ-bestand vanaf de RC naar de Manifold verplaatst moest worden.
+2. We hadden 5 KB/sec via de radio gemeten en als showstopper aangemerkt voor productiebestanden.
+3. We behandelden DJI's Smart Auto-Exploration-output als ondoorzichtig.
+
+Een read-only inspectie van het Manifold-bestandssysteem op 2026-05-03 heeft alle drie veranderd:
+
+- De **3D-mesh van Smart Auto-Exploration staat al op de Manifold**, in standaard `.ply`-bestanden onder `/blackbox/the_latest_flight/dji_perception/1/mesh_binary_*.ply`. Per vlucht: ~1 GB verdeeld over ~50 chunks van vertex+normaal-puntwolken. We hoeven niets te verplaatsen; we lezen het ter plaatse.
+- De perceptie-data op de Manifold is **dichter dan de gecureerde wolk die DJI in de KMZ stopt** — 4.700 facades geëxtraheerd vs. 1.651 uit dezelfde KMZ-`cloud.ply`.
+- Het vluchtplan (waypoints, gimbal-hoeken, capture-commando's) **staat niet op de Manifold** — DJI bewaart het versleuteld in `expl_plan.bin.enc`. Het vluchtplan blijft in de KMZ op de RC, die de piloot via de bestaande USB-MTP-kabel naar de laptop trekt.
+
+De architectuur kantelt dus: **AeroScan leest de mesh van de Manifold (snel, bekabeld), leest het vluchtplan uit de KMZ op de RC (bestaande handmatige export), past alleen de gimbal-richting per waypoint aan, en stuurt de gewijzigde KMZ terug naar de Manifold via dezelfde bekabelde route. De radio zit niet in het bulk-datapad.**
 
 ---
 
 ## Wat we wilden bereiken
 
-Een gebouwinspectie-missie die in AeroScan is gepland kunnen vliegen **zonder
-dat de piloot de controller hoeft te verlaten** — geen SD-kaart-omweg, geen
-"download KMZ → loop naar de controller → wissel kaart → herstart Pilot 2 →
-importeer" cyclus.
+Een gebouwinspectie-missie die in AeroScan is gepland kunnen vliegen **zonder dat de piloot de controller hoeft te verlaten** — geen SD-kaart-omweg, geen "download KMZ → loop naar de controller → wissel kaart → herstart Pilot 2 → importeer" cyclus.
 
-Concreet: een kleine Android-app op de DJI RC Plus 2 controller waarmee de
-piloot een missiebestand (KMZ) kiest en dat draadloos doorstuurt naar de
-on-drone computer (DJI Manifold 3), die vervolgens de missie vliegt.
+## Wat we daadwerkelijk hebben gebouwd en geleerd
 
-## Wat we hebben gebouwd
+**Werkt vandaag:**
+- Draadloos pad RC ↔ Manifold over OcuSync (proof-of-concept) — **alleen behouden als kanaal voor controle-berichten**, niet voor bulkbestanden. Payloads ≤500 KB in <2 minuten; prima voor "vlieg missie X"-commando's en status-uitvragen.
+- De Android-app op de controller (`rc-companion/`) registreert MSDK V5 schoon, koppelt aan de M4E, en stuurt data via DJI's MOP-kanaal naar een passieve Manifold-luisteraar (`rc_probe.c`). End-to-end geverifieerd.
 
-End-to-end draadloos transport: **controller → drone-radio → drone E-Port →
-on-drone computer**. De piloot kiest een bestand in onze app, het bestand
-streamt door de lucht, en komt aan bij de drone-side applicatie die we ook
-zelf hebben geschreven. We hebben dit vandaag op echte hardware met een echt
-missiebestand geverifieerd.
+**Gevalideerd door inspectie (2026-05-03):**
+- De `/blackbox/`-map op de Manifold bewaart per-vlucht perceptie-data in standaard PLY-formaat. 18 GB verdeeld over 35+ vluchten. We hebben SSH-toegang. **Geen bestandsoverdracht nodig voor de mesh — we lezen die rechtstreeks.**
+- DJI onderhoudt een `/blackbox/the_latest_flight`-symlink die naar de meest recente vlucht verwijst. **Geen vlucht-ID-opzoekmechanisme nodig.**
+- Het versleutelde `expl_plan.bin.enc` is ondoorzichtig, dus het vluchtplan moet nog steeds uit de KMZ op de RC komen. Het bestaande USB-MTP-naar-laptop-proces van de piloot regelt dat — handmatig maar betrouwbaar.
 
-Dit is de eerste keer dat we in onze setup hebben aangetoond dat missiedata
-zonder SD-kaart op een DJI-drone kan worden gezet.
+**De kern-inzicht:** de juiste scope is **gimbal-aanvulling, niet missie-herplanning**. We nemen het Smart3D-vluchtpad zoals het is, extraheren facades uit de Manifold-mesh, en overschrijven alleen `gimbalPitchAngle` / `gimbalYawAngle` per waypoint zodat de camera op de dichtstbijzijnde zichtbare facade wordt gericht. De drone vliegt opnieuw een pad dat hij al weet uit te voeren.
 
-## Wat we hebben geleerd
+## Productie-workflow (na pivot)
 
-**Het goede:**
-- Het draadloze pad werkt. We hebben elke laag van DJI's "MOP" inter-app-kanaal
-  bewezen — registratie, het juiste device-slot adresseren, framing,
-  integriteitscontrole (MD5), schone disconnect. De drone-side applicatie ziet
-  echte bytes vanuit de controller-side applicatie.
-- We hebben vier niet-vanzelfsprekende DJI-valkuilen gedocumenteerd die ons
-  onderweg tijd hebben gekost (crashes bij app-start, een
-  connectie-flikker-gedrag, een verkeerde adressering, en het feit dat de
-  piloot na power-up eenmalig de radio moet "primen" met DJI's eigen app).
-  Allemaal vastgelegd in `rc-companion-bringup.md` zodat we er niet nog een
-  keer voor betalen.
+1. **In het veld:** piloot vliegt een Smart Auto-Exploration-missie zoals gewend. De mesh wordt opgebouwd in `/blackbox/the_latest_flight/`. De Smart3D-KMZ komt terecht in de RC-opslag.
+2. **Bij de laptop (depot, hangar of elke locatie met een USB-kabel):**
+   - USB-C-kabel van de laptop naar de M4E-debugport → Manifold verschijnt op `192.168.42.120` (door DJI gedocumenteerd voor pc's). Of, in het lab, het bestaande Wi-Fi-LAN.
+   - Piloot verbindt RC met laptop via USB-MTP en sleept de Smart3D-KMZ naar de laptop (bestaande workflow).
+   - Klik "Aanvullen met NEN-2767-gimbals" in AeroScan. Backend leest de mesh van de meest recente vlucht over de bekabelde verbinding, parst de KMZ voor waypoints, berekent welke facade elk waypoint moet bekijken, en schrijft een gewijzigde KMZ.
+   - Klik "Naar drone sturen" — backend SCP't de gewijzigde KMZ naar `/open_app/dev/data/received/` op de Manifold.
+3. **Voor opstijgen:** kabel loskoppelen. Drone aanzetten. Piloot tikt op de AeroScan PSDK-widget op Pilot 2's live-flight view → drone uploadt de aangevulde KMZ via `DjiWaypointV3_UploadKmzFile` → `DjiWaypointV3_Action(START)` → drone vliegt hetzelfde pad met camera's nu gericht op facades.
 
-**De blokkade:**
-- **De uploadsnelheid is fysiek begrensd op ~5 KB/sec door de radio.** Dit is
-  een gedocumenteerde limiet van DJI's OcuSync-uplink op de fysieke laag —
-  niet iets dat we in software aan welke kant dan ook kunnen tweaken. De
-  snelheid is identiek voor reliable en unreliable modus.
+## Waarom dit beter is dan de alternatieven
 
-**Wat dat in de praktijk betekent:**
+- **Beter dan SD-kaart-sideload** omdat er niets fysiek van de RC af hoeft. De MTP-kabel van de piloot naar de laptop vervangt de SD-kaart-wissel, de laptop stuurt de aangevulde missie naar de drone via USB-C naar de aircraft-debugport, en Pilot 2 vliegt hem.
+- **Beter dan draadloos transport** omdat OcuSync's ~5 KB/sec uplink 67 minuten zou doen over een 20 MB KMZ. Kabel-snelheid haalt meerdere MB/sec — bestanden in seconden.
+- **Beter dan de planner naar de Manifold verhuizen** omdat we geen Python-op-Tegra-arm64-build hoeven te onderhouden. De laptop heeft de planner al.
+- **Beter dan de missie vanaf nul herplannen** omdat de gimbal-aanvulpas veel eenvoudiger is dan NEN-2767 waypoint-generatie: zelfde pad, zelfde acties, alleen camera-hoeken veranderen.
 
-| Grootte missiebestand | Overdrachtstijd via de radio |
-|---|---|
-| 50 KB | ~10 sec (acceptabel) |
-| 500 KB | ~1,5 min (op de grens) |
-| 1 MB | ~3 min (slechte UX) |
-| 5 MB | ~15 min (onhaalbaar) |
+## Wat we behouden uit de proof-of-concept
 
-Een typische AeroScan-inspectie-missie voor een gebouw van enige omvang valt
-in het multi-MB-bereik zodra de volledige waypoint-set, foto-metadata en het
-verplichte `wpmz/`-pakket van DJI erin zitten. **Bij 5 KB/sec zou de piloot
-minutenlang op het opstijgpunt zitten wachten per missie.** Dat is slechter
-dan het SD-kaart-proces dat we juist proberen te vervangen.
-
-## Waarom we pauzeren
-
-Deze transportlaag is niet het juiste vehikel voor het overzetten van het
-volledige missiebestand. Doorinvesteren in deze laag (bestand wegschrijven
-naar disk aan drone-zijde, headers valideren, doorkoppelen naar de "Waypoint
-V3"-uitvoer-API van de autopilot) levert ons een pad op dat **fundamenteel te
-traag** is voor de missies die we daadwerkelijk genereren. Het overige werk
-zou solide engineering zijn, maar zou een feature opleveren die de piloot na
-oplevering niet zou kiezen om te gebruiken.
-
-## Aanbevolen pivot
-
-De juiste plek om de missie-generatielogica te zetten is **op de drone zelf**,
-op de on-drone computer (Manifold 3). In plaats van *een KMZ op de controller
-genereren en die over de trage radio sturen*, sturen we een klein commando
-("inspecteer de gebouwomtrek op GPS X, Y, Z met deze parameters") en laten we
-de on-drone computer **de KMZ lokaal opbouwen** en aan de autopilot
-overhandigen. De radio draagt dan kilobytes aan intentie, geen megabytes aan
-waypoints.
-
-Deze pivot:
-- Omzeilt het OcuSync-uplink-plafond volledig.
-- Hergebruikt de draadloze transportlaag die we zojuist hebben bewezen — voor
-  command-and-control payloads, waar 5 KB/sec ruim voldoende is.
-- Sluit aan bij waar DJI hun architectuur duidelijk voor heeft ontworpen: de
-  Manifold heeft de CPU, de opslag en de directe E-Port-USB-link naar de
-  autopilot; de controller is bedoeld als dunne piloot-gerichte laag.
-- Laat ons de volledige AeroScan-planningsengine behouden; die draait dan op
-  de drone in plaats van op een laptop.
-
-## Wat we behouden
-
-- De Android RC-app (`rc-companion/`) staat in de kast, build-baar en
-  installeerbaar. Hij heeft nog steeds waarde voor toekomstige features die
-  het controller-naar-drone-kanaal nodig hebben voor *kleine* payloads —
-  instellingen, start/stop-commando's, status-pulls, telemetrie-tagging.
-- De drone-side listener (`rc_probe.c` op de Manifold) blijft eveneens als
-  bekend-werkend sjabloon voor elke command-laag-feature.
-- Het bring-up-document legt elke valkuil vast, zodat dit transport later
-  weer oppakken uren kost in plaats van dagen.
+- De Android RC-companion-app (`rc-companion/`) blijft build-baar en op de plank voor toekomstige kleine-payload toepassingen (status-uitvragen, controle-commando's, ad-hoc tweaks in het veld). Niet op het kritieke productie-pad.
+- De Manifold-zijde luisteraar (`rc_probe.c`) wordt in een follow-up PR uitgebreid om binnenkomende KMZ's daadwerkelijk naar disk weg te schrijven (vandaag logt die alleen hex-previews).
+- Het bring-up-document (`rc-companion-bringup.md`) legt elke valkuil vast aan beide kanten, zodat dit transport later weer oppakken uren kost in plaats van dagen.
 
 ## Beslissing nodig
 
-Bevestig dat we de missie-generatie-engine als primaire architectuur naar de
-Manifold 3 verplaatsen, en dat het radiopad uitsluitend wordt gereserveerd
-voor controleberichten. De technische proof-of-concept is klaar; dit is een
-"waar besteden we de komende twee weken aan"-vraag.
+Bevestig dat we doorgaan met:
+- **Bron-van-waarheid:** mesh van de Manifold (`/blackbox/the_latest_flight/dji_perception/1/`), vluchtplan uit de KMZ die de RC exporteert.
+- **Transport:** USB-C-kabel (laptop ↔ M4E-debugport) voor SCP-push van de aangevulde KMZ. LAN als depot-fallback.
+- **AeroScan-scope-verschuiving:** een "gimbal-aanvul"-pas bovenop Smart3D-missies, in plaats van NEN-2767-inspectiemissies vanaf nul genereren.
+
+De technische proof-of-concept is klaar. Dit is nu een "waar besteden we de komende twee weken aan"-vraag — en het antwoord is de gimbal-aanvulpas + de laptop-zijde-ingester vanaf de Manifold, niet meer transport-plumbing.
