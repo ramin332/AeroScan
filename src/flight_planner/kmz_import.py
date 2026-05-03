@@ -642,14 +642,19 @@ def estimate_facade_detection_defaults(
     surface density ≈ 100 pts/m²) as the baseline that the existing
     hardcoded defaults work for:
 
-    - ``epsilon`` ≈ 1× median NN spacing (≥ 2 cm, ≤ 8 cm). Plane-fit
-      tolerance tracks point precision — denser clouds can afford a tighter ε.
+    - ``epsilon`` ≈ 0.5× median NN spacing (≥ 1.5 cm, ≤ 5 cm). Plane-fit
+      tolerance is half the NN spacing — tight enough that adjacent
+      surfaces don't merge into one plane, loose enough that a single
+      noisy point doesn't kick a real inlier out. Clamping at 5 cm
+      keeps fits precise even on coarse clouds; we don't want to admit
+      8 cm "tolerance" as a default just because the cloud happens to
+      be at 9 cm spacing.
     - ``cluster_epsilon`` ≈ 4× median NN spacing (≥ 10 cm, ≤ 50 cm). Max
       gap within one region.
-    - ``min_points`` = 40 × (surface_density / baseline). Scales linearly
-      with density relative to the baseline KMZ cloud. Clamped [25, 250].
-      Denser cloud → higher min_points, so each region still requires the
-      same physical coverage as the baseline does.
+    - ``min_points`` = round(surface_density × 0.3). Each region needs at
+      least ~0.3 m² of inliers before being a "real" facet. Clamped
+      [25, 250]. Denser clouds get higher min_points automatically —
+      same physical coverage requirement regardless of sampling rate.
     - ``min_density_per_m2`` stays at the hardcoded 25 default — it's a
       "is this a surface or a floater?" filter, not a density gate. Scaling
       it up rejects real walls.
@@ -663,9 +668,8 @@ def estimate_facade_detection_defaults(
     vertical walls because footprint density counts every wall point on the
     same XY pixel.
     """
-    BASELINE_SURFACE_DENSITY = 100.0  # KMZ-curated cloud: ~10cm spacing, ~100 pts/m²
-    BASELINE_MIN_POINTS = 40           # the hardcoded default, calibrated for that
-    BASELINE_MIN_DENSITY = 25.0        # same — kept fixed, scaling it rejects real surfaces
+    BASELINE_MIN_DENSITY = 25.0        # the hardcoded default — kept fixed,
+                                       # scaling it rejects real surfaces
     if points_enu is None or len(points_enu) < 200:
         return {}
 
@@ -706,11 +710,11 @@ def estimate_facade_detection_defaults(
     footprint_m2 = max(float(bbox_xy[0] * bbox_xy[1]), 1.0)
     footprint_density = float(len(pts)) / footprint_m2
 
-    epsilon = float(np.clip(median_nn, 0.02, 0.08))
+    epsilon = float(np.clip(median_nn * 0.5, 0.015, 0.05))
     cluster_epsilon = float(np.clip(median_nn * 4.0, 0.10, 0.50))
-    density_ratio = surface_density / BASELINE_SURFACE_DENSITY
+    target_facet_area_m2 = 0.3
     min_points = int(np.clip(
-        round(BASELINE_MIN_POINTS * density_ratio), 25, 250
+        round(surface_density * target_facet_area_m2), 25, 250
     ))
     # Don't scale this — it's a floater filter, not a density gate.
     min_density_per_m2 = BASELINE_MIN_DENSITY
@@ -1650,7 +1654,7 @@ def pointcloud_to_mesh_ply(
     alpha: float = 0.5,
     target_points: int = 120_000,
     min_voxel_size: float = 0.03,
-    max_voxel_size: float = 0.20,
+    max_voxel_size: float = 0.15,
     voxel_size_override: float | None = None,
     smooth_iterations: int = 12,
     decimation_ratio: float = 0.35,
@@ -1685,13 +1689,21 @@ def pointcloud_to_mesh_ply(
         pcd = pcd.voxel_down_sample(voxel_size=voxel_size)
         print(f"[kmz_import] {n_in} → {len(pcd.points)} points (voxel={voxel_size:.3f}m, manual)")
     elif n_in > target_points:
-        bbox = pcd.get_axis_aligned_bounding_box()
-        extent = np.asarray(bbox.get_extent())
-        vol = max(float(np.prod(extent)), 1e-6)
-        voxel_size = (vol / target_points) ** (1.0 / 3.0)
-        voxel_size = max(min_voxel_size, min(max_voxel_size, voxel_size))
+        # Density-aware: voxel ≈ 1.5× the cloud's natural NN spacing. Keeps
+        # most of the precision the input offers — denser clouds get a
+        # finer mesh, sparser clouds a coarser one. Clamped to
+        # [min_voxel_size, max_voxel_size] (defaults [3 cm, 15 cm]) so we
+        # don't go absurdly fine on lab-scale clouds or absurdly coarse on
+        # huge / sparse ones.
+        try:
+            est = estimate_facade_detection_defaults(np.asarray(pcd.points))
+            median_nn = float(est.get("_estimator", {}).get("median_nn_m", 0.10))
+        except Exception:
+            median_nn = 0.10
+        voxel_size = float(np.clip(median_nn * 1.5, min_voxel_size, max_voxel_size))
         pcd = pcd.voxel_down_sample(voxel_size=voxel_size)
-        print(f"[kmz_import] {n_in} → {len(pcd.points)} points (voxel={voxel_size:.3f}m, auto)")
+        print(f"[kmz_import] {n_in} → {len(pcd.points)} points "
+              f"(voxel={voxel_size:.3f}m, density-aware: NN={median_nn:.3f}m × 1.5)")
     else:
         voxel_size = float(min_voxel_size)
     pcd, _ = pcd.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.0)
