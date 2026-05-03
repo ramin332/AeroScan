@@ -302,18 +302,67 @@ need to know flight numbers — just follow the symlink.
 ### What the PLY chunks contain
 
 Sample: `/blackbox/flight0016/dji_perception/1/mesh_binary_*.ply`
+
 - 54 PLY files, ~10 MB each (1.0 GB total for one flight).
 - Format: PLY binary little-endian, vertex+normal point cloud, no faces.
-- Local meter-scale ENU frame anchored on takeoff. Bbox of merged cloud:
-  ~111 × 60 × 20 m for a multi-building site.
-- **18.8 M points across all chunks**, vs 416 K points in the curated `cloud.ply`
-  inside the corresponding `Mijande.kmz` — the Manifold has the unfiltered,
-  much denser source.
+- Local meter-scale ENU frame anchored on takeoff, **yaw-aligned to the aircraft's heading at takeoff** (not magnetic north / KMZ's ENU). Per-flight rotation around Z is needed to register into the KMZ's frame — verified on flight0016/Mijande: ICP gives fitness 0.986, RMSE 0.468 m, total yaw 85.74°, translation effectively zero. Open3D's `registration_icp` with a coarse-yaw seed (0/90/180/270°) handles this in ~10 s on a 20 cm voxel-downsampled cloud.
+- Bbox of merged cloud: ~111 × 60 × 20 m for a multi-building site (Mijande).
 
-Existing `flight_planner.kmz_import.facades_from_pointcloud_cgal` runs unchanged
-on the merged Manifold cloud (after a 10 cm voxel downsample) and produces
-**4,700 facades** vs **1,651 facades** from the same KMZ's curated cloud. Both
-are valid; the Manifold version exposes more small structural detail.
+### Manifold vs KMZ: same site, two different representations
+
+The thing that surprises is the size delta. Quick numbers, both for Mijande:
+
+| Source | Where | Points | On disk |
+|---|---|---|---|
+| `kmz/Mijande.kmz` `cloud.ply` | inside KMZ on RC | 416 K | 12.9 MB (zip) |
+| `/blackbox/flight0016/dji_perception/1/mesh_binary_*.ply` | on the drone | **18.8 M** | **~1.0 GB** (uncompressed PLY: 6 floats × 4 bytes per point) |
+
+Manifold has **45× more points**. They are **not the same data in two places**:
+
+- **Manifold = raw perception stream.** During the Smart3D flight, the perception system dumps mesh chunks as the drone scans, every few seconds. Unfiltered, dense, noisy. Size scales with scan duration:
+
+| Flight | Chunks | Total |
+|---|---|---|
+| flight0008 | 15 | 268 MB |
+| flight0014 | 64 | 1.4 GB |
+| flight0016 (Mijande) | 54 | 1.0 GB |
+| flight0019 | 25 | 350 MB |
+
+- **KMZ `cloud.ply` = DJI's post-flight thumbnail.** Decimated to ~10 cm point spacing, sized for Pilot 2's 3D Tiles preview, not for analysis. That's why your `Mijande.kmz` is only 15 MB — it's the pretty version of what the drone actually saw.
+
+### Why we use the Manifold version (and downsample anyway)
+
+For facade extraction, **denser is better** — more points means we resolve smaller features (window sills, parapets, balcony details). On Mijande, the existing `facades_from_pointcloud_cgal` pipeline runs unchanged on the merged Manifold cloud (with a 10 cm voxel downsample) and produces **4,700 facades vs 1,651** from the same KMZ's curated cloud. Same building, 2.8× more structural detail.
+
+**Subtle but important:** the voxel downsample is **only for the CGAL algorithm's runtime**, not for storage or transport. Region-growing on 18.8 M points takes minutes; on 1.7 M points (10 cm voxel) it takes 14 s. The downsample also kills sensor noise (averaging within each 10 cm cube) while preserving structural geometry. Nothing big leaves the Manifold; the augmented KMZ we ship back is the same ~15 MB as the input KMZ.
+
+### Production data flow
+
+```
+Manifold raw PLYs (~268 MB – 1.4 GB on Manifold, depending on flight)
+   │
+   │ rsync over wired link (USB-tether to M4E debug port, or LAN)
+   ▼  ~5–30 sec
+Laptop merges in memory + voxel-downsamples to 10 cm  (~1.7 M pts in RAM)
+   │
+   ▼  ~14 sec
+CGAL facade extraction → ~4700 facades
+   │
+   ▼  ICP-register to KMZ frame using KMZ's curated cloud as target
+Facades in KMZ-aligned ENU frame
+   │
+   ▼  per-waypoint: find dominant in-view facade, override gimbal pitch/yaw
+Gimbal-augmentation pass (~few sec, 1233 waypoints)
+   │
+   ▼  re-zip with original waylines.wpml + template.kml + tiles unchanged
+Modified KMZ (~15 MB, similar size to original Smart3D KMZ)
+   │
+   │ scp → Manifold's /open_app/dev/data/received/
+   ▼
+DjiWaypointV3_UploadKmzFile + DjiWaypointV3_Action(START)
+```
+
+`scripts/build_manifold_overlay_kmz.py` builds a synthetic KMZ for visual verification: it replaces `cloud.ply` inside a source KMZ with a Manifold-sourced (and ICP-registered) cloud, leaves the waypoints / polygon / gimbal commands byte-identical, and lets you import both KMZs through `/import-kmz` to toggle between them in Viewer3D.
 
 ### What's NOT on the Manifold
 
