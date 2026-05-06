@@ -4,22 +4,108 @@ import android.app.Application
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.aeroscan.rccompanion.Connection
+import com.aeroscan.rccompanion.cloud.PlyParser
+import com.aeroscan.rccompanion.cloud.PlyVoxelDownsample
 import com.aeroscan.rccompanion.filepick.PickedFile
-import com.aeroscan.rccompanion.mop.MopFileSender
+import com.aeroscan.rccompanion.mop.AugmentSession
+import com.aeroscan.rccompanion.wpml.WpmlParser
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import org.json.JSONObject
 
+/**
+ * State machine for the augment flow:
+ *
+ *   Idle
+ *    └── onFilePicked → Picked
+ *         └── augment() → ParsingKmz → Uploading → AwaitingPreview
+ *                              └── PreviewReceived → ReviewReady
+ *                                       ├── approve() → Approving → ReadyToFly
+ *                                       └── reject()  → Idle
+ *                              └── error            → Error
+ *
+ * The pilot's tap-to-fly happens on Pilot 2's Custom Widget, NOT in this app —
+ * once we hit ReadyToFly, the rc-companion's job is done. The card in that
+ * state nudges the pilot to switch to Pilot 2.
+ */
 class HomeViewModel(app: Application) : AndroidViewModel(app) {
+
+    /** Per-WP voxel size used to downsample the KMZ's cloud.ply before
+     * shipping. 1 m is the empirical sweet spot from the bench (see
+     * scripts/bench_icp_target_density.py + validate_2m_voxel_e2e.py): yields
+     * ~440 KB gzipped fingerprint, ICP transform delta < 0.005°, 27% gimbal
+     * disagreement vs full-cloud (all aimed at valid building surfaces). */
+    private val voxelSizeM: Double = 1.0
 
     sealed interface UiState {
         data object Idle : UiState
         data class Picked(val file: PickedFile) : UiState
+        data class ParsingKmz(val file: PickedFile) : UiState
         data class Uploading(val file: PickedFile, val sent: Long, val total: Long) : UiState
-        data class Done(val file: PickedFile) : UiState
+        data class AwaitingPreview(val file: PickedFile, val elapsedSec: Long = 0) : UiState
+        data class ReviewReady(
+            val file: PickedFile,
+            val summary: PreviewSummary,
+            val augmentedKmz: ByteArray,
+        ) : UiState
+        data class Approving(val file: PickedFile) : UiState
+        data class ReadyToFly(val file: PickedFile, val summary: PreviewSummary) : UiState
         data class Error(val file: PickedFile?, val message: String) : UiState
+    }
+
+    /** Compact view of the summary JSON for the UI — only the fields the
+     *  pilot reviews. Decoded from the PRVW frame's summary slab. */
+    data class PreviewSummary(
+        val name: String,
+        val waypointCount: Int,
+        val waypointsAimed: Int,
+        val facadeCount: Int,
+        val pitchMin: Double,
+        val pitchMax: Double,
+        val pitchMedian: Double,
+        val anomalyPitchUp: Int,
+        val anomalyPitchDown: Int,
+        val anomalyIndicesPitchUp: IntArray,
+        val anomalyIndicesPitchDown: IntArray,
+        val icpRmseM: Double,
+        val elapsedSec: Double,
+    ) {
+        companion object {
+            fun fromJson(jsonBytes: ByteArray): PreviewSummary {
+                val obj = JSONObject(String(jsonBytes, Charsets.UTF_8))
+                val gs = obj.getJSONObject("gimbal_stats")
+                val pitch = gs.getJSONObject("pitch_deg")
+                val ac = gs.getJSONObject("anomaly_counts")
+                val ai = gs.getJSONObject("anomaly_indices")
+                val icp = obj.getJSONObject("icp")
+                return PreviewSummary(
+                    name = obj.optString("name", "Mission"),
+                    waypointCount = obj.getInt("waypoints_total"),
+                    waypointsAimed = obj.getInt("waypoints_aimed"),
+                    facadeCount = obj.getInt("facades"),
+                    pitchMin = pitch.getDouble("min"),
+                    pitchMax = pitch.getDouble("max"),
+                    pitchMedian = pitch.getDouble("median"),
+                    anomalyPitchUp = ac.getInt("pitch_up"),
+                    anomalyPitchDown = ac.getInt("pitch_down"),
+                    anomalyIndicesPitchUp = jsonIntArray(ai.getJSONArray("pitch_up")),
+                    anomalyIndicesPitchDown = jsonIntArray(ai.getJSONArray("pitch_down")),
+                    icpRmseM = icp.getDouble("icp_rmse_m"),
+                    elapsedSec = obj.getDouble("elapsed_s"),
+                )
+            }
+
+            private fun jsonIntArray(arr: org.json.JSONArray): IntArray {
+                val out = IntArray(arr.length())
+                for (i in 0 until arr.length()) out[i] = arr.getInt(i)
+                return out
+            }
+        }
     }
 
     private val _ui = MutableStateFlow<UiState>(UiState.Idle)
@@ -27,23 +113,26 @@ class HomeViewModel(app: Application) : AndroidViewModel(app) {
 
     val connection: StateFlow<Connection.State> = Connection.state
 
-    private var sendJob: Job? = null
+    private var augmentJob: Job? = null
+    private var session: AugmentSession? = null
 
     fun onFilePicked(picked: PickedFile) {
         _ui.value = UiState.Picked(picked)
     }
 
     fun reset() {
-        sendJob?.cancel()
-        sendJob = null
+        augmentJob?.cancel()
+        augmentJob = null
+        session = null
         _ui.value = UiState.Idle
     }
 
     fun cancel() {
-        sendJob?.cancel()
+        augmentJob?.cancel()
     }
 
-    fun send() {
+    /** Pick → parse → uplink → wait. */
+    fun augment() {
         val current = _ui.value
         val picked = when (current) {
             is UiState.Picked -> current.file
@@ -56,32 +145,124 @@ class HomeViewModel(app: Application) : AndroidViewModel(app) {
             return
         }
 
-        sendJob = viewModelScope.launch {
-            _ui.value = UiState.Uploading(picked, 0, picked.sizeBytes.coerceAtLeast(0))
+        augmentJob = viewModelScope.launch {
+            _ui.value = UiState.ParsingKmz(picked)
             val ctx = getApplication<Application>().applicationContext
-            val sender = MopFileSender()
 
-            val input = runCatching { ctx.contentResolver.openInputStream(picked.uri) }
-                .getOrNull()
-            if (input == null) {
-                _ui.value = UiState.Error(picked, "Could not open the picked file. Try re-selecting.")
+            // 1. Read picked KMZ → parse waylines + extract cloud.ply.
+            val kmzBytes = withContext(Dispatchers.IO) {
+                runCatching {
+                    ctx.contentResolver.openInputStream(picked.uri)?.use { it.readBytes() }
+                }.getOrNull()
+            }
+            if (kmzBytes == null) {
+                _ui.value = UiState.Error(picked, "Could not read picked file. Try re-selecting.")
+                return@launch
+            }
+            val parseResult = withContext(Dispatchers.Default) {
+                runCatching {
+                    WpmlParser.parseKmz(kmzBytes, missionName = picked.displayName.removeSuffix(".kmz"))
+                }
+            }
+            val intent = parseResult.getOrNull()?.intent
+            val cloudBytes = parseResult.getOrNull()?.cloudPlyBytes
+            if (intent == null) {
+                _ui.value = UiState.Error(picked,
+                    "KMZ parse failed: ${parseResult.exceptionOrNull()?.message ?: "unknown"}")
+                return@launch
+            }
+            if (cloudBytes == null) {
+                _ui.value = UiState.Error(picked,
+                    "KMZ has no cloud.ply — required as the ICP target.")
                 return@launch
             }
 
-            input.use { stream ->
-                val total = if (picked.sizeBytes > 0) picked.sizeBytes else 0L
-                val result = sender.send(picked.displayName, total, stream) { sent, totalBytes ->
-                    _ui.value = UiState.Uploading(picked, sent, totalBytes)
+            // 2. Voxel-downsample the cloud at 1 m.
+            val fingerprintBytes = withContext(Dispatchers.Default) {
+                runCatching {
+                    val pc = PlyParser.read(cloudBytes)
+                        ?: error("cloud.ply could not be parsed as binary PLY")
+                    val ds = PlyVoxelDownsample.downsample(pc, voxelSizeM)
+                    PlyParser.writeBinary(ds)
                 }
-                _ui.value = when (result) {
-                    is MopFileSender.Result.Ok -> UiState.Done(picked)
-                    is MopFileSender.Result.Cancelled -> UiState.Idle
-                    is MopFileSender.Result.Failed -> UiState.Error(
-                        picked,
-                        result.cause.message ?: "Upload failed for an unknown reason."
-                    )
+            }.getOrNull()
+            if (fingerprintBytes == null) {
+                _ui.value = UiState.Error(picked, "cloud.ply downsample failed.")
+                return@launch
+            }
+
+            // 3. Open MOP session, send AUGM, await PRVW.
+            _ui.value = UiState.Uploading(picked, 0,
+                total = (intent.toJsonString().toByteArray().size + fingerprintBytes.size).toLong())
+            val sess = AugmentSession()
+            session = sess
+
+            // Subscribe to events to update the UI.
+            launch {
+                sess.events.collect { ev ->
+                    when (ev) {
+                        is AugmentSession.Event.Connecting -> { /* keep state */ }
+                        is AugmentSession.Event.Sending -> {
+                            (_ui.value as? UiState.Uploading)?.let {
+                                _ui.value = it.copy(sent = ev.bytesSent, total = ev.totalBytes)
+                            }
+                        }
+                        is AugmentSession.Event.SendComplete -> {
+                            _ui.value = UiState.AwaitingPreview(picked)
+                        }
+                        is AugmentSession.Event.WaitingForPreview -> {
+                            _ui.value = UiState.AwaitingPreview(picked)
+                        }
+                        is AugmentSession.Event.PreviewReceived -> {
+                            val summary = runCatching { PreviewSummary.fromJson(ev.summaryJson) }
+                                .getOrElse {
+                                    _ui.value = UiState.Error(picked,
+                                        "Preview JSON parse failed: ${it.message}")
+                                    return@collect
+                                }
+                            _ui.value = UiState.ReviewReady(picked, summary, ev.augmentedKmz)
+                        }
+                        is AugmentSession.Event.ExecuteSent -> {
+                            val rr = _ui.value as? UiState.ReviewReady
+                            if (rr != null) {
+                                _ui.value = UiState.ReadyToFly(rr.file, rr.summary)
+                            }
+                        }
+                        is AugmentSession.Event.Cancelled -> {
+                            if (_ui.value !is UiState.Idle) _ui.value = UiState.Idle
+                        }
+                        is AugmentSession.Event.Failed -> {
+                            _ui.value = UiState.Error(picked,
+                                ev.cause.message ?: "Augment failed.")
+                        }
+                        is AugmentSession.Event.Closed -> { /* terminal; UI already set */ }
+                    }
                 }
             }
+
+            sess.sendAndAwaitPreview(intent, fingerprintBytes)
+        }
+    }
+
+    /** Pilot tapped APPROVE on the preview — ship EXEC, kmz_runner uploads to aircraft. */
+    fun approve() {
+        val rr = _ui.value as? UiState.ReviewReady ?: return
+        val sess = session ?: return
+        viewModelScope.launch {
+            _ui.value = UiState.Approving(rr.file)
+            sess.approve(missionId = rr.summary.name)
+            // ExecuteSent event → ReadyToFly transition wired in the events
+            // collector above.
+        }
+    }
+
+    /** Pilot tapped REJECT — drop the session, return to Idle. */
+    fun reject() {
+        val sess = session
+        viewModelScope.launch {
+            sess?.closeAndRelease()
+            session = null
+            _ui.value = UiState.Idle
         }
     }
 }

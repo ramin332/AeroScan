@@ -51,7 +51,11 @@ fun HomeScreen(viewModel: HomeViewModel = viewModel()) {
                     name = s.file.displayName,
                     size = s.file.sizeBytes,
                     onPick = pick,
-                    onSend = viewModel::send,
+                    onAugment = viewModel::augment,
+                )
+                is HomeViewModel.UiState.ParsingKmz -> SimpleStatusCard(
+                    title = "Parsing KMZ…",
+                    body = "${s.file.displayName} — extracting waypoints + downsampling cloud to 1 m",
                 )
                 is HomeViewModel.UiState.Uploading -> UploadingCard(
                     name = s.file.displayName,
@@ -59,15 +63,32 @@ fun HomeScreen(viewModel: HomeViewModel = viewModel()) {
                     total = s.total,
                     onCancel = viewModel::cancel,
                 )
-                is HomeViewModel.UiState.Done -> DoneCard(
+                is HomeViewModel.UiState.AwaitingPreview -> SimpleStatusCard(
+                    title = "Augmenting on Manifold…",
+                    body = "Typically 4 minutes for a Mijande-class building. " +
+                            "The Manifold is registering the perception cloud, " +
+                            "extracting facades, and re-aiming gimbals.",
+                )
+                is HomeViewModel.UiState.ReviewReady -> ReviewCard(
                     name = s.file.displayName,
+                    summary = s.summary,
+                    onApprove = viewModel::approve,
+                    onReject = viewModel::reject,
+                )
+                is HomeViewModel.UiState.Approving -> SimpleStatusCard(
+                    title = "Approving…",
+                    body = "Telling the Manifold to upload the augmented mission to the aircraft.",
+                )
+                is HomeViewModel.UiState.ReadyToFly -> ReadyToFlyCard(
+                    name = s.file.displayName,
+                    summary = s.summary,
                     onOpenPilot2 = { openPilot2(ctx) },
                     onAnother = viewModel::reset,
                 )
                 is HomeViewModel.UiState.Error -> ErrorCard(
                     message = s.message,
                     canRetry = s.file != null,
-                    onRetry = viewModel::send,
+                    onRetry = viewModel::augment,
                     onPickAnother = pick,
                 )
             }
@@ -107,15 +128,105 @@ private fun IdleCard(onPick: () -> Unit) {
 }
 
 @Composable
-private fun PickedCard(name: String, size: Long, onPick: () -> Unit, onSend: () -> Unit) {
+private fun PickedCard(name: String, size: Long, onPick: () -> Unit, onAugment: () -> Unit) {
     Card(modifier = Modifier.fillMaxWidth()) {
         Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             Text("Picked", style = MaterialTheme.typography.titleMedium)
             Text(name, style = MaterialTheme.typography.bodyLarge)
             Text(formatSize(size), style = MaterialTheme.typography.bodySmall)
             Spacer(Modifier.height(4.dp))
-            Button(onClick = onSend, modifier = Modifier.fillMaxWidth()) { Text("Send to Manifold") }
+            Button(onClick = onAugment, modifier = Modifier.fillMaxWidth()) { Text("Augment Mission") }
             OutlinedButton(onClick = onPick, modifier = Modifier.fillMaxWidth()) { Text("Pick a different file") }
+        }
+    }
+}
+
+@Composable
+private fun SimpleStatusCard(title: String, body: String) {
+    Card(modifier = Modifier.fillMaxWidth()) {
+        Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Text(title, style = MaterialTheme.typography.titleMedium)
+            LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+            Text(body, style = MaterialTheme.typography.bodyMedium)
+        }
+    }
+}
+
+@Composable
+private fun ReviewCard(
+    name: String,
+    summary: HomeViewModel.PreviewSummary,
+    onApprove: () -> Unit,
+    onReject: () -> Unit,
+) {
+    Card(modifier = Modifier.fillMaxWidth()) {
+        Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Text("Review augmented mission", style = MaterialTheme.typography.titleMedium)
+            Text(name, style = MaterialTheme.typography.bodyLarge)
+
+            Spacer(Modifier.height(4.dp))
+            // Summary stats
+            Text("• Waypoints: ${summary.waypointCount} (${summary.waypointsAimed} aimed at facades)",
+                 style = MaterialTheme.typography.bodyMedium)
+            Text("• Facades extracted: ${summary.facadeCount}", style = MaterialTheme.typography.bodyMedium)
+            Text("• Gimbal pitch range: %.0f° to %.0f° (median %.1f°)".format(
+                summary.pitchMin, summary.pitchMax, summary.pitchMedian),
+                 style = MaterialTheme.typography.bodyMedium)
+            Text("• ICP RMSE: %.3f m  •  Augmented in %.0f s".format(summary.icpRmseM, summary.elapsedSec),
+                 style = MaterialTheme.typography.bodySmall)
+
+            // Anomaly flags — these are the WPs the pilot should sanity-check.
+            if (summary.anomalyPitchUp > 0 || summary.anomalyPitchDown > 0) {
+                Spacer(Modifier.height(4.dp))
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.tertiaryContainer),
+                ) {
+                    Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        Text("Anomalies (review before approving)",
+                             style = MaterialTheme.typography.titleSmall)
+                        if (summary.anomalyPitchUp > 0) {
+                            Text("• ${summary.anomalyPitchUp} WPs pitched ≥ +25° (overhang/eave OR sky shot)",
+                                 style = MaterialTheme.typography.bodySmall)
+                        }
+                        if (summary.anomalyPitchDown > 0) {
+                            Text("• ${summary.anomalyPitchDown} WPs pitched ≤ −85° (base/ground OR floor)",
+                                 style = MaterialTheme.typography.bodySmall)
+                        }
+                    }
+                }
+            }
+
+            Spacer(Modifier.height(8.dp))
+            Button(onClick = onApprove, modifier = Modifier.fillMaxWidth()) {
+                Text("Approve & upload to aircraft")
+            }
+            OutlinedButton(onClick = onReject, modifier = Modifier.fillMaxWidth()) {
+                Text("Reject")
+            }
+        }
+    }
+}
+
+@Composable
+private fun ReadyToFlyCard(
+    name: String,
+    summary: HomeViewModel.PreviewSummary,
+    onOpenPilot2: () -> Unit,
+    onAnother: () -> Unit,
+) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer),
+    ) {
+        Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Text("Ready to fly ✓", style = MaterialTheme.typography.titleMedium)
+            Text("$name — ${summary.waypointCount} waypoints uploaded to the aircraft.",
+                 style = MaterialTheme.typography.bodyMedium)
+            Text("Switch to DJI Pilot 2 and tap the AeroScan: Fly widget on the live-flight view.",
+                 style = MaterialTheme.typography.bodyMedium)
+            Button(onClick = onOpenPilot2, modifier = Modifier.fillMaxWidth()) { Text("Open DJI Pilot 2") }
+            OutlinedButton(onClick = onAnother, modifier = Modifier.fillMaxWidth()) { Text("Augment another mission") }
         }
     }
 }
@@ -130,18 +241,6 @@ private fun UploadingCard(name: String, sent: Long, total: Long, onCancel: () ->
             LinearProgressIndicator(progress = { pct }, modifier = Modifier.fillMaxWidth())
             Text("${formatSize(sent)} / ${formatSize(total)}  (${(pct * 100).toInt()}%)")
             OutlinedButton(onClick = onCancel) { Text("Cancel") }
-        }
-    }
-}
-
-@Composable
-private fun DoneCard(name: String, onOpenPilot2: () -> Unit, onAnother: () -> Unit) {
-    Card(modifier = Modifier.fillMaxWidth()) {
-        Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            Text("Sent ✓", style = MaterialTheme.typography.titleMedium)
-            Text("$name is on Manifold. Switch to DJI Pilot 2 and tap the AeroScan widget to fly.", style = MaterialTheme.typography.bodyMedium)
-            Button(onClick = onOpenPilot2, modifier = Modifier.fillMaxWidth()) { Text("Open DJI Pilot 2") }
-            OutlinedButton(onClick = onAnother, modifier = Modifier.fillMaxWidth()) { Text("Send another file") }
         }
     }
 }
