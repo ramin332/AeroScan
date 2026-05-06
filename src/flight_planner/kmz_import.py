@@ -248,7 +248,15 @@ def _parse_waylines(xml_bytes: bytes) -> list[ParsedWaypoint]:
         def _i(tag: str, default: int = 0) -> int:
             return int(_f(tag, default))
 
-        alt = _f("executeHeight", 0.0)
+        # Altitude resolution: prefer ellipsoidHeight (WGS84 absolute, always
+        # the same meaning) over executeHeight (heightMode-dependent — Smart3D
+        # KMZs write absolute, our augmenter and Pilot 2 write relative-to-
+        # takeoff). Without this preference, augmented KMZs render WPs ~50 m
+        # below the building cloud because the cloud's ENU origin uses the
+        # absolute WGS84 ref while WPs use a relative-to-takeoff value.
+        alt = _f("ellipsoidHeight", 0.0)
+        if alt == 0.0:
+            alt = _f("executeHeight", 0.0)
         heading = 0.0
         gimbal_pitch = 0.0
 

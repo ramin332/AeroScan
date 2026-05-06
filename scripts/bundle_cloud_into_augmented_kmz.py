@@ -38,21 +38,40 @@ def find_cloud_in_kmz(kmz_bytes: bytes) -> tuple[bytes, str] | None:
     return None
 
 
-def bundle(input_kmz: Path, cloud_ply: bytes, cloud_member_path: str, output_kmz: Path) -> int:
-    """Copy input KMZ to output, adding the cloud at cloud_member_path.
+def find_sfm_geo_desc_in_kmz(kmz_bytes: bytes) -> tuple[bytes, str] | None:
+    """Return (sfm_geo_desc_bytes, original_member_name), or None.
 
-    cloud_member_path should be a Smart3D-style path like
-    `wpmz/res/ply/<mission>/cloud.ply` so the dev frontend's _find_cloud_ply
-    matcher (any name ending in 'cloud.ply') picks it up.
+    sfm_geo_desc.json holds the ENU origin (ref_GPS lat/lon/altitude). Without
+    it, parse_kmz falls back to the first waypoint's altitude as the origin —
+    which is WRONG for the augmented KMZ case where WP altitudes are
+    relative-to-takeoff. The cloud.ply was positioned relative to the
+    ORIGINAL geo desc's altitude (e.g. 52.89 m WGS84), so anchoring WPs at
+    a different alt makes them appear ~48 m below the building cloud.
     """
+    with zipfile.ZipFile(io.BytesIO(kmz_bytes)) as zf:
+        for name in zf.namelist():
+            if name.lower().endswith("sfm_geo_desc.json"):
+                return zf.read(name), name
+    return None
+
+
+def bundle(
+    input_kmz: Path,
+    cloud_ply: bytes,
+    cloud_member_path: str,
+    output_kmz: Path,
+    sfm_geo_desc: bytes | None = None,
+    sfm_geo_desc_member_path: str | None = None,
+) -> int:
+    """Copy input KMZ to output, adding the cloud (and optional geo desc)."""
     out_buf = io.BytesIO()
     with zipfile.ZipFile(input_kmz, "r") as zin, \
          zipfile.ZipFile(out_buf, "w", zipfile.ZIP_DEFLATED) as zout:
-        # Copy existing entries unchanged
         for info in zin.infolist():
             zout.writestr(info, zin.read(info.filename))
-        # Add the cloud
         zout.writestr(cloud_member_path, cloud_ply)
+        if sfm_geo_desc is not None and sfm_geo_desc_member_path:
+            zout.writestr(sfm_geo_desc_member_path, sfm_geo_desc)
     output_kmz.parent.mkdir(parents=True, exist_ok=True)
     output_kmz.write_bytes(out_buf.getvalue())
     return len(out_buf.getvalue())
@@ -74,6 +93,8 @@ def main() -> int:
                         "(default mirrors Smart3D structure).")
     args = p.parse_args()
 
+    sfm_geo_desc: bytes | None = None
+    sfm_geo_desc_path: str | None = None
     if args.source is not None:
         src_bytes = args.source.read_bytes()
         found = find_cloud_in_kmz(src_bytes)
@@ -83,8 +104,17 @@ def main() -> int:
         cloud_ply, original_path = found
         print(f"Source KMZ:    {args.source}  ({len(src_bytes):,} bytes)")
         print(f"  cloud.ply at: {original_path}  ({len(cloud_ply):,} bytes)")
-        # Reuse the Smart3D path so it visually matches a real Smart3D KMZ
         member_path = original_path
+        # Also pull sfm_geo_desc.json so the dev frontend anchors WPs to the
+        # same ENU origin as the cloud — without this, WPs render ~48 m
+        # below the building because they default to using the first WP's
+        # relative altitude as the ref.
+        geo_found = find_sfm_geo_desc_in_kmz(src_bytes)
+        if geo_found is not None:
+            sfm_geo_desc, sfm_geo_desc_path = geo_found
+            print(f"  sfm_geo_desc at: {sfm_geo_desc_path}  ({len(sfm_geo_desc):,} bytes)")
+        else:
+            print("  WARN: source has no sfm_geo_desc.json — WP altitudes may render wrong")
     else:
         cloud_ply = args.cloud_ply.read_bytes()
         print(f"Cloud:         {args.cloud_ply}  ({len(cloud_ply):,} bytes)")
@@ -92,9 +122,15 @@ def main() -> int:
 
     in_size = args.input.stat().st_size
     print(f"Input KMZ:     {args.input}  ({in_size:,} bytes)")
-    out_size = bundle(args.input, cloud_ply, member_path, args.output)
+    out_size = bundle(
+        args.input, cloud_ply, member_path, args.output,
+        sfm_geo_desc=sfm_geo_desc,
+        sfm_geo_desc_member_path=sfm_geo_desc_path,
+    )
     print(f"Output KMZ:    {args.output}  ({out_size:,} bytes)")
     print(f"  cloud.ply at: {member_path}")
+    if sfm_geo_desc_path:
+        print(f"  sfm_geo_desc at: {sfm_geo_desc_path}")
     return 0
 
 
