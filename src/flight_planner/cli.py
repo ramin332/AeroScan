@@ -219,7 +219,16 @@ def augment_mission(
     )
     output_kmz = Path(output_kmz)
     output_kmz.parent.mkdir(parents=True, exist_ok=True)
-    out_path = build_kmz(new_waypoints, config, str(output_kmz))
+    # Bundle the ICP target cloud (the same cloud the augment used) into the
+    # output KMZ at wpmz/res/ply/<name>/cloud.ply. Aircraft ignores it;
+    # makes the artifact self-contained so it can be imported directly into
+    # the dev frontend (server.api._process expects a Smart3D-style KMZ
+    # with the cloud bundled). Adds the icp-target's bytes to the output —
+    # for a 1 m voxel fingerprint that's ~150 KB; for a full curated cloud
+    # it's ~13 MB.
+    bundled_cloud = icp_target_ply.read_bytes()
+    out_path = build_kmz(new_waypoints, config, str(output_kmz),
+                         bundled_cloud_ply=bundled_cloud)
     out_size = Path(out_path).stat().st_size
     _log(f"      done. {out_size:,} bytes")
 

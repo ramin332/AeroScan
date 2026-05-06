@@ -482,8 +482,17 @@ def _build_kmz_zip(
     waypoints: list[Waypoint],
     config: MissionConfig,
     algo: AlgorithmConfig | None = None,
+    bundled_cloud_ply: bytes | None = None,
+    bundled_mission_name: str | None = None,
 ) -> bytes:
-    """Build a complete KMZ (ZIP) with both template.kml and waylines.wpml."""
+    """Build a complete KMZ (ZIP) with both template.kml and waylines.wpml.
+
+    If [bundled_cloud_ply] is non-None, the bytes are embedded at
+    ``wpmz/res/ply/<bundled_mission_name>/cloud.ply`` so the resulting KMZ
+    is self-contained for the dev-frontend import workflow (which expects
+    a Smart3D-style KMZ with a reference cloud). The aircraft's WaypointV3
+    flow ignores the cloud — only the dev viewer needs it.
+    """
     mission = _build_mission(waypoints, config, algo)
     kml = mission.build()
     template_xml_str = _rewrite_wpml_version(kml.to_xml())
@@ -510,6 +519,15 @@ def _build_kmz_zip(
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
         zf.writestr("wpmz/template.kml", template_xml)
         zf.writestr("wpmz/waylines.wpml", waylines_xml)
+        if bundled_cloud_ply is not None:
+            # Mirrors the Smart3D KMZ structure so /api/import-kmz on the
+            # dev backend (server.api._process) can find the cloud at
+            # wpmz/res/ply/<name>/cloud.ply.
+            name = bundled_mission_name or config.mission_name or "mission"
+            # Strip path-unfriendly characters; the dev import doesn't care
+            # about the inner-folder name beyond non-empty + path-clean.
+            safe_name = "".join(c if (c.isalnum() or c in "-_") else "_" for c in name) or "mission"
+            zf.writestr(f"wpmz/res/ply/{safe_name}/cloud.ply", bundled_cloud_ply)
     return buf.getvalue()
 
 
@@ -522,6 +540,7 @@ def build_kmz(
     config: MissionConfig,
     output_path: str,
     algo: AlgorithmConfig | None = None,
+    bundled_cloud_ply: bytes | None = None,
 ) -> str:
     """Generate a DJI WPML-compliant KMZ file.
 
@@ -530,12 +549,16 @@ def build_kmz(
         config: Mission configuration.
         output_path: Path to write the .kmz file.
         algo: Algorithm configuration overrides.
+        bundled_cloud_ply: Optional cloud.ply bytes to embed at
+            ``wpmz/res/ply/<mission>/cloud.ply``. The aircraft ignores it;
+            only the dev frontend's import workflow needs it. Pass-through to
+            :func:`_build_kmz_zip`.
 
     Returns:
         The absolute path to the generated KMZ file.
     """
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
-    data = _build_kmz_zip(waypoints, config, algo)
+    data = _build_kmz_zip(waypoints, config, algo, bundled_cloud_ply=bundled_cloud_ply)
     with open(output_path, "wb") as f:
         f.write(data)
     return os.path.abspath(output_path)
@@ -545,6 +568,7 @@ def build_kmz_bytes(
     waypoints: list[Waypoint],
     config: MissionConfig,
     algo: AlgorithmConfig | None = None,
+    bundled_cloud_ply: bytes | None = None,
 ) -> bytes:
     """Generate a DJI WPML-compliant KMZ file as bytes (in-memory)."""
-    return _build_kmz_zip(waypoints, config, algo)
+    return _build_kmz_zip(waypoints, config, algo, bundled_cloud_ply=bundled_cloud_ply)
