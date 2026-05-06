@@ -38,8 +38,6 @@ from .kmz_import import (
 )
 from .manifold import from_manifold, register_to_kmz_frame
 from .mission_intent import (
-    SCHEMA_VERSION,
-    imported_kmz_to_intent_dict,
     read_intent_json,
     write_intent_json,
 )
@@ -56,6 +54,62 @@ from .models import (
 _NEN_INSPECTION_SPEED_MS = 3.0
 _NEN_MAX_FACADE_DIST_M = 60.0
 _NEN_PITCH_MARGIN_DEG = 2.0
+
+# Anomaly thresholds for preview-side flagging. The 2 m / 1 m fingerprint
+# bench surfaced these as the "edge case" categories that warrant pilot
+# attention: very-up pitches may be valid overhangs OR spurious upward-facing
+# facets from CGAL extraction; very-down pitches may be valid base / floor
+# OR ground points that bled into facet extraction. Real thresholds will be
+# calibrated on the first few field flights.
+_ANOMALY_PITCH_UP_DEG = 25.0
+_ANOMALY_PITCH_DOWN_DEG = -85.0
+
+
+def _gimbal_summary(waypoints: list[Waypoint]) -> dict:
+    """Compact stats over the augmented waypoints — what rc-companion needs
+    to render the preview screen and what the pilot should glance at before
+    approving the mission."""
+    pitches = [float(w.gimbal_pitch_deg) for w in waypoints]
+    yaws = [
+        float(w.gimbal_yaw_deg) if w.gimbal_yaw_deg is not None else float(w.heading_deg)
+        for w in waypoints
+    ]
+    aimed = [w for w in waypoints if w.facade_index >= 0]
+    pitch_up = sum(1 for p in pitches if p >= _ANOMALY_PITCH_UP_DEG)
+    pitch_down = sum(1 for p in pitches if p <= _ANOMALY_PITCH_DOWN_DEG)
+    if pitches:
+        ps = sorted(pitches)
+        n = len(ps)
+        pitch_stats = {
+            "min": ps[0],
+            "max": ps[-1],
+            "median": ps[n // 2],
+            "p25": ps[n // 4],
+            "p75": ps[3 * n // 4],
+        }
+    else:
+        pitch_stats = {"min": 0.0, "max": 0.0, "median": 0.0, "p25": 0.0, "p75": 0.0}
+    return {
+        "waypoint_count": len(waypoints),
+        "waypoints_aimed_at_facade": len(aimed),
+        "waypoints_unmatched": len(waypoints) - len(aimed),
+        "pitch_deg": pitch_stats,
+        "yaw_unique_deg": len({round(y, 1) for y in yaws}),
+        "anomaly_thresholds": {
+            "pitch_up_deg": _ANOMALY_PITCH_UP_DEG,
+            "pitch_down_deg": _ANOMALY_PITCH_DOWN_DEG,
+        },
+        "anomaly_counts": {
+            "pitch_up": pitch_up,
+            "pitch_down": pitch_down,
+        },
+        "anomaly_indices": {
+            "pitch_up": [w.index for w in waypoints
+                         if w.gimbal_pitch_deg >= _ANOMALY_PITCH_UP_DEG],
+            "pitch_down": [w.index for w in waypoints
+                           if w.gimbal_pitch_deg <= _ANOMALY_PITCH_DOWN_DEG],
+        },
+    }
 
 
 def _load_icp_target(icp_target_ply: Path) -> o3d.geometry.PointCloud:
@@ -96,6 +150,7 @@ def augment_mission(
     max_facade_distance_m: float = _NEN_MAX_FACADE_DIST_M,
     inspection_speed_ms: float = _NEN_INSPECTION_SPEED_MS,
     pitch_margin_deg: float = _NEN_PITCH_MARGIN_DEG,
+    summary_json: Path | None = None,
     log: bool = True,
 ) -> dict:
     """Run the full intent-JSON → augmented-KMZ pipeline.
@@ -171,7 +226,8 @@ def augment_mission(
     elapsed = time.monotonic() - t0
     _log(f"Total: {elapsed:.1f} s")
 
-    return {
+    summary = {
+        "schema_version": 1,
         "name": intent.name,
         "flight_id": flight_id,
         "output_kmz": out_path,
@@ -179,9 +235,25 @@ def augment_mission(
         "waypoints_total": len(new_waypoints),
         "waypoints_aimed": aimed,
         "facades": len(facades),
-        "icp": icp_stats,
+        "gimbal_stats": _gimbal_summary(new_waypoints),
+        "icp": {
+            "coarse_yaw_deg": icp_stats["coarse_yaw_deg"],
+            "icp_rmse_m": icp_stats["icp_rmse_m"],
+            "icp_fitness": icp_stats["icp_fitness"],
+            "total_yaw_deg": icp_stats["total_yaw_deg"],
+            "total_translation_m": icp_stats["total_translation_m"],
+        },
+        "icp_per_scale": icp_stats["icp_per_scale"],
         "elapsed_s": elapsed,
     }
+
+    if summary_json is not None:
+        summary_json = Path(summary_json)
+        summary_json.parent.mkdir(parents=True, exist_ok=True)
+        summary_json.write_text(json.dumps(summary, indent=2))
+        _log(f"      summary → {summary_json} ({summary_json.stat().st_size:,} bytes)")
+
+    return summary
 
 
 # ---------------------------------------------------------------------------
@@ -266,6 +338,7 @@ def _cmd_augment_mission(args: argparse.Namespace) -> int:
             max_facade_distance_m=args.max_facade_distance_m,
             inspection_speed_ms=args.inspection_speed_ms,
             pitch_margin_deg=args.pitch_margin_deg,
+            summary_json=args.summary_json,
             log=not args.json,
         )
     finally:
@@ -273,13 +346,8 @@ def _cmd_augment_mission(args: argparse.Namespace) -> int:
             cleanup_target.unlink(missing_ok=True)
 
     if args.json:
-        out = {k: v for k, v in stats.items() if k != "icp"}
-        out["icp"] = {
-            "coarse_yaw_deg": stats["icp"]["coarse_yaw_deg"],
-            "icp_rmse_m": stats["icp"]["icp_rmse_m"],
-            "icp_fitness": stats["icp"]["icp_fitness"],
-        }
-        json.dump(out, sys.stdout, indent=2)
+        # stats already has the trimmed icp; print as-is.
+        json.dump(stats, sys.stdout, indent=2, default=str)
         sys.stdout.write("\n")
     return 0
 
@@ -340,6 +408,10 @@ def build_parser() -> argparse.ArgumentParser:
                     help=f"Per-waypoint flight speed (m/s). Default {_NEN_INSPECTION_SPEED_MS}.")
     am.add_argument("--pitch-margin-deg", type=float, default=_NEN_PITCH_MARGIN_DEG,
                     help=f"Margin from gimbal hardware pitch limits (deg). Default {_NEN_PITCH_MARGIN_DEG}.")
+    am.add_argument("--summary-json", type=Path, default=None,
+                    help="Optional: write a structured summary JSON alongside the output KMZ. "
+                         "kmz_runner.c reads this and ships it back to rc-companion in the "
+                         "PRVW preview frame so the pilot can review before approving.")
     am.add_argument("--json", action="store_true",
                     help="Emit a JSON stats blob on stdout instead of human progress lines.")
     am.set_defaults(func=_cmd_augment_mission)
