@@ -60,7 +60,7 @@ class HomeViewModel(app: Application) : AndroidViewModel(app) {
             /** Where the augmented KMZ was persisted, or null if save failed. */
             val savedKmzPath: String?,
         ) : UiState
-        data class Approving(val file: PickedFile) : UiState
+        data class Approving(val file: PickedFile, val summary: PreviewSummary) : UiState
         data class ReadyToFly(val file: PickedFile, val summary: PreviewSummary) : UiState
         data class Error(val file: PickedFile?, val message: String) : UiState
     }
@@ -239,9 +239,12 @@ class HomeViewModel(app: Application) : AndroidViewModel(app) {
                             _ui.value = UiState.ReviewReady(picked, summary, ev.augmentedKmz, savedPath)
                         }
                         is AugmentSession.Event.ExecuteSent -> {
-                            val rr = _ui.value as? UiState.ReviewReady
-                            if (rr != null) {
-                                _ui.value = UiState.ReadyToFly(rr.file, rr.summary)
+                            // approve() flipped state to Approving before sending
+                            // EXEC, so by the time this event lands the state is
+                            // Approving (NOT ReviewReady). Transition from there.
+                            val approving = _ui.value as? UiState.Approving
+                            if (approving != null) {
+                                _ui.value = UiState.ReadyToFly(approving.file, approving.summary)
                             }
                         }
                         is AugmentSession.Event.Cancelled -> {
@@ -265,7 +268,7 @@ class HomeViewModel(app: Application) : AndroidViewModel(app) {
         val rr = _ui.value as? UiState.ReviewReady ?: return
         val sess = session ?: return
         viewModelScope.launch {
-            _ui.value = UiState.Approving(rr.file)
+            _ui.value = UiState.Approving(rr.file, rr.summary)
             sess.approve(missionId = rr.summary.name)
             // ExecuteSent event → ReadyToFly transition wired in the events
             // collector above.
