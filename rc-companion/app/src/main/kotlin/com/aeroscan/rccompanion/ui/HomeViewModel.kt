@@ -17,6 +17,11 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
+import java.io.File
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+import java.util.TimeZone
 
 /**
  * State machine for the augment flow:
@@ -52,6 +57,8 @@ class HomeViewModel(app: Application) : AndroidViewModel(app) {
             val file: PickedFile,
             val summary: PreviewSummary,
             val augmentedKmz: ByteArray,
+            /** Where the augmented KMZ was persisted, or null if save failed. */
+            val savedKmzPath: String?,
         ) : UiState
         data class Approving(val file: PickedFile) : UiState
         data class ReadyToFly(val file: PickedFile, val summary: PreviewSummary) : UiState
@@ -220,7 +227,16 @@ class HomeViewModel(app: Application) : AndroidViewModel(app) {
                                         "Preview JSON parse failed: ${it.message}")
                                     return@collect
                                 }
-                            _ui.value = UiState.ReviewReady(picked, summary, ev.augmentedKmz)
+                            // Persist the augmented KMZ + summary to app-private
+                            // external storage so the pilot can transfer them off
+                            // the RC via USB (visible under Android/data/<pkg>/files/
+                            // missions/) without root or extra permissions. Survives
+                            // the in-memory UiState — pilot can recover the artifact
+                            // even after Reject.
+                            val savedPath = saveAugmentedKmz(
+                                ctx, picked.displayName, ev.augmentedKmz, ev.summaryJson,
+                            )
+                            _ui.value = UiState.ReviewReady(picked, summary, ev.augmentedKmz, savedPath)
                         }
                         is AugmentSession.Event.ExecuteSent -> {
                             val rr = _ui.value as? UiState.ReviewReady
@@ -263,6 +279,37 @@ class HomeViewModel(app: Application) : AndroidViewModel(app) {
             sess?.closeAndRelease()
             session = null
             _ui.value = UiState.Idle
+        }
+    }
+
+    private fun saveAugmentedKmz(
+        ctx: android.content.Context,
+        sourceName: String,
+        kmzBytes: ByteArray,
+        summaryJson: ByteArray,
+    ): String? {
+        return try {
+            // App-scoped external storage: /sdcard/Android/data/<pkg>/files/missions/
+            // Visible via Files app + USB. No special permissions needed (API 19+).
+            // Survives app updates; cleared on uninstall.
+            val baseDir = ctx.getExternalFilesDir(null) ?: ctx.filesDir
+            val missionsDir = File(baseDir, "missions").apply { mkdirs() }
+
+            val tsFmt = SimpleDateFormat("yyyyMMdd'T'HHmmss'Z'", Locale.US).apply {
+                timeZone = TimeZone.getTimeZone("UTC")
+            }
+            val ts = tsFmt.format(Date())
+            // Strip any path components from the picked filename and the .kmz suffix.
+            val baseName = File(sourceName).nameWithoutExtension.take(40)
+
+            val kmzFile = File(missionsDir, "${ts}_${baseName}.augmented.kmz")
+            kmzFile.writeBytes(kmzBytes)
+            File(missionsDir, "${ts}_${baseName}.summary.json").writeBytes(summaryJson)
+
+            kmzFile.absolutePath
+        } catch (t: Throwable) {
+            android.util.Log.e("HomeViewModel", "saveAugmentedKmz failed", t)
+            null
         }
     }
 }

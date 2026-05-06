@@ -79,6 +79,7 @@ fun HomeScreen(viewModel: HomeViewModel = viewModel()) {
                 is HomeViewModel.UiState.ReviewReady -> ReviewCard(
                     name = s.file.displayName,
                     summary = s.summary,
+                    savedKmzPath = s.savedKmzPath,
                     onApprove = viewModel::approve,
                     onReject = viewModel::reject,
                 )
@@ -163,6 +164,7 @@ private fun SimpleStatusCard(title: String, body: String) {
 private fun ReviewCard(
     name: String,
     summary: HomeViewModel.PreviewSummary,
+    savedKmzPath: String?,
     onApprove: () -> Unit,
     onReject: () -> Unit,
 ) {
@@ -202,6 +204,23 @@ private fun ReviewCard(
                         }
                     }
                 }
+            }
+
+            // Saved-to-disk note. Helps the pilot find the augmented KMZ via
+            // USB / Files app to inspect on a laptop later.
+            if (savedKmzPath != null) {
+                Spacer(Modifier.height(4.dp))
+                Text(
+                    "Saved: $savedKmzPath",
+                    style = MaterialTheme.typography.bodySmall,
+                )
+            } else {
+                Spacer(Modifier.height(4.dp))
+                Text(
+                    "Save to device storage failed (KMZ still in memory until reject).",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.error,
+                )
             }
 
             Spacer(Modifier.height(8.dp))
