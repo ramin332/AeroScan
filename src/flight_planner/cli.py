@@ -55,6 +55,8 @@ from .models import (
 _NEN_INSPECTION_SPEED_MS = 3.0
 _NEN_MAX_FACADE_DIST_M = 60.0
 _NEN_PITCH_MARGIN_DEG = 2.0
+_NEN_WALL_BONUS = 0.5
+_NEN_SMOOTH_ALPHA = 0.6
 
 # Anomaly thresholds for preview-side flagging. The 2 m / 1 m fingerprint
 # bench surfaced these as the "edge case" categories that warrant pilot
@@ -151,6 +153,8 @@ def augment_mission(
     max_facade_distance_m: float = _NEN_MAX_FACADE_DIST_M,
     inspection_speed_ms: float = _NEN_INSPECTION_SPEED_MS,
     pitch_margin_deg: float = _NEN_PITCH_MARGIN_DEG,
+    wall_distance_bonus: float = _NEN_WALL_BONUS,
+    smooth_alpha: float = _NEN_SMOOTH_ALPHA,
     summary_json: Path | None = None,
     log: bool = True,
 ) -> dict:
@@ -238,13 +242,18 @@ def augment_mission(
             "filter dropped everything, or facade-detection thresholds are too tight."
         )
 
-    _log("[6/7] Rewriting gimbals perpendicular to nearest facade…")
+    _log(
+        f"[6/7] Rewriting gimbals (wall bonus {wall_distance_bonus}, "
+        f"EMA α={smooth_alpha})…"
+    )
     new_waypoints = rewrite_gimbals_perpendicular(
         waypoints=waypoints,
         facades=facades,
         max_distance_m=max_facade_distance_m,
         pitch_margin_deg=pitch_margin_deg,
         preserve_heading=True,
+        wall_distance_bonus=wall_distance_bonus,
+        smooth_alpha=smooth_alpha,
     )
     # NEN-2767: stop-and-shoot at fixed speed, single TAKE_PHOTO per WP.
     # Matches server.api /versions/{id}/rewrite-gimbals exactly.
@@ -390,6 +399,8 @@ def _cmd_augment_mission(args: argparse.Namespace) -> int:
             max_facade_distance_m=args.max_facade_distance_m,
             inspection_speed_ms=args.inspection_speed_ms,
             pitch_margin_deg=args.pitch_margin_deg,
+            wall_distance_bonus=args.wall_distance_bonus,
+            smooth_alpha=args.smooth_alpha,
             summary_json=args.summary_json,
             log=not args.json,
         )
@@ -460,6 +471,14 @@ def build_parser() -> argparse.ArgumentParser:
                     help=f"Per-waypoint flight speed (m/s). Default {_NEN_INSPECTION_SPEED_MS}.")
     am.add_argument("--pitch-margin-deg", type=float, default=_NEN_PITCH_MARGIN_DEG,
                     help=f"Margin from gimbal hardware pitch limits (deg). Default {_NEN_PITCH_MARGIN_DEG}.")
+    am.add_argument("--wall-distance-bonus", type=float, default=_NEN_WALL_BONUS,
+                    help=f"Selection-distance multiplier for wall facets (0–1). "
+                         f"Lower = stronger wall bias; 1.0 = no bias. "
+                         f"Default {_NEN_WALL_BONUS}.")
+    am.add_argument("--smooth-alpha", type=float, default=_NEN_SMOOTH_ALPHA,
+                    help=f"EMA coefficient for gimbal smoothing across consecutive "
+                         f"matched WPs (0–1). 1.0 disables smoothing. "
+                         f"Default {_NEN_SMOOTH_ALPHA}.")
     am.add_argument("--summary-json", type=Path, default=None,
                     help="Optional: write a structured summary JSON alongside the output KMZ. "
                          "kmz_runner.c reads this and ships it back to rc-companion in the "

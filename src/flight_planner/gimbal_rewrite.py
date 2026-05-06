@@ -32,55 +32,100 @@ def _pick_facade_for_waypoint(
     wp_xyz: np.ndarray,
     facades: Sequence[Facade],
     max_distance_m: float,
-    prefer_walls: bool = True,
+    wall_distance_bonus: float = 0.5,
 ) -> tuple[int, float] | None:
-    """Find the closest outward-facing facade to this waypoint.
+    """Find the best outward-facing facade for this waypoint by weighted distance.
 
     Returns (facade_index, signed_perp_distance) or None if no facade is
     within ``max_distance_m`` on its outward side.
 
-    With ``prefer_walls=True`` (default), walls are searched first: if any
-    wall is reachable, the closest wall wins, even when a roof/tilted facet
-    is geometrically closer. This matches NEN-2767 inspection intent —
-    inspectors care about walls; roofs/soffits are secondary. Without this
-    bias, on a Mijande-style building (~5× more roof facets than wall
-    facets), a large fraction of WPs end up aimed straight down at roofs
-    or up at soffits instead of perpendicular to the wall they're flying
-    past. Falls back to all facets if no wall is in range — preserves
-    coverage of non-wall features.
+    Walls (label starts with ``wall_``) get their selection distance
+    multiplied by ``wall_distance_bonus``. With the default 0.5, a wall at
+    10 m beats a roof at 4.9 m, but a roof at 4 m beats a wall at 10 m —
+    the picker leans toward walls when reasonable, but still chooses
+    non-wall facets when the WP is genuinely closer to one (e.g., flying
+    *over* a roof during a transit segment). Set bonus to 1.0 to disable
+    the bias entirely, or below 0.5 for a stronger wall preference.
     """
-    if prefer_walls:
-        wall_facades = [(i, f) for i, f in enumerate(facades)
-                        if (f.label or "").startswith("wall_")]
-        if wall_facades:
-            pick = _closest_outward(wp_xyz, wall_facades, max_distance_m)
-            if pick is not None:
-                return pick
-    return _closest_outward(
-        wp_xyz, list(enumerate(facades)), max_distance_m,
-    )
-
-
-def _closest_outward(
-    wp_xyz: np.ndarray,
-    indexed_facades: Sequence[tuple[int, Facade]],
-    max_distance_m: float,
-) -> tuple[int, float] | None:
-    """Pick the facade with smallest positive (outward) perpendicular distance."""
     best: tuple[int, float] | None = None
-    best_abs = float("inf")
+    best_weighted = float("inf")
 
-    for i, f in indexed_facades:
+    for i, f in enumerate(facades):
         n = _unit(np.asarray(f.normal, dtype=np.float64))
         c = np.asarray(f.center, dtype=np.float64)
         signed = float(np.dot(n, wp_xyz - c))
         if signed <= 0 or signed > max_distance_m:
             continue
-        if signed < best_abs:
-            best_abs = signed
+        is_wall = (f.label or "").startswith("wall_")
+        weighted = signed * (wall_distance_bonus if is_wall else 1.0)
+        if weighted < best_weighted:
+            best_weighted = weighted
             best = (i, signed)
 
     return best
+
+
+def _smooth_gimbal_ema(
+    waypoints: list[Waypoint],
+    alpha: float,
+) -> list[Waypoint]:
+    """Exponentially-smooth gimbal pitch/yaw along the trajectory.
+
+    Drone flight paths are smooth, so the gimbal should glide between
+    facades rather than snap. EMA filters out occasional bad facade picks
+    and produces a more cinematic / calmer gimbal track.
+
+    * ``alpha=1.0`` → no smoothing (identity).
+    * ``alpha=0.6`` → mild smoothing (default).
+    * ``alpha→0`` → almost frozen (the first matched WP dominates).
+
+    Only re-aimed WPs (``facade_index >= 0``) participate. Unmatched WPs
+    keep their original DJI pose untouched, AND reset the EMA state — so a
+    matched WP after a gap starts fresh instead of carrying state from a
+    different building region.
+
+    Yaw is smoothed on the unit circle (cos/sin EMA → atan2) to handle the
+    ±180° wraparound correctly; otherwise crossing 180° would lurch the
+    EMA the long way around the compass.
+    """
+    if not waypoints or alpha >= 1.0:
+        return waypoints
+
+    out = list(waypoints)
+    ema_pitch: float | None = None
+    ema_yx: float | None = None
+    ema_yy: float | None = None
+
+    for i, wp in enumerate(out):
+        if wp.facade_index < 0:
+            ema_pitch = ema_yx = ema_yy = None
+            continue
+
+        p = float(wp.gimbal_pitch_deg)
+        yaw_deg = (
+            float(wp.gimbal_yaw_deg)
+            if wp.gimbal_yaw_deg is not None
+            else float(wp.heading_deg)
+        )
+        yx = math.cos(math.radians(yaw_deg))
+        yy = math.sin(math.radians(yaw_deg))
+
+        if ema_pitch is None:
+            ema_pitch, ema_yx, ema_yy = p, yx, yy
+            continue
+
+        ema_pitch = alpha * p + (1.0 - alpha) * ema_pitch
+        ema_yx = alpha * yx + (1.0 - alpha) * ema_yx
+        ema_yy = alpha * yy + (1.0 - alpha) * ema_yy
+
+        smoothed_yaw = math.degrees(math.atan2(ema_yy, ema_yx))
+        out[i] = replace(
+            wp,
+            gimbal_pitch_deg=float(ema_pitch),
+            gimbal_yaw_deg=float(smoothed_yaw),
+        )
+
+    return out
 
 
 def rewrite_gimbals_perpendicular(
@@ -89,9 +134,11 @@ def rewrite_gimbals_perpendicular(
     max_distance_m: float = 60.0,
     pitch_margin_deg: float = 2.0,
     preserve_heading: bool = True,
+    wall_distance_bonus: float = 0.5,
+    smooth_alpha: float = 0.6,
 ) -> list[Waypoint]:
     """Rewrite ``gimbal_pitch_deg`` / ``gimbal_yaw_deg`` so each waypoint
-    photographs the nearest facade head-on.
+    photographs the best nearby facade head-on.
 
     Parameters
     ----------
@@ -108,6 +155,15 @@ def rewrite_gimbals_perpendicular(
         If True (default), only update the gimbal and leave aircraft heading
         alone — safer, since DJI's waypoint heading drives turn smoothing.
         Gimbal yaw is then stored absolutely (relative to north, not aircraft).
+    wall_distance_bonus
+        Selection-distance multiplier applied to wall facets (0–1, default
+        0.5). Lower values bias the picker more toward walls; 1.0 disables
+        the bias. Keeps roof-aiming valid when the WP is genuinely above one.
+    smooth_alpha
+        EMA coefficient (0–1, default 0.6) for post-pick gimbal smoothing
+        across consecutive matched WPs. 1.0 disables smoothing; lower
+        values produce a calmer gimbal track at the cost of lag through
+        facade transitions.
 
     Returns a new list of Waypoints; input list is not mutated.
     """
@@ -117,7 +173,10 @@ def rewrite_gimbals_perpendicular(
     out: list[Waypoint] = []
     for wp in waypoints:
         pos = np.array([wp.x, wp.y, wp.z], dtype=np.float64)
-        pick = _pick_facade_for_waypoint(pos, facades, max_distance_m)
+        pick = _pick_facade_for_waypoint(
+            pos, facades, max_distance_m,
+            wall_distance_bonus=wall_distance_bonus,
+        )
         if pick is None:
             out.append(replace(wp, facade_index=wp.facade_index))
             continue
@@ -151,4 +210,4 @@ def rewrite_gimbals_perpendicular(
         )
         out.append(new_wp)
 
-    return out
+    return _smooth_gimbal_ema(out, alpha=smooth_alpha)

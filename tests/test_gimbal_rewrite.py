@@ -91,41 +91,90 @@ def test_picks_nearest_facade_when_multiple_available():
     assert out.facade_index == 0
 
 
-def test_prefers_walls_over_geometrically_closer_roof():
-    # Roof facade (upward-facing) is geometrically closer to the waypoint,
-    # but the wall (in range) should win because of the wall-preference bias.
-    # Waypoint is high up + slightly east of building center.
+def test_wall_bias_wins_at_modest_distance():
+    # Wall is moderately farther than the roof; with default bonus=0.5, a
+    # wall up to ~2× the roof distance should still win — biases toward
+    # walls during inspection passes alongside the building.
     roof = _make_facade(
         normal=(0.0, 0.0, 1.0), center=(0.0, 0.0, 4.0), label="roof_3",
     )
     wall = _make_facade(
-        normal=(1.0, 0.0, 0.0), center=(2.0, 0.0, 3.0), label="wall_7",
+        normal=(1.0, 0.0, 0.0), center=(5.0, 0.0, 5.0), label="wall_7",
     )
-    wp = Waypoint(x=4.0, y=0.0, z=4.5)
+    # WP is 3 m above the roof, 5 m east of the wall → weighted: roof=3.0,
+    # wall=5.0×0.5=2.5 → wall wins.
+    wp = Waypoint(x=10.0, y=0.0, z=7.0)
 
     out = rewrite_gimbals_perpendicular([wp], [roof, wall])[0]
 
-    # Wall is at index 1 in the input; assert the picker chose the wall.
     assert out.facade_index == 1
-    # Looking west into the wall → yaw ≈ -90°; pitch should be near horizontal,
-    # NOT straight-down (which is what aiming at the roof would have produced).
     assert abs(out.gimbal_yaw_deg - (-90.0)) < 5.0
-    assert out.gimbal_pitch_deg > -45.0
 
 
-def test_falls_back_to_roof_when_no_wall_in_range():
-    # Roof is the only facet within max_distance; wall-preference should
-    # gracefully fall through to the all-facets pick.
+def test_roof_wins_when_wp_genuinely_above():
+    # WP is over the roof and the wall is far enough that the bonus can't
+    # save it. Captures the "flying over the building" case the bias must
+    # not break.
     roof = _make_facade(
-        normal=(0.0, 0.0, 1.0), center=(0.0, 0.0, 4.0), label="roof_3",
+        normal=(0.0, 0.0, 1.0), center=(15.0, 0.0, 4.0), label="roof_3",
     )
-    far_wall = _make_facade(
-        normal=(1.0, 0.0, 0.0), center=(-200.0, 0.0, 3.0), label="wall_7",
+    wall = _make_facade(
+        normal=(1.0, 0.0, 0.0), center=(10.0, 0.0, 3.0), label="wall_7",
     )
-    wp = Waypoint(x=0.5, y=0.0, z=10.0)
+    # roof signed = 6-4 = 2; wall signed = 15-10 = 5 → weighted roof=2,
+    # wall=2.5 → roof wins.
+    wp = Waypoint(x=15.0, y=0.0, z=6.0)
 
-    out = rewrite_gimbals_perpendicular(
-        [wp], [roof, far_wall], max_distance_m=20.0,
-    )[0]
+    out = rewrite_gimbals_perpendicular([wp], [roof, wall])[0]
 
     assert out.facade_index == 0
+    # Pointed down at the roof (clamped within hardware pitch margin)
+    assert out.gimbal_pitch_deg < -60.0
+
+
+def test_ema_smooths_yaw_across_facade_transition():
+    # Two adjacent walls 90° apart (north + east). The trajectory walks
+    # along facade A then transitions to facade B. With smoothing, the WP
+    # at the transition should land partway between the two yaws — not
+    # snap from -90° to 180°.
+    east_wall = _make_facade(
+        normal=(1.0, 0.0, 0.0), center=(0.0, 0.0, 2.0), label="wall_0",
+    )
+    north_wall = _make_facade(
+        normal=(0.0, 1.0, 0.0), center=(0.0, 0.0, 2.0), label="wall_1",
+    )
+    # 4 WPs walking along the corner of the two walls (which intersect at
+    # x=0, y=0). First two are firmly behind the north plane (north
+    # filtered, east wins). Last two are firmly behind the east plane
+    # (east filtered, north wins). The transition is hard at WP[2].
+    wps = [
+        Waypoint(x=5.0, y=-5.0, z=2.0, index=0),
+        Waypoint(x=5.0, y=-3.0, z=2.0, index=1),
+        Waypoint(x=-3.0, y=5.0, z=2.0, index=2),
+        Waypoint(x=-5.0, y=5.0, z=2.0, index=3),
+    ]
+
+    smoothed = rewrite_gimbals_perpendicular(
+        wps, [east_wall, north_wall], smooth_alpha=0.5,
+    )
+    raw = rewrite_gimbals_perpendicular(
+        wps, [east_wall, north_wall], smooth_alpha=1.0,
+    )
+
+    # Raw: WP[2] should be aimed straight at the north wall (yaw=180°).
+    # Smoothed: WP[2] should be partway between the prior east-wall yaw
+    # (-90°) and the north-wall yaw (180°), so it can't equal raw exactly.
+    assert raw[2].facade_index == 1
+    assert smoothed[2].facade_index == 1
+    assert smoothed[2].gimbal_yaw_deg != raw[2].gimbal_yaw_deg
+
+
+def test_ema_disabled_when_alpha_one():
+    # alpha=1.0 should be identity — verify with a 3-WP smoke trajectory.
+    wall = _make_facade(
+        normal=(1.0, 0.0, 0.0), center=(0.0, 0.0, 2.0), label="wall_0",
+    )
+    wps = [Waypoint(x=5.0, y=float(j), z=2.0, index=j) for j in range(3)]
+    out = rewrite_gimbals_perpendicular(wps, [wall], smooth_alpha=1.0)
+    for w in out:
+        assert abs(w.gimbal_yaw_deg - (-90.0)) < 0.5
