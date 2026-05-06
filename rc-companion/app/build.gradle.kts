@@ -90,4 +90,9 @@ dependencies {
 
     testImplementation("junit:junit:4.13.2")
     testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.8.1")
+    // Android's android.jar ships only stubs for org.json and org.xmlpull
+    // — fine on-device, but JVM unit tests need real implementations.
+    testImplementation("org.json:json:20240303")
+    testImplementation("net.sf.kxml:kxml2:2.3.0")
+    testImplementation("xmlpull:xmlpull:1.1.3.1")
 }
