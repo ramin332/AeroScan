@@ -32,24 +32,49 @@ def _pick_facade_for_waypoint(
     wp_xyz: np.ndarray,
     facades: Sequence[Facade],
     max_distance_m: float,
+    prefer_walls: bool = True,
 ) -> tuple[int, float] | None:
     """Find the closest outward-facing facade to this waypoint.
 
     Returns (facade_index, signed_perp_distance) or None if no facade is
     within ``max_distance_m`` on its outward side.
+
+    With ``prefer_walls=True`` (default), walls are searched first: if any
+    wall is reachable, the closest wall wins, even when a roof/tilted facet
+    is geometrically closer. This matches NEN-2767 inspection intent —
+    inspectors care about walls; roofs/soffits are secondary. Without this
+    bias, on a Mijande-style building (~5× more roof facets than wall
+    facets), a large fraction of WPs end up aimed straight down at roofs
+    or up at soffits instead of perpendicular to the wall they're flying
+    past. Falls back to all facets if no wall is in range — preserves
+    coverage of non-wall features.
     """
+    if prefer_walls:
+        wall_facades = [(i, f) for i, f in enumerate(facades)
+                        if (f.label or "").startswith("wall_")]
+        if wall_facades:
+            pick = _closest_outward(wp_xyz, wall_facades, max_distance_m)
+            if pick is not None:
+                return pick
+    return _closest_outward(
+        wp_xyz, list(enumerate(facades)), max_distance_m,
+    )
+
+
+def _closest_outward(
+    wp_xyz: np.ndarray,
+    indexed_facades: Sequence[tuple[int, Facade]],
+    max_distance_m: float,
+) -> tuple[int, float] | None:
+    """Pick the facade with smallest positive (outward) perpendicular distance."""
     best: tuple[int, float] | None = None
     best_abs = float("inf")
 
-    for i, f in enumerate(facades):
+    for i, f in indexed_facades:
         n = _unit(np.asarray(f.normal, dtype=np.float64))
         c = np.asarray(f.center, dtype=np.float64)
         signed = float(np.dot(n, wp_xyz - c))
-        # Outward side only — if the waypoint is behind the facade (signed < 0)
-        # we'd be pointing the camera at the inside wall, skip.
-        if signed <= 0:
-            continue
-        if signed > max_distance_m:
+        if signed <= 0 or signed > max_distance_m:
             continue
         if signed < best_abs:
             best_abs = signed

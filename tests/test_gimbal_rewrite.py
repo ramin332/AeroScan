@@ -9,7 +9,12 @@ from flight_planner.gimbal_rewrite import rewrite_gimbals_perpendicular
 from flight_planner.models import Facade, Waypoint
 
 
-def _make_facade(normal: tuple[float, float, float], center: tuple[float, float, float], size: float = 4.0) -> Facade:
+def _make_facade(
+    normal: tuple[float, float, float],
+    center: tuple[float, float, float],
+    size: float = 4.0,
+    label: str = "test",
+) -> Facade:
     """Build a square facade of given size, centered at `center`, facing `normal`."""
     n = np.array(normal, dtype=np.float64)
     n /= np.linalg.norm(n)
@@ -19,7 +24,7 @@ def _make_facade(normal: tuple[float, float, float], center: tuple[float, float,
     c = np.array(center, dtype=np.float64)
     h = size / 2.0
     verts = np.array([c - h * u - h * v, c + h * u - h * v, c + h * u + h * v, c - h * u + h * v])
-    return Facade(vertices=verts, normal=n, component_tag="21.1", label="test", index=0)
+    return Facade(vertices=verts, normal=n, component_tag="21.1", label=label, index=0)
 
 
 def test_east_facing_wall_gets_yaw_west():
@@ -82,5 +87,45 @@ def test_picks_nearest_facade_when_multiple_available():
     wp = Waypoint(x=3.0, y=0.0, z=2.0)
 
     out = rewrite_gimbals_perpendicular([wp], [near, far])[0]
+
+    assert out.facade_index == 0
+
+
+def test_prefers_walls_over_geometrically_closer_roof():
+    # Roof facade (upward-facing) is geometrically closer to the waypoint,
+    # but the wall (in range) should win because of the wall-preference bias.
+    # Waypoint is high up + slightly east of building center.
+    roof = _make_facade(
+        normal=(0.0, 0.0, 1.0), center=(0.0, 0.0, 4.0), label="roof_3",
+    )
+    wall = _make_facade(
+        normal=(1.0, 0.0, 0.0), center=(2.0, 0.0, 3.0), label="wall_7",
+    )
+    wp = Waypoint(x=4.0, y=0.0, z=4.5)
+
+    out = rewrite_gimbals_perpendicular([wp], [roof, wall])[0]
+
+    # Wall is at index 1 in the input; assert the picker chose the wall.
+    assert out.facade_index == 1
+    # Looking west into the wall → yaw ≈ -90°; pitch should be near horizontal,
+    # NOT straight-down (which is what aiming at the roof would have produced).
+    assert abs(out.gimbal_yaw_deg - (-90.0)) < 5.0
+    assert out.gimbal_pitch_deg > -45.0
+
+
+def test_falls_back_to_roof_when_no_wall_in_range():
+    # Roof is the only facet within max_distance; wall-preference should
+    # gracefully fall through to the all-facets pick.
+    roof = _make_facade(
+        normal=(0.0, 0.0, 1.0), center=(0.0, 0.0, 4.0), label="roof_3",
+    )
+    far_wall = _make_facade(
+        normal=(1.0, 0.0, 0.0), center=(-200.0, 0.0, 3.0), label="wall_7",
+    )
+    wp = Waypoint(x=0.5, y=0.0, z=10.0)
+
+    out = rewrite_gimbals_perpendicular(
+        [wp], [roof, far_wall], max_distance_m=20.0,
+    )[0]
 
     assert out.facade_index == 0

@@ -31,6 +31,7 @@ from .gimbal_rewrite import rewrite_gimbals_perpendicular
 from .kmz_builder import build_kmz
 from .kmz_import import (
     ImportedKmz,
+    _points_in_polygon_xy,
     facades_from_pointcloud_cgal,
     parse_kmz,
     polygon_to_enu,
@@ -182,10 +183,52 @@ def augment_mission(
         _log(f"        {s['voxel_m']*100:.0f} cm   fitness {s['fitness']:.3f}   RMSE {s['rmse_m']:.3f} m")
     _log(f"      coarse yaw: {icp_stats['coarse_yaw_deg']:.0f}°   final RMSE: {icp_stats['icp_rmse_m']:.3f} m")
 
+    # Match dev frontend's input characteristics before facade extraction.
+    # /blackbox is everything-within-sensor-range (1.7M pts after 10 cm voxel
+    # — 4× denser than dev's curated KMZ cloud and full of ground/surrounding
+    # noise). DJI's KMZ cloud is pre-trimmed to building-only at ~10 cm.
+    # Without these three steps the CGAL extractor sees too much non-building
+    # mass and emits ~5× more roof+ground facets than walls (369 walls vs
+    # 1821 roofs vs 689 tilted on Mijande), which biases the gimbal picker
+    # toward roofs and produces too-much-up/too-much-down complaints.
+    pre_pts = len(registered.points)
+    n_after_poly = pre_pts
+    z_floor = None
+    # 1) Polygon clip in XY: drop scan noise outside the mission area.
+    if polygon_enu and len(polygon_enu) >= 3:
+        poly_xy = np.array([(p[0], p[1]) for p in polygon_enu], dtype=np.float64)
+        pts = np.asarray(registered.points)
+        mask = _points_in_polygon_xy(pts[:, :2], poly_xy)
+        if mask.sum() > 0:
+            registered = o3d.geometry.PointCloud()
+            registered.points = o3d.utility.Vector3dVector(pts[mask])
+            n_after_poly = int(mask.sum())
+    # 2) Z-floor: drop ground points (5th-percentile Z + 1m buffer is a
+    # robust "ground level" estimate that survives outliers).
+    pts = np.asarray(registered.points)
+    if len(pts) > 0:
+        z_floor = float(np.percentile(pts[:, 2], 5)) + 1.0
+        above = pts[pts[:, 2] > z_floor]
+        if len(above) > 0:
+            registered = o3d.geometry.PointCloud()
+            registered.points = o3d.utility.Vector3dVector(above)
+    # 3) Revoxel to dev's target density (~10 cm) so CGAL's region-growing
+    # k-NN sees comparable neighborhood density. The 10 cm voxel earlier
+    # was pre-ICP; this one shapes the extractor input.
+    registered = registered.voxel_down_sample(0.10)
+    _log(
+        f"      dev-match prep: {pre_pts:,} pts → polygon-clip {n_after_poly:,} → "
+        f"z>{z_floor:.2f}m & revoxel(10cm) → {len(registered.points):,} pts"
+        if z_floor is not None
+        else f"      dev-match prep: {pre_pts:,} → {len(registered.points):,} pts (polygon clip + revoxel(10cm))"
+    )
+
     _log("[5/7] Extracting facades (CGAL region growing)…")
+    # Polygon already pre-applied above as a hard XY clip — pass None so the
+    # extractor's centroid-based polygon test doesn't double-filter.
     facades = facades_from_pointcloud_cgal(
         np.asarray(registered.points, dtype=np.float64),
-        polygon_enu if polygon_enu else None,
+        None,
     )
     _log(f"      facades: {len(facades)}")
     if not facades:
