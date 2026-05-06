@@ -20,6 +20,11 @@ import numpy as np
 from ._profiling import timed
 from .models import AlgorithmConfig, Building, Facade, meters_per_deg, RoofType
 
+# Manifold loader is implemented in flight_planner.manifold for cohesion;
+# re-exported here so callers can use building_import.from_manifold(...)
+# alongside the other building constructors.
+from .manifold import from_manifold  # noqa: F401
+
 
 def decode_mesh_viewer_data(raw_mesh: dict) -> tuple[np.ndarray, np.ndarray]:
     """Decode mesh_viewer_data to (vertices, faces) numpy arrays.
