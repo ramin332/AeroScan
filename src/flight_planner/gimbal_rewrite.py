@@ -84,28 +84,35 @@ def _pick_facade_for_waypoint(
 def _smooth_gimbal_window(
     waypoints: list[Waypoint],
     window: int,
+    yaw_outlier_deg: float = 60.0,
+    pitch_outlier_deg: float = 30.0,
+    min_coherent_members: int = 2,
 ) -> list[Waypoint]:
-    """Centered moving-window average of gimbal pitch/yaw along the trajectory.
+    """Outlier-rejecting centered-window smoother for gimbal pitch/yaw.
 
-    Single-pass EMA proved too narrow for our use case — drones travel in
-    long flowy arcs around buildings (corners, orbits, sweeps), and a
-    causal exponential filter both lags through transitions and produces
-    asymmetric smoothing (head-of-arc smoother than tail-of-arc). A
-    centered window doesn't lag and gives uniform smoothing along the
-    whole arc.
+    Plain mean-of-window failed in practice: when the window straddled a
+    facade transition or contained one bad outlier pick, the mean blurred
+    the bad value into all neighbors. Pitch averaging across sign-flips
+    collapsed to 0° (e.g., five WPs of [+25, +20, -10, -25, -30] → mean
+    -4° looking nowhere). Yaw averaging across opposite directions
+    cancelled the unit-circle vector to ~0 magnitude → atan2(0,0)=0°
+    pointing arbitrarily north.
 
-    For each WP at index i, average over WPs in [i - window/2, i + window/2]
-    that have a matched facade. Unmatched WPs keep their original DJI
-    pose and are excluded from any window's average — they don't pollute
-    neighboring smoothed values.
+    Fix: per-WP outlier rejection. Drop window members whose yaw differs
+    from the center WP's by > ``yaw_outlier_deg`` or whose pitch differs
+    by > ``pitch_outlier_deg``. If fewer than ``min_coherent_members``
+    survive, fall back to the WP's own raw pose (no smoothing). This
+    keeps real transitions sharp on either side, suppresses single-WP
+    bad picks, and preserves smoothing within coherent runs.
 
-    * ``window=1`` → no smoothing (identity).
-    * ``window=5`` → average over current + 2 before + 2 after (default).
-    * ``window=11`` → much heavier smoothing for very long-arc flights.
+    Unmatched WPs (``facade_index < 0``) keep their original DJI pose
+    and are excluded from every window's pool.
 
-    Yaw is averaged on the unit circle (cos/sin → atan2) to handle the
-    ±180° wraparound; otherwise crossing 180° would yield the wrong
-    average direction.
+    * ``window=1``: smoothing disabled.
+    * ``window=5`` (default): centered 5-WP coherent average.
+    * ``yaw_outlier_deg=60``: a wall transition usually reorients the
+      camera by ~90°, so 60° rejects almost all transition cross-talk
+      while still admitting normal arc curvature within a single facade.
     """
     if not waypoints or window <= 1:
         return waypoints
@@ -126,6 +133,8 @@ def _smooth_gimbal_window(
             continue
         lo = max(0, i - half)
         hi = min(n, i + half + 1)
+        ref_yaw = yaws[i]
+        ref_pitch = pitches[i]
         ps: list[float] = []
         yx_acc = 0.0
         yy_acc = 0.0
@@ -133,12 +142,16 @@ def _smooth_gimbal_window(
         for k in range(lo, hi):
             if not matched[k]:
                 continue
+            dyaw = abs(((yaws[k] - ref_yaw + 180.0) % 360.0) - 180.0)
+            dpitch = abs(pitches[k] - ref_pitch)
+            if dyaw > yaw_outlier_deg or dpitch > pitch_outlier_deg:
+                continue
             ps.append(pitches[k])
             yx_acc += math.cos(math.radians(yaws[k]))
             yy_acc += math.sin(math.radians(yaws[k]))
             count += 1
-        if count == 0:
-            continue
+        if count < min_coherent_members:
+            continue  # keep raw — too few coherent neighbors to smooth
         avg_pitch = sum(ps) / count
         avg_yaw = math.degrees(math.atan2(yy_acc, yx_acc))
         out[i] = replace(

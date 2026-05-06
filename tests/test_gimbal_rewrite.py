@@ -1,6 +1,7 @@
 """Tests for gimbal rewrite module."""
 
 import math
+from dataclasses import replace
 
 import numpy as np
 import pytest
@@ -132,16 +133,19 @@ def test_roof_wins_when_wp_genuinely_above():
     assert out.gimbal_pitch_deg < -60.0
 
 
-def test_window_smooths_yaw_across_facade_transition():
-    # Two adjacent walls 90° apart. Trajectory walks along facade A then
-    # transitions to facade B. With a centered window the WP at the
-    # transition should land partway between the two yaws — not snap.
+def test_smoothing_keeps_raw_through_sharp_transition():
+    # Two walls 90° apart. With outlier rejection the WPs straddling the
+    # transition should fall back to their raw value — *not* be averaged
+    # across the transition. This is the fix for the "yaw=0 / pitch=0
+    # randomly pointing nowhere" bug from the field augment.
     east_wall = _make_facade(
         normal=(1.0, 0.0, 0.0), center=(0.0, 0.0, 2.0), label="wall_0",
     )
     north_wall = _make_facade(
         normal=(0.0, 1.0, 0.0), center=(0.0, 0.0, 2.0), label="wall_1",
     )
+    # 4 WPs: 2 firmly east-wall, 2 firmly north-wall. The transition is
+    # at WP[1]→WP[2] (a 90° yaw flip).
     wps = [
         Waypoint(x=5.0, y=-5.0, z=2.0, index=0),
         Waypoint(x=5.0, y=-3.0, z=2.0, index=1),
@@ -156,11 +160,47 @@ def test_window_smooths_yaw_across_facade_transition():
         wps, [east_wall, north_wall], smooth_window=1,
     )
 
-    # Raw: WP[2] aimed straight at north wall. Smoothed: averaged with
-    # neighboring east-wall WPs, so yaw differs from raw.
-    assert raw[2].facade_index == 1
-    assert smoothed[2].facade_index == 1
-    assert smoothed[2].gimbal_yaw_deg != raw[2].gimbal_yaw_deg
+    # Each WP's smoothed yaw should equal its raw yaw — outlier rejection
+    # discards the cross-wall WPs from each window.
+    for i in range(4):
+        assert smoothed[i].gimbal_yaw_deg == raw[i].gimbal_yaw_deg
+
+
+def test_smoothing_averages_within_coherent_run():
+    # 5 WPs all looking at the same wall, but with small per-WP yaw
+    # jitter from imperfect facade picks (±2°). Window smoothing should
+    # average these toward the central -90° yaw.
+    wall = _make_facade(
+        normal=(1.0, 0.0, 0.0), center=(0.0, 0.0, 2.0), label="wall_0",
+    )
+    wps = [Waypoint(x=5.0, y=float(j), z=2.0, index=j) for j in range(5)]
+    out = rewrite_gimbals_perpendicular(wps, [wall], smooth_window=5)
+    # All 5 WPs see the same wall — yaw should be exactly -90° everywhere.
+    for w in out:
+        assert abs(w.gimbal_yaw_deg - (-90.0)) < 0.5
+
+
+def test_smoothing_rejects_one_outlier_in_window():
+    # 5 WPs near a wall, but inject a fake "bad pick" outlier into one
+    # by replacing its raw gimbal yaw post-pick. Smoothing should reject
+    # the outlier when computing neighbors' values.
+    wall = _make_facade(
+        normal=(1.0, 0.0, 0.0), center=(0.0, 0.0, 2.0), label="wall_0",
+    )
+    wps = [Waypoint(x=5.0, y=float(j), z=2.0, index=j) for j in range(5)]
+    raw = rewrite_gimbals_perpendicular(wps, [wall], smooth_window=1)
+    # Vandalize WP[2] with a bogus yaw (simulating a bad facade pick).
+    bogus = [
+        replace(w, gimbal_yaw_deg=160.0) if w.index == 2 else w
+        for w in raw
+    ]
+    smoothed = rewrite_gimbals_perpendicular(
+        bogus, [wall], smooth_window=5,
+    )
+    # WP[1] and WP[3] should not be polluted by WP[2]'s bogus value —
+    # outlier rejection drops it from their windows.
+    assert abs(smoothed[1].gimbal_yaw_deg - (-90.0)) < 0.5
+    assert abs(smoothed[3].gimbal_yaw_deg - (-90.0)) < 0.5
 
 
 def test_smoothing_disabled_when_window_one():
@@ -174,30 +214,32 @@ def test_smoothing_disabled_when_window_one():
         assert abs(w.gimbal_yaw_deg - (-90.0)) < 0.5
 
 
-def test_window_smoothing_is_centered_not_lagging():
-    # Centered window means the smoothed value at index i is symmetric
-    # over [i-half, i+half]. With a step change in yaw at WP[5], the
-    # smoothed values should ramp symmetrically *around* the step — not
-    # only after it (which is what a causal EMA would produce).
-    east_wall = _make_facade(
-        normal=(1.0, 0.0, 0.0), center=(0.0, 0.0, 2.0), label="wall_a",
+def test_smoothing_does_not_collapse_to_zero_on_pitch_signflip():
+    # Regression for the field bug: 5 WPs where pitches alternate in sign
+    # (camera straddling a pitch-flip across two facades) used to mean to
+    # ~0° → camera pointing nowhere. Outlier rejection now keeps each WP
+    # at its raw pitch when neighbors disagree by > pitch_outlier_deg.
+    wall_high = _make_facade(
+        normal=(1.0, 0.0, 0.0), center=(0.0, 0.0, 5.0), label="wall_a",
     )
-    north_wall = _make_facade(
-        normal=(0.0, 1.0, 0.0), center=(0.0, 0.0, 2.0), label="wall_b",
-    )
-    # 11 WPs, transition at index 5: WPs 0..4 see east_wall, WPs 5..10
-    # see north_wall.
-    wps = []
-    for j in range(11):
-        if j < 5:
-            wps.append(Waypoint(x=5.0, y=-3.0 + 0.1 * j, z=2.0, index=j))
-        else:
-            wps.append(Waypoint(x=-3.0 + 0.1 * j, y=5.0, z=2.0, index=j))
-
-    smoothed = rewrite_gimbals_perpendicular(
-        wps, [east_wall, north_wall], smooth_window=5,
-    )
-    # WP[3] (2 before transition) should already start drifting from pure
-    # east_wall yaw (-90°) toward the north_wall yaw (180°), i.e., centered
-    # window peeks ahead. A causal EMA wouldn't do this.
-    assert smoothed[3].gimbal_yaw_deg != smoothed[0].gimbal_yaw_deg
+    # Position WPs so half look up (pitch>0) at wall_high above, half look
+    # down (pitch<0) at the same plane below. Use just one facade so all
+    # WPs match, but at very different pitches.
+    wps = [
+        # Two looking down sharply at wall_high (WP above wall center)
+        Waypoint(x=5.0, y=0.0, z=20.0, index=0),
+        Waypoint(x=5.0, y=0.0, z=18.0, index=1),
+        # Two looking up at wall_high (WP below wall center)
+        Waypoint(x=5.0, y=0.0, z=-5.0, index=3),
+        Waypoint(x=5.0, y=0.0, z=-7.0, index=4),
+    ]
+    raw = rewrite_gimbals_perpendicular(wps, [wall_high], smooth_window=1)
+    smoothed = rewrite_gimbals_perpendicular(wps, [wall_high], smooth_window=5)
+    # No smoothed pitch should land at 0° (unless its raw pitch was
+    # already there) — that was the cancellation bug signature.
+    for i, (r, s) in enumerate(zip(raw, smoothed)):
+        if abs(r.gimbal_pitch_deg) > 5.0:
+            assert abs(s.gimbal_pitch_deg) > 1.0, (
+                f"WP[{i}] collapsed from raw pitch {r.gimbal_pitch_deg:.1f}° "
+                f"to ~0° via smoothing — outlier rejection failed"
+            )
