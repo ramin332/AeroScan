@@ -187,12 +187,20 @@ class AugmentSession(
     }
 
     /**
-     * Block-read exactly [want] bytes off the pipeline. The MSDK
-     * `Pipeline.readData(buf)` reads up to buf.size and returns DataResult
-     * with the actual length; loop until we have the full payload. Manifold's
-     * augment can take ~4 min; the MSDK should not time out the call (long
-     * idle reads are normal for our workload), but if it does we surface the
-     * error and let the caller decide.
+     * Block-read exactly [want] bytes off the pipeline.
+     *
+     * The MSDK V5 `Pipeline.readData(buf)` has a built-in receive timeout
+     * (~30 s on this firmware). When no data arrives in that window, it
+     * returns DataResult with a "timeout" error in [DataResult.error] —
+     * NOT a hard failure. The Manifold's augment subprocess can take 3–5
+     * min on a Mijande-class building, so MANY timeouts are expected
+     * during the silent augment phase. We retry through them.
+     *
+     * Only hard connection-close errors should bail. Coroutine
+     * cancellation remains the explicit loop-out for caller-driven aborts.
+     *
+     * Mirrors the C-side `RecvAll` in `aeroscan-psdk:kmz_runner.c` which
+     * has the same retry-soft-bail-hard pattern.
      */
     private fun readExactly(pipeline: Pipeline, want: Int): ByteArray {
         val out = ByteArray(want)
@@ -204,12 +212,17 @@ class AugmentSession(
             val result: DataResult = pipeline.readData(readBuf)
             val read = result.length
             val err = result.error
-            if (err != null) error("MOP readData error: $err")
-            if (read <= 0) {
-                // Some MSDK builds return 0 when the link is briefly idle;
-                // the caller's coroutine cancellation is the actual loop-out.
+            if (err != null) {
+                val errStr = err.toString()
+                val isHardClose = errStr.contains("CLOSE", ignoreCase = true) ||
+                                  errStr.contains("DISCONNECT", ignoreCase = true) ||
+                                  errStr.contains("RESET", ignoreCase = true)
+                if (isHardClose) error("MOP readData hard error: $err")
+                // Soft error (timeout, channel idle) — keep waiting. The
+                // Manifold may be 4 min deep into facade extraction.
                 continue
             }
+            if (read <= 0) continue
             System.arraycopy(readBuf, 0, out, got, read)
             got += read
         }

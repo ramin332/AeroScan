@@ -8,6 +8,8 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
@@ -39,7 +41,12 @@ fun HomeScreen(viewModel: HomeViewModel = viewModel()) {
             modifier = Modifier
                 .fillMaxSize()
                 .padding(padding)
-                .padding(16.dp),
+                .padding(16.dp)
+                // ReviewCard with anomaly section + Approve/Reject buttons
+                // is taller than typical RC screens (768 dp) — without scroll
+                // the buttons clip below the visible area. Verified live
+                // on-device 2026-05-06 after first successful PRVW receive.
+                .verticalScroll(rememberScrollState()),
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
             Text("AeroScan RC", style = MaterialTheme.typography.headlineMedium)
