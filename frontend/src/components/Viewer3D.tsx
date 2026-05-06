@@ -168,7 +168,13 @@ function CameraArrows({ waypoints, color, bright, cameraFov }: { waypoints: Wayp
     for (let j = 0; j < waypoints.length; j += stride) {
       const wp = waypoints[j];
       const [ox, oy, oz] = enu(wp.x, wp.y, wp.z);
-      const hr = (wp.heading * Math.PI) / 180;
+      // Camera direction = gimbal_yaw (absolute, north-relative) when the
+      // augmenter set one; otherwise the gimbal follows the aircraft heading.
+      // Without this fall-through, augmented missions render every arrow
+      // pointing the way the *drone* faces, not where the camera aims —
+      // which is exactly what the augmenter rewrote.
+      const yawDeg = wp.gimbal_yaw != null ? wp.gimbal_yaw : wp.heading;
+      const hr = (yawDeg * Math.PI) / 180;
       const pr = (wp.gimbal_pitch * Math.PI) / 180;
 
       // Forward direction in ENU
@@ -1040,9 +1046,12 @@ function CameraPreview({ waypoints, progress, cameraFov, timeline, onSnapshot }:
     const eased = wp.is_transition ? t * t * (3 - 2 * t) : t;
     const pos = new THREE.Vector3().lerpVectors(positions[idx], positions[idx + 1], eased);
 
-    // Position + orient PIP camera to match drone heading + gimbal
+    // Position + orient PIP camera to match the camera's actual aim — that's
+    // gimbal_yaw (north-relative) when set, falling back to aircraft heading
+    // for missions where the gimbal follows the drone.
     pipCameraRef.current.position.copy(pos);
-    const headingRad = -(wp.heading * Math.PI) / 180;
+    const camYawDeg = wp.gimbal_yaw != null ? wp.gimbal_yaw : wp.heading;
+    const headingRad = -(camYawDeg * Math.PI) / 180;
     const pitchRad = (wp.gimbal_pitch * Math.PI) / 180;
     pipCameraRef.current.rotation.set(pitchRad, headingRad, 0, 'YXZ');
     pipCameraRef.current.aspect = PIP_W / PIP_H;

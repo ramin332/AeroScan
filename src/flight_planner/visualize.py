@@ -171,6 +171,12 @@ def prepare_leaflet_data(
             "alt": round(wp.z, 1),
             "heading": round(wp.heading_deg, 1),
             "gimbal_pitch": round(wp.gimbal_pitch_deg, 1),
+            # Absolute (north-relative) camera yaw when the augmenter set one;
+            # None means the gimbal follows the aircraft heading. Without
+            # this field the viewer falls back to rendering arrows from
+            # heading alone — wrong for augmented missions, where heading
+            # was preserved but gimbal_yaw was rewritten per facet.
+            "gimbal_yaw": round(wp.gimbal_yaw_deg, 1) if wp.gimbal_yaw_deg is not None else None,
             "facade_index": fi,
             "component": wp.component_tag,
             "is_transition": wp.is_transition,
@@ -240,6 +246,9 @@ def prepare_threejs_data(
             "z": round(wp.z, 2),
             "heading": round(wp.heading_deg, 1),
             "gimbal_pitch": round(wp.gimbal_pitch_deg, 1),
+            # See identical comment in prepare_leaflet_data above for why
+            # this is required for augmented missions.
+            "gimbal_yaw": round(wp.gimbal_yaw_deg, 1) if wp.gimbal_yaw_deg is not None else None,
             "facade_index": wp.facade_index,
             "index": wp.index,
             "component": wp.component_tag,

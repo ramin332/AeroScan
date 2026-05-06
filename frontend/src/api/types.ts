@@ -218,6 +218,12 @@ export interface WaypointData {
   z: number;
   heading: number;
   gimbal_pitch: number;
+  /** Absolute (north-relative) camera yaw in degrees, 0=N CW positive.
+   * Set by the augmenter to point at facets; null means the gimbal follows
+   * aircraft heading (the Smart3D / pre-augment case). The viewer should
+   * use this when rendering arrows for augmented missions; otherwise
+   * fall back to `heading`. */
+  gimbal_yaw?: number | null;
   facade_index: number;
   index: number;
   component: string;
