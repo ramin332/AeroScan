@@ -263,6 +263,7 @@ def _parse_waylines(xml_bytes: bytes) -> list[ParsedWaypoint]:
 
         gimbal_yaw_raw = 0.0
         gimbal_heading_mode = "smoothTransition"
+        gimbal_yaw_base_for_wp: str | None = None
         gp = placemark.find(f"{WPML_NS}waypointGimbalHeadingParam")
         if gp is not None:
             p_el = gp.find(f"{WPML_NS}waypointGimbalPitchAngle")
@@ -281,6 +282,46 @@ def _parse_waylines(xml_bytes: bytes) -> list[ParsedWaypoint]:
             if m_el is not None and m_el.text is not None:
                 gimbal_heading_mode = m_el.text.strip() or "smoothTransition"
 
+        # Action-based gimbal/heading fallback. Smart3D Capture KMZs encode
+        # the gimbal pose inline via waypointGimbalHeadingParam (handled
+        # above), but our augmenter (and DJI Pilot 2 exports) emit per-action
+        # `gimbalRotate` and `rotateYaw` action groups instead. Walk the
+        # placemark's actionGroup actions and override whatever we read
+        # inline. The action format wins because it's what the FC will
+        # actually execute.
+        for action in placemark.iter(f"{WPML_NS}action"):
+            func_el = action.find(f"{WPML_NS}actionActuatorFunc")
+            param_el = action.find(f"{WPML_NS}actionActuatorFuncParam")
+            if func_el is None or param_el is None or func_el.text is None:
+                continue
+            func = func_el.text.strip()
+            if func == "rotateYaw":
+                h_el = param_el.find(f"{WPML_NS}aircraftHeading")
+                if h_el is not None and h_el.text is not None:
+                    try:
+                        heading = float(h_el.text.strip())
+                    except ValueError:
+                        pass
+            elif func == "gimbalRotate":
+                p_el = param_el.find(f"{WPML_NS}gimbalPitchRotateAngle")
+                if p_el is not None and p_el.text is not None:
+                    try:
+                        gimbal_pitch = float(p_el.text.strip())
+                    except ValueError:
+                        pass
+                y_el = param_el.find(f"{WPML_NS}gimbalYawRotateAngle")
+                if y_el is not None and y_el.text is not None:
+                    try:
+                        gimbal_yaw_raw = float(y_el.text.strip())
+                    except ValueError:
+                        pass
+                # Per-action yaw base — usually 'north' for absolute pose.
+                yb_el = param_el.find(f"{WPML_NS}gimbalHeadingYawBase")
+                if yb_el is not None and yb_el.text is not None:
+                    yb = yb_el.text.strip()
+                    if yb:
+                        gimbal_yaw_base_for_wp = yb
+
         speed = _f("waypointSpeed", 2.0)
 
         wp_index = _i("index", len(waypoints))
@@ -298,7 +339,9 @@ def _parse_waylines(xml_bytes: bytes) -> list[ParsedWaypoint]:
             speed_ms=speed,
             gimbal_yaw_raw_deg=gimbal_yaw_raw,
             gimbal_heading_mode=gimbal_heading_mode,
-            gimbal_yaw_base=default_yaw_base,
+            # Per-WP yaw base from a gimbalRotate action overrides the mission
+            # default. Augmented KMZs always set 'north' here (absolute yaw).
+            gimbal_yaw_base=gimbal_yaw_base_for_wp or default_yaw_base,
             smart_oblique_poses=poses_for_wp,
         ))
 
