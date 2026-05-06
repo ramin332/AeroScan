@@ -132,21 +132,16 @@ def test_roof_wins_when_wp_genuinely_above():
     assert out.gimbal_pitch_deg < -60.0
 
 
-def test_ema_smooths_yaw_across_facade_transition():
-    # Two adjacent walls 90° apart (north + east). The trajectory walks
-    # along facade A then transitions to facade B. With smoothing, the WP
-    # at the transition should land partway between the two yaws — not
-    # snap from -90° to 180°.
+def test_window_smooths_yaw_across_facade_transition():
+    # Two adjacent walls 90° apart. Trajectory walks along facade A then
+    # transitions to facade B. With a centered window the WP at the
+    # transition should land partway between the two yaws — not snap.
     east_wall = _make_facade(
         normal=(1.0, 0.0, 0.0), center=(0.0, 0.0, 2.0), label="wall_0",
     )
     north_wall = _make_facade(
         normal=(0.0, 1.0, 0.0), center=(0.0, 0.0, 2.0), label="wall_1",
     )
-    # 4 WPs walking along the corner of the two walls (which intersect at
-    # x=0, y=0). First two are firmly behind the north plane (north
-    # filtered, east wins). Last two are firmly behind the east plane
-    # (east filtered, north wins). The transition is hard at WP[2].
     wps = [
         Waypoint(x=5.0, y=-5.0, z=2.0, index=0),
         Waypoint(x=5.0, y=-3.0, z=2.0, index=1),
@@ -155,26 +150,54 @@ def test_ema_smooths_yaw_across_facade_transition():
     ]
 
     smoothed = rewrite_gimbals_perpendicular(
-        wps, [east_wall, north_wall], smooth_alpha=0.5,
+        wps, [east_wall, north_wall], smooth_window=5,
     )
     raw = rewrite_gimbals_perpendicular(
-        wps, [east_wall, north_wall], smooth_alpha=1.0,
+        wps, [east_wall, north_wall], smooth_window=1,
     )
 
-    # Raw: WP[2] should be aimed straight at the north wall (yaw=180°).
-    # Smoothed: WP[2] should be partway between the prior east-wall yaw
-    # (-90°) and the north-wall yaw (180°), so it can't equal raw exactly.
+    # Raw: WP[2] aimed straight at north wall. Smoothed: averaged with
+    # neighboring east-wall WPs, so yaw differs from raw.
     assert raw[2].facade_index == 1
     assert smoothed[2].facade_index == 1
     assert smoothed[2].gimbal_yaw_deg != raw[2].gimbal_yaw_deg
 
 
-def test_ema_disabled_when_alpha_one():
-    # alpha=1.0 should be identity — verify with a 3-WP smoke trajectory.
+def test_smoothing_disabled_when_window_one():
+    # window=1 should be identity — verify with a 3-WP smoke trajectory.
     wall = _make_facade(
         normal=(1.0, 0.0, 0.0), center=(0.0, 0.0, 2.0), label="wall_0",
     )
     wps = [Waypoint(x=5.0, y=float(j), z=2.0, index=j) for j in range(3)]
-    out = rewrite_gimbals_perpendicular(wps, [wall], smooth_alpha=1.0)
+    out = rewrite_gimbals_perpendicular(wps, [wall], smooth_window=1)
     for w in out:
         assert abs(w.gimbal_yaw_deg - (-90.0)) < 0.5
+
+
+def test_window_smoothing_is_centered_not_lagging():
+    # Centered window means the smoothed value at index i is symmetric
+    # over [i-half, i+half]. With a step change in yaw at WP[5], the
+    # smoothed values should ramp symmetrically *around* the step — not
+    # only after it (which is what a causal EMA would produce).
+    east_wall = _make_facade(
+        normal=(1.0, 0.0, 0.0), center=(0.0, 0.0, 2.0), label="wall_a",
+    )
+    north_wall = _make_facade(
+        normal=(0.0, 1.0, 0.0), center=(0.0, 0.0, 2.0), label="wall_b",
+    )
+    # 11 WPs, transition at index 5: WPs 0..4 see east_wall, WPs 5..10
+    # see north_wall.
+    wps = []
+    for j in range(11):
+        if j < 5:
+            wps.append(Waypoint(x=5.0, y=-3.0 + 0.1 * j, z=2.0, index=j))
+        else:
+            wps.append(Waypoint(x=-3.0 + 0.1 * j, y=5.0, z=2.0, index=j))
+
+    smoothed = rewrite_gimbals_perpendicular(
+        wps, [east_wall, north_wall], smooth_window=5,
+    )
+    # WP[3] (2 before transition) should already start drifting from pure
+    # east_wall yaw (-90°) toward the north_wall yaw (180°), i.e., centered
+    # window peeks ahead. A causal EMA wouldn't do this.
+    assert smoothed[3].gimbal_yaw_deg != smoothed[0].gimbal_yaw_deg

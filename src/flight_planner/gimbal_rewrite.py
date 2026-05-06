@@ -36,8 +36,20 @@ def _pick_facade_for_waypoint(
 ) -> tuple[int, float] | None:
     """Find the best outward-facing facade for this waypoint by weighted distance.
 
-    Returns (facade_index, signed_perp_distance) or None if no facade is
+    Returns (facade_index, 3d_distance_to_center) or None if no facade is
     within ``max_distance_m`` on its outward side.
+
+    Distance is the **3D Euclidean distance from the WP to the facade
+    center**, not the perpendicular distance to the facade plane. This
+    properly penalizes large facades whose plane is close but whose extent
+    is elsewhere — e.g., a 30 m-long wall whose plane is 5 m from the WP
+    but whose center is 25 m away should NOT win over a closer compact
+    facade. (The earlier perpendicular-distance picker had this bug — it
+    treated facades as infinite planes and locked onto big distant ones.)
+
+    The signed perpendicular component is still used as a hard
+    outward-side filter (signed > 0) so the camera never aims through the
+    building at a wall behind it.
 
     Walls (label starts with ``wall_``) get their selection distance
     multiplied by ``wall_distance_bonus``. With the default 0.5, a wall at
@@ -53,76 +65,86 @@ def _pick_facade_for_waypoint(
     for i, f in enumerate(facades):
         n = _unit(np.asarray(f.normal, dtype=np.float64))
         c = np.asarray(f.center, dtype=np.float64)
-        signed = float(np.dot(n, wp_xyz - c))
-        if signed <= 0 or signed > max_distance_m:
+        delta = wp_xyz - c
+        signed = float(np.dot(n, delta))
+        if signed <= 0:
+            continue
+        center_dist = float(np.linalg.norm(delta))
+        if center_dist > max_distance_m:
             continue
         is_wall = (f.label or "").startswith("wall_")
-        weighted = signed * (wall_distance_bonus if is_wall else 1.0)
+        weighted = center_dist * (wall_distance_bonus if is_wall else 1.0)
         if weighted < best_weighted:
             best_weighted = weighted
-            best = (i, signed)
+            best = (i, center_dist)
 
     return best
 
 
-def _smooth_gimbal_ema(
+def _smooth_gimbal_window(
     waypoints: list[Waypoint],
-    alpha: float,
+    window: int,
 ) -> list[Waypoint]:
-    """Exponentially-smooth gimbal pitch/yaw along the trajectory.
+    """Centered moving-window average of gimbal pitch/yaw along the trajectory.
 
-    Drone flight paths are smooth, so the gimbal should glide between
-    facades rather than snap. EMA filters out occasional bad facade picks
-    and produces a more cinematic / calmer gimbal track.
+    Single-pass EMA proved too narrow for our use case — drones travel in
+    long flowy arcs around buildings (corners, orbits, sweeps), and a
+    causal exponential filter both lags through transitions and produces
+    asymmetric smoothing (head-of-arc smoother than tail-of-arc). A
+    centered window doesn't lag and gives uniform smoothing along the
+    whole arc.
 
-    * ``alpha=1.0`` → no smoothing (identity).
-    * ``alpha=0.6`` → mild smoothing (default).
-    * ``alpha→0`` → almost frozen (the first matched WP dominates).
+    For each WP at index i, average over WPs in [i - window/2, i + window/2]
+    that have a matched facade. Unmatched WPs keep their original DJI
+    pose and are excluded from any window's average — they don't pollute
+    neighboring smoothed values.
 
-    Only re-aimed WPs (``facade_index >= 0``) participate. Unmatched WPs
-    keep their original DJI pose untouched, AND reset the EMA state — so a
-    matched WP after a gap starts fresh instead of carrying state from a
-    different building region.
+    * ``window=1`` → no smoothing (identity).
+    * ``window=5`` → average over current + 2 before + 2 after (default).
+    * ``window=11`` → much heavier smoothing for very long-arc flights.
 
-    Yaw is smoothed on the unit circle (cos/sin EMA → atan2) to handle the
-    ±180° wraparound correctly; otherwise crossing 180° would lurch the
-    EMA the long way around the compass.
+    Yaw is averaged on the unit circle (cos/sin → atan2) to handle the
+    ±180° wraparound; otherwise crossing 180° would yield the wrong
+    average direction.
     """
-    if not waypoints or alpha >= 1.0:
+    if not waypoints or window <= 1:
         return waypoints
 
+    n = len(waypoints)
+    half = window // 2
+
+    pitches = [float(w.gimbal_pitch_deg) for w in waypoints]
+    yaws = [
+        float(w.gimbal_yaw_deg) if w.gimbal_yaw_deg is not None else float(w.heading_deg)
+        for w in waypoints
+    ]
+    matched = [w.facade_index >= 0 for w in waypoints]
+
     out = list(waypoints)
-    ema_pitch: float | None = None
-    ema_yx: float | None = None
-    ema_yy: float | None = None
-
-    for i, wp in enumerate(out):
-        if wp.facade_index < 0:
-            ema_pitch = ema_yx = ema_yy = None
+    for i, wp in enumerate(waypoints):
+        if not matched[i]:
             continue
-
-        p = float(wp.gimbal_pitch_deg)
-        yaw_deg = (
-            float(wp.gimbal_yaw_deg)
-            if wp.gimbal_yaw_deg is not None
-            else float(wp.heading_deg)
-        )
-        yx = math.cos(math.radians(yaw_deg))
-        yy = math.sin(math.radians(yaw_deg))
-
-        if ema_pitch is None:
-            ema_pitch, ema_yx, ema_yy = p, yx, yy
+        lo = max(0, i - half)
+        hi = min(n, i + half + 1)
+        ps: list[float] = []
+        yx_acc = 0.0
+        yy_acc = 0.0
+        count = 0
+        for k in range(lo, hi):
+            if not matched[k]:
+                continue
+            ps.append(pitches[k])
+            yx_acc += math.cos(math.radians(yaws[k]))
+            yy_acc += math.sin(math.radians(yaws[k]))
+            count += 1
+        if count == 0:
             continue
-
-        ema_pitch = alpha * p + (1.0 - alpha) * ema_pitch
-        ema_yx = alpha * yx + (1.0 - alpha) * ema_yx
-        ema_yy = alpha * yy + (1.0 - alpha) * ema_yy
-
-        smoothed_yaw = math.degrees(math.atan2(ema_yy, ema_yx))
+        avg_pitch = sum(ps) / count
+        avg_yaw = math.degrees(math.atan2(yy_acc, yx_acc))
         out[i] = replace(
             wp,
-            gimbal_pitch_deg=float(ema_pitch),
-            gimbal_yaw_deg=float(smoothed_yaw),
+            gimbal_pitch_deg=float(avg_pitch),
+            gimbal_yaw_deg=float(avg_yaw),
         )
 
     return out
@@ -135,7 +157,7 @@ def rewrite_gimbals_perpendicular(
     pitch_margin_deg: float = 2.0,
     preserve_heading: bool = True,
     wall_distance_bonus: float = 0.5,
-    smooth_alpha: float = 0.6,
+    smooth_window: int = 5,
 ) -> list[Waypoint]:
     """Rewrite ``gimbal_pitch_deg`` / ``gimbal_yaw_deg`` so each waypoint
     photographs the best nearby facade head-on.
@@ -159,11 +181,11 @@ def rewrite_gimbals_perpendicular(
         Selection-distance multiplier applied to wall facets (0–1, default
         0.5). Lower values bias the picker more toward walls; 1.0 disables
         the bias. Keeps roof-aiming valid when the WP is genuinely above one.
-    smooth_alpha
-        EMA coefficient (0–1, default 0.6) for post-pick gimbal smoothing
-        across consecutive matched WPs. 1.0 disables smoothing; lower
-        values produce a calmer gimbal track at the cost of lag through
-        facade transitions.
+    smooth_window
+        Centered moving-average window size in WPs (default 5). 1 disables
+        smoothing; larger values produce a smoother track that better
+        matches long flowy flight arcs around buildings. Unmatched WPs
+        are excluded from each window's average.
 
     Returns a new list of Waypoints; input list is not mutated.
     """
@@ -210,4 +232,4 @@ def rewrite_gimbals_perpendicular(
         )
         out.append(new_wp)
 
-    return _smooth_gimbal_ema(out, alpha=smooth_alpha)
+    return _smooth_gimbal_window(out, window=smooth_window)
