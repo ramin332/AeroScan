@@ -3,7 +3,7 @@ name = "flight-planner"
 version = "0.1.0"
 description = "AeroScan NEN-2767 inspection flight planner - generates DJI-compatible KMZ waypoint missions"
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = ">=3.9"
 dependencies = [
     "numpy>=1.24",
     "pyproj>=3.6",
@@ -31,6 +31,10 @@ mesh = [
     "pyrender>=0.1.45",
     "fast-simplification>=0.1",
     "pymeshlab>=2023.12",
+    "cgal>=6.0",
+]
+manifold = [
+    "open3d>=0.17",
     "cgal>=6.0",
 ]
 
