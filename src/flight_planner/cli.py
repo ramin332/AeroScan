@@ -32,6 +32,7 @@ from .kmz_builder import build_kmz
 from .kmz_import import (
     ImportedKmz,
     _points_in_polygon_xy,
+    estimate_facade_detection_defaults,
     facades_from_pointcloud_cgal,
     parse_kmz,
     polygon_to_enu,
@@ -230,10 +231,23 @@ def augment_mission(
     _log("[5/7] Extracting facades (CGAL region growing)…")
     # Polygon already pre-applied above as a hard XY clip — pass None so the
     # extractor's centroid-based polygon test doesn't double-filter.
-    facades = facades_from_pointcloud_cgal(
-        np.asarray(registered.points, dtype=np.float64),
-        None,
-    )
+    #
+    # Use the same density-aware estimator the dev backend
+    # (_kmz_extract_best_facades) uses, so the Manifold and dev viewer
+    # produce identical facades from identical input clouds. Without this,
+    # the Manifold CLI was calling CGAL with the KMZ-tuned hardcoded
+    # defaults (epsilon=0.05, cluster_eps=0.25, min_pts=40, density=25),
+    # which over-segment on the /blackbox-derived cloud (different NN
+    # spacing → too-loose epsilon, too-low min_points). The estimator
+    # measures the cloud's median nearest-neighbour spacing and surface
+    # density, then derives knobs proportional to those measurements.
+    points_xyz = np.asarray(registered.points, dtype=np.float64)
+    fd_kwargs = estimate_facade_detection_defaults(points_xyz)
+    fd_kwargs.pop("_estimator", None)
+    if fd_kwargs:
+        _log("      auto-estimated CGAL knobs: "
+             + ", ".join(f"{k}={v}" for k, v in fd_kwargs.items()))
+    facades = facades_from_pointcloud_cgal(points_xyz, None, **fd_kwargs)
     _log(f"      facades: {len(facades)}")
     if not facades:
         raise SystemExit(
