@@ -32,135 +32,30 @@ def _pick_facade_for_waypoint(
     wp_xyz: np.ndarray,
     facades: Sequence[Facade],
     max_distance_m: float,
-    wall_distance_bonus: float = 0.5,
 ) -> tuple[int, float] | None:
-    """Find the best outward-facing facade for this waypoint by weighted distance.
+    """Find the closest outward-facing facade to this waypoint.
 
-    Returns (facade_index, 3d_distance_to_center) or None if no facade is
+    Returns (facade_index, signed_perp_distance) or None if no facade is
     within ``max_distance_m`` on its outward side.
-
-    Distance is the **3D Euclidean distance from the WP to the facade
-    center**, not the perpendicular distance to the facade plane. This
-    properly penalizes large facades whose plane is close but whose extent
-    is elsewhere — e.g., a 30 m-long wall whose plane is 5 m from the WP
-    but whose center is 25 m away should NOT win over a closer compact
-    facade. (The earlier perpendicular-distance picker had this bug — it
-    treated facades as infinite planes and locked onto big distant ones.)
-
-    The signed perpendicular component is still used as a hard
-    outward-side filter (signed > 0) so the camera never aims through the
-    building at a wall behind it.
-
-    Walls (label starts with ``wall_``) get their selection distance
-    multiplied by ``wall_distance_bonus``. With the default 0.5, a wall at
-    10 m beats a roof at 4.9 m, but a roof at 4 m beats a wall at 10 m —
-    the picker leans toward walls when reasonable, but still chooses
-    non-wall facets when the WP is genuinely closer to one (e.g., flying
-    *over* a roof during a transit segment). Set bonus to 1.0 to disable
-    the bias entirely, or below 0.5 for a stronger wall preference.
     """
     best: tuple[int, float] | None = None
-    best_weighted = float("inf")
+    best_abs = float("inf")
 
     for i, f in enumerate(facades):
         n = _unit(np.asarray(f.normal, dtype=np.float64))
         c = np.asarray(f.center, dtype=np.float64)
-        delta = wp_xyz - c
-        signed = float(np.dot(n, delta))
+        signed = float(np.dot(n, wp_xyz - c))
+        # Outward side only — if the waypoint is behind the facade (signed < 0)
+        # we'd be pointing the camera at the inside wall, skip.
         if signed <= 0:
             continue
-        center_dist = float(np.linalg.norm(delta))
-        if center_dist > max_distance_m:
+        if signed > max_distance_m:
             continue
-        is_wall = (f.label or "").startswith("wall_")
-        weighted = center_dist * (wall_distance_bonus if is_wall else 1.0)
-        if weighted < best_weighted:
-            best_weighted = weighted
-            best = (i, center_dist)
+        if signed < best_abs:
+            best_abs = signed
+            best = (i, signed)
 
     return best
-
-
-def _smooth_gimbal_window(
-    waypoints: list[Waypoint],
-    window: int,
-    yaw_outlier_deg: float = 60.0,
-    pitch_outlier_deg: float = 30.0,
-    min_coherent_members: int = 2,
-) -> list[Waypoint]:
-    """Outlier-rejecting centered-window smoother for gimbal pitch/yaw.
-
-    Plain mean-of-window failed in practice: when the window straddled a
-    facade transition or contained one bad outlier pick, the mean blurred
-    the bad value into all neighbors. Pitch averaging across sign-flips
-    collapsed to 0° (e.g., five WPs of [+25, +20, -10, -25, -30] → mean
-    -4° looking nowhere). Yaw averaging across opposite directions
-    cancelled the unit-circle vector to ~0 magnitude → atan2(0,0)=0°
-    pointing arbitrarily north.
-
-    Fix: per-WP outlier rejection. Drop window members whose yaw differs
-    from the center WP's by > ``yaw_outlier_deg`` or whose pitch differs
-    by > ``pitch_outlier_deg``. If fewer than ``min_coherent_members``
-    survive, fall back to the WP's own raw pose (no smoothing). This
-    keeps real transitions sharp on either side, suppresses single-WP
-    bad picks, and preserves smoothing within coherent runs.
-
-    Unmatched WPs (``facade_index < 0``) keep their original DJI pose
-    and are excluded from every window's pool.
-
-    * ``window=1``: smoothing disabled.
-    * ``window=5`` (default): centered 5-WP coherent average.
-    * ``yaw_outlier_deg=60``: a wall transition usually reorients the
-      camera by ~90°, so 60° rejects almost all transition cross-talk
-      while still admitting normal arc curvature within a single facade.
-    """
-    if not waypoints or window <= 1:
-        return waypoints
-
-    n = len(waypoints)
-    half = window // 2
-
-    pitches = [float(w.gimbal_pitch_deg) for w in waypoints]
-    yaws = [
-        float(w.gimbal_yaw_deg) if w.gimbal_yaw_deg is not None else float(w.heading_deg)
-        for w in waypoints
-    ]
-    matched = [w.facade_index >= 0 for w in waypoints]
-
-    out = list(waypoints)
-    for i, wp in enumerate(waypoints):
-        if not matched[i]:
-            continue
-        lo = max(0, i - half)
-        hi = min(n, i + half + 1)
-        ref_yaw = yaws[i]
-        ref_pitch = pitches[i]
-        ps: list[float] = []
-        yx_acc = 0.0
-        yy_acc = 0.0
-        count = 0
-        for k in range(lo, hi):
-            if not matched[k]:
-                continue
-            dyaw = abs(((yaws[k] - ref_yaw + 180.0) % 360.0) - 180.0)
-            dpitch = abs(pitches[k] - ref_pitch)
-            if dyaw > yaw_outlier_deg or dpitch > pitch_outlier_deg:
-                continue
-            ps.append(pitches[k])
-            yx_acc += math.cos(math.radians(yaws[k]))
-            yy_acc += math.sin(math.radians(yaws[k]))
-            count += 1
-        if count < min_coherent_members:
-            continue  # keep raw — too few coherent neighbors to smooth
-        avg_pitch = sum(ps) / count
-        avg_yaw = math.degrees(math.atan2(yy_acc, yx_acc))
-        out[i] = replace(
-            wp,
-            gimbal_pitch_deg=float(avg_pitch),
-            gimbal_yaw_deg=float(avg_yaw),
-        )
-
-    return out
 
 
 def rewrite_gimbals_perpendicular(
@@ -169,11 +64,9 @@ def rewrite_gimbals_perpendicular(
     max_distance_m: float = 60.0,
     pitch_margin_deg: float = 2.0,
     preserve_heading: bool = True,
-    wall_distance_bonus: float = 0.5,
-    smooth_window: int = 5,
 ) -> list[Waypoint]:
     """Rewrite ``gimbal_pitch_deg`` / ``gimbal_yaw_deg`` so each waypoint
-    photographs the best nearby facade head-on.
+    photographs the nearest facade head-on.
 
     Parameters
     ----------
@@ -190,15 +83,6 @@ def rewrite_gimbals_perpendicular(
         If True (default), only update the gimbal and leave aircraft heading
         alone — safer, since DJI's waypoint heading drives turn smoothing.
         Gimbal yaw is then stored absolutely (relative to north, not aircraft).
-    wall_distance_bonus
-        Selection-distance multiplier applied to wall facets (0–1, default
-        0.5). Lower values bias the picker more toward walls; 1.0 disables
-        the bias. Keeps roof-aiming valid when the WP is genuinely above one.
-    smooth_window
-        Centered moving-average window size in WPs (default 5). 1 disables
-        smoothing; larger values produce a smoother track that better
-        matches long flowy flight arcs around buildings. Unmatched WPs
-        are excluded from each window's average.
 
     Returns a new list of Waypoints; input list is not mutated.
     """
@@ -208,37 +92,17 @@ def rewrite_gimbals_perpendicular(
     out: list[Waypoint] = []
     for wp in waypoints:
         pos = np.array([wp.x, wp.y, wp.z], dtype=np.float64)
-        pick = _pick_facade_for_waypoint(
-            pos, facades, max_distance_m,
-            wall_distance_bonus=wall_distance_bonus,
-        )
+        pick = _pick_facade_for_waypoint(pos, facades, max_distance_m)
         if pick is None:
             out.append(replace(wp, facade_index=wp.facade_index))
             continue
 
         idx, _dist = pick
         facade = facades[idx]
-        center = np.asarray(facade.center, dtype=np.float64)
+        n = _unit(np.asarray(facade.normal, dtype=np.float64))
 
-        # Camera look direction = WP → facade center (aim AT the facet).
-        #
-        # Earlier we used `look = -facade.normal` for "perpendicular"
-        # inspection geometry, but that breaks badly when the WP is offset
-        # from the facet's extent (e.g., the picker matches a high-altitude
-        # WP to a downward-tilted soffit far below — perpendicular-to-
-        # downward-tilted-normal sends the camera looking up at the sky).
-        # Aim-at-center always points the camera AT the chosen facet, which
-        # degrades gracefully: a perfectly-placed WP gets a near-perpendicular
-        # view anyway (look-vector ≈ -normal when WP is centered in front of
-        # the facet), and a poorly-placed WP at least doesn't aim at empty
-        # sky/ground.
-        look = center - pos
-        norm = float(np.linalg.norm(look))
-        if norm < 1e-6:
-            out.append(replace(wp, facade_index=wp.facade_index))
-            continue
-        look = look / norm
-
+        # Camera look direction = -outward_normal (into the facade).
+        look = -n
         # Yaw: bearing from north, clockwise. ENU x=East, y=North.
         yaw_rad = math.atan2(look[0], look[1])
         yaw_deg = (math.degrees(yaw_rad) + 360.0) % 360.0
@@ -262,4 +126,4 @@ def rewrite_gimbals_perpendicular(
         )
         out.append(new_wp)
 
-    return _smooth_gimbal_window(out, window=smooth_window)
+    return out
