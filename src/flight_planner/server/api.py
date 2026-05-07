@@ -89,70 +89,8 @@ def _kmz_extract_best_facades(
     return facades
 
 
-def _expand_polygon_xy(polygon_enu, margin_m: float):
-    """Return the polygon expanded outward by ``margin_m`` (axis-aligned bbox)."""
-    import numpy as _np
-    if not polygon_enu or len(polygon_enu) < 3 or margin_m <= 0:
-        return polygon_enu
-    arr = _np.asarray(polygon_enu, dtype=float).reshape(-1, 3)
-    centroid = arr[:, :2].mean(axis=0)
-    out = []
-    for x, y, z in arr:
-        dx = x - centroid[0]
-        dy = y - centroid[1]
-        r = (dx * dx + dy * dy) ** 0.5
-        if r < 1e-6:
-            out.append((float(x), float(y), float(z)))
-            continue
-        scale = (r + margin_m) / r
-        out.append((float(centroid[0] + dx * scale), float(centroid[1] + dy * scale), float(z)))
-    return out
-
-
-def _filter_facades_by_dji_bbox(
-    facades,
-    mission_area_wgs84: list | None,
-    ref_lat: float,
-    ref_lon: float,
-    ref_alt: float,
-    *,
-    margin_m: float = 2.0,
-):
-    """Restrict facades to the DJI RC Plus mission-area polygon.
-
-    The ``mission_area_wgs84`` polygon (from the KMZ ``template.kml``) is the
-    authoritative bound: it's what the RC Plus shows on-controller as the
-    mapped region. A small ``margin_m`` is added so facades lying just on
-    the polygon edge (common when the building footprint hugs the mission
-    boundary) still survive. Returns the input list unchanged if no polygon
-    is available (degraded KMZ).
-    """
-    import numpy as _np
-    from ..kmz_import import polygon_to_enu as _poly_to_enu
-    if not mission_area_wgs84:
-        print("[kmz facades] no mission_area_wgs84 — skipping filter")
-        return facades
-    poly_enu = _poly_to_enu(mission_area_wgs84, ref_lat, ref_lon, ref_alt)
-    poly_enu = _expand_polygon_xy(poly_enu, margin_m)
-    if not poly_enu or len(poly_enu) < 3:
-        return facades
-    poly = _np.asarray(poly_enu, dtype=float).reshape(-1, 3)[:, :2]
-
-    def _inside(x: float, y: float) -> bool:
-        inside = False
-        n = len(poly)
-        j = n - 1
-        for i in range(n):
-            xi, yi = poly[i]
-            xj, yj = poly[j]
-            if ((yi > y) != (yj > y)) and (x < (xj - xi) * (y - yi) / (yj - yi + 1e-12) + xi):
-                inside = not inside
-            j = i
-        return inside
-
-    kept = [f for f in facades if _inside(*_np.asarray(f.vertices).mean(axis=0)[:2])]
-    print(f"[kmz facades] RC Plus polygon filter (margin={margin_m}m): {len(facades)} → {len(kept)}")
-    return kept
+from ..kmz_import import expand_polygon_xy as _expand_polygon_xy
+from ..kmz_import import filter_facades_by_polygon as _filter_facades_by_dji_bbox
 
 
 def _clip_waypoints_to_dji_bbox(

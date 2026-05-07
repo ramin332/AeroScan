@@ -34,8 +34,10 @@ from .kmz_import import (
     _points_in_polygon_xy,
     estimate_facade_detection_defaults,
     facades_from_pointcloud_cgal,
+    filter_facades_by_polygon,
     parse_kmz,
     polygon_to_enu,
+    tight_footprint_from_cloud_xy,
     waypoints_to_enu,
 )
 from .manifold import from_manifold, register_to_kmz_frame
@@ -184,67 +186,57 @@ def augment_mission(
         _log(f"        {s['voxel_m']*100:.0f} cm   fitness {s['fitness']:.3f}   RMSE {s['rmse_m']:.3f} m")
     _log(f"      coarse yaw: {icp_stats['coarse_yaw_deg']:.0f}°   final RMSE: {icp_stats['icp_rmse_m']:.3f} m")
 
-    # Match dev frontend's input characteristics before facade extraction.
-    # /blackbox is everything-within-sensor-range (1.7M pts after 10 cm voxel
-    # — 4× denser than dev's curated KMZ cloud and full of ground/surrounding
-    # noise). DJI's KMZ cloud is pre-trimmed to building-only at ~10 cm.
-    # Without these three steps the CGAL extractor sees too much non-building
-    # mass and emits ~5× more roof+ground facets than walls (369 walls vs
-    # 1821 roofs vs 689 tilted on Mijande), which biases the gimbal picker
-    # toward roofs and produces too-much-up/too-much-down complaints.
-    pre_pts = len(registered.points)
-    n_after_poly = pre_pts
-    z_floor = None
-    # 1) Polygon clip in XY: drop scan noise outside the mission area.
-    if polygon_enu and len(polygon_enu) >= 3:
-        poly_xy = np.array([(p[0], p[1]) for p in polygon_enu], dtype=np.float64)
-        pts = np.asarray(registered.points)
-        mask = _points_in_polygon_xy(pts[:, :2], poly_xy)
-        if mask.sum() > 0:
-            registered = o3d.geometry.PointCloud()
-            registered.points = o3d.utility.Vector3dVector(pts[mask])
-            n_after_poly = int(mask.sum())
-    # 2) Z-floor: drop ground points (5th-percentile Z + 1m buffer is a
-    # robust "ground level" estimate that survives outliers).
-    pts = np.asarray(registered.points)
-    if len(pts) > 0:
-        z_floor = float(np.percentile(pts[:, 2], 5)) + 1.0
-        above = pts[pts[:, 2] > z_floor]
-        if len(above) > 0:
-            registered = o3d.geometry.PointCloud()
-            registered.points = o3d.utility.Vector3dVector(above)
-    # 3) Revoxel to dev's target density (~10 cm) so CGAL's region-growing
-    # k-NN sees comparable neighborhood density. The 10 cm voxel earlier
-    # was pre-ICP; this one shapes the extractor input.
-    registered = registered.voxel_down_sample(0.10)
-    _log(
-        f"      dev-match prep: {pre_pts:,} pts → polygon-clip {n_after_poly:,} → "
-        f"z>{z_floor:.2f}m & revoxel(10cm) → {len(registered.points):,} pts"
-        if z_floor is not None
-        else f"      dev-match prep: {pre_pts:,} → {len(registered.points):,} pts (polygon clip + revoxel(10cm))"
-    )
+    # Mirror the dev backend's KMZ-import preprocessing so the same cloud
+    # produces the same facades on either side. Dev does (api.py around
+    # line 1356):
+    #   1. Pass FULL pcd.points to CGAL (no pre-voxel, no pre-Z-floor,
+    #      no pre-polygon-clip).
+    #   2. Compute a TIGHT polygon = convex hull of mid-height (30–70th
+    #      pctile Z) points. That's the building footprint, way tighter
+    #      than the WPML mission_area polygon which is generous by 10–20m.
+    #   3. Pass that tight polygon to CGAL — CGAL clips internally and
+    #      runs ground_skip_m=1.0 (drops bottom 1m of Z range).
+    #   4. Post-extraction: drop facades whose centroid is outside the
+    #      mission_area polygon expanded by 2m.
+    #
+    # Earlier the Manifold pre-clipped to the mission polygon, ran a hard
+    # Z-floor at 5th-pctile+1m (cut bottom ~2.5m of every wall on Mijande),
+    # and revoxeled to 10cm. Those over-aggressive filters are what was
+    # producing different facets than dev — same code, different inputs.
+    points_xyz = np.asarray(registered.points, dtype=np.float64)
+    pre_pts = len(points_xyz)
+
+    tight_poly = tight_footprint_from_cloud_xy(points_xyz)
+    if tight_poly is not None and len(tight_poly) >= 3:
+        clip_poly = tight_poly
+        _log(f"      tight footprint: {len(tight_poly)} verts (mission polygon had {len(polygon_enu) if polygon_enu else 0})")
+    else:
+        clip_poly = polygon_enu
+        _log("      tight footprint failed; falling back to mission polygon")
+
+    _log(f"      facade-extraction input: {pre_pts:,} pts (no pre-voxel, no pre-Z-floor; CGAL handles ground_skip internally)")
 
     _log("[5/7] Extracting facades (CGAL region growing)…")
-    # Polygon already pre-applied above as a hard XY clip — pass None so the
-    # extractor's centroid-based polygon test doesn't double-filter.
-    #
-    # Use the same density-aware estimator the dev backend
-    # (_kmz_extract_best_facades) uses, so the Manifold and dev viewer
-    # produce identical facades from identical input clouds. Without this,
-    # the Manifold CLI was calling CGAL with the KMZ-tuned hardcoded
-    # defaults (epsilon=0.05, cluster_eps=0.25, min_pts=40, density=25),
-    # which over-segment on the /blackbox-derived cloud (different NN
-    # spacing → too-loose epsilon, too-low min_points). The estimator
-    # measures the cloud's median nearest-neighbour spacing and surface
-    # density, then derives knobs proportional to those measurements.
-    points_xyz = np.asarray(registered.points, dtype=np.float64)
+    # Density-aware auto-estimator — same call dev backend uses inside
+    # _kmz_extract_best_facades. Scales epsilon/cluster_epsilon/min_points
+    # to the cloud's actual NN spacing and surface density.
     fd_kwargs = estimate_facade_detection_defaults(points_xyz)
     fd_kwargs.pop("_estimator", None)
     if fd_kwargs:
         _log("      auto-estimated CGAL knobs: "
              + ", ".join(f"{k}={v}" for k, v in fd_kwargs.items()))
-    facades = facades_from_pointcloud_cgal(points_xyz, None, **fd_kwargs)
-    _log(f"      facades: {len(facades)}")
+    facades = facades_from_pointcloud_cgal(points_xyz, clip_poly, **fd_kwargs)
+    _log(f"      facades after CGAL: {len(facades)}")
+
+    # Post-extraction: drop facades whose centroid is outside the WPML
+    # mission_area polygon expanded by 2m — same final gate the dev backend
+    # applies (server/api.py line 1369).
+    facades = filter_facades_by_polygon(
+        facades,
+        intent.mission_area_wgs84,
+        intent.ref_lat, intent.ref_lon, intent.ref_alt,
+    )
+    _log(f"      facades after polygon filter: {len(facades)}")
     if not facades:
         raise SystemExit(
             "Facade extraction produced 0 facades — cannot augment gimbals. "

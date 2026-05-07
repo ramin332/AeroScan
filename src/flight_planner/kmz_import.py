@@ -594,6 +594,72 @@ def tight_footprint_from_cloud_xy(
     return [(float(x), float(y), 0.0) for x, y in poly_xy]
 
 
+def expand_polygon_xy(polygon_enu, margin_m: float):
+    """Expand polygon outward radially by ``margin_m`` from its XY centroid.
+
+    Used to add a small tolerance margin so facades whose centroid lies just
+    on/outside the polygon edge still survive a centroid-inside-polygon
+    filter. Z values are preserved verbatim.
+    """
+    if not polygon_enu or len(polygon_enu) < 3 or margin_m <= 0:
+        return polygon_enu
+    arr = np.asarray(polygon_enu, dtype=float).reshape(-1, 3)
+    centroid = arr[:, :2].mean(axis=0)
+    out = []
+    for x, y, z in arr:
+        dx = x - centroid[0]
+        dy = y - centroid[1]
+        r = (dx * dx + dy * dy) ** 0.5
+        if r < 1e-6:
+            out.append((float(x), float(y), float(z)))
+            continue
+        scale = (r + margin_m) / r
+        out.append((float(centroid[0] + dx * scale), float(centroid[1] + dy * scale), float(z)))
+    return out
+
+
+def filter_facades_by_polygon(
+    facades,
+    mission_area_wgs84,
+    ref_lat: float,
+    ref_lon: float,
+    ref_alt: float,
+    *,
+    margin_m: float = 2.0,
+):
+    """Drop facades whose XY centroid is outside ``mission_area_wgs84``
+    expanded by ``margin_m``.
+
+    The mission polygon (from ``template.kml``) is the authoritative bound:
+    it's what the RC Plus shows on-controller as the mapped region. A small
+    ``margin_m`` admits facades sitting on the polygon edge (common when
+    the building hugs the mission boundary). Returns the input list
+    unchanged if no polygon is available.
+
+    Shared between the dev backend (``server/api.py:_filter_facades_by_dji_bbox``)
+    and the Manifold CLI (``cli.augment_mission``) so both produce the same
+    final facade set from the same input.
+    """
+    if not mission_area_wgs84:
+        print("[kmz facades] no mission_area_wgs84 — skipping filter")
+        return facades
+    poly_enu = polygon_to_enu(mission_area_wgs84, ref_lat, ref_lon, ref_alt)
+    poly_enu = expand_polygon_xy(poly_enu, margin_m)
+    if not poly_enu or len(poly_enu) < 3:
+        return facades
+    poly_xy = np.asarray(poly_enu, dtype=float).reshape(-1, 3)[:, :2]
+    centroids_xy = np.asarray(
+        [np.asarray(f.vertices, dtype=float)[:, :2].mean(axis=0) for f in facades],
+        dtype=float,
+    ) if facades else np.zeros((0, 2), dtype=float)
+    if len(centroids_xy) == 0:
+        return facades
+    inside = _points_in_polygon_xy(centroids_xy, poly_xy)
+    kept = [f for f, ok in zip(facades, inside.tolist()) if ok]
+    print(f"[kmz facades] RC Plus polygon filter (margin={margin_m}m): {len(facades)} → {len(kept)}")
+    return kept
+
+
 def _points_in_polygon_xy(points_xy: np.ndarray, polygon_xy: np.ndarray) -> np.ndarray:
     """Vectorised even-odd ray-cast. ``points_xy`` (N,2), ``polygon_xy`` (M,2)."""
     n_pts = len(points_xy)
