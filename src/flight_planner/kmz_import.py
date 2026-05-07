@@ -230,7 +230,18 @@ def _parse_waylines(xml_bytes: bytes) -> list[ParsedWaypoint]:
         coords_el = placemark.find(f"{KML_NS}Point/{KML_NS}coordinates")
         if coords_el is None or not coords_el.text:
             continue
-        parts = [p.strip() for p in coords_el.text.strip().split(",")]
+        # Skip mission-area-polygon placemarks. Smart3D KMZs encode the
+        # mapping polygon as a Placemark whose Point.coordinates contains
+        # one lon,lat,alt per polygon vertex — a multi-line block. Real
+        # waypoint placemarks always have a single line. Detecting "more
+        # than one line" is a robust separator.
+        coord_lines = [
+            line.strip() for line in coords_el.text.strip().splitlines()
+            if line.strip()
+        ]
+        if len(coord_lines) > 1:
+            continue
+        parts = [p.strip() for p in coord_lines[0].split(",")]
         if len(parts) < 2:
             continue
         lon = float(parts[0])

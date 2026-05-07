@@ -478,12 +478,64 @@ def _generate_waylines_wpml(
     return root
 
 
+def _inject_mission_area_polygon(
+    root: ET.Element,
+    mission_area_wgs84: list[tuple[float, float, float]],
+) -> None:
+    """Inject the Smart3D mission-area polygon Placemark into template.kml.
+
+    DJI Smart3D KMZs encode the mission/mapping area as a Placemark inside the
+    Folder, with a ``<Point>`` element containing multi-line ``<coordinates>``
+    (one lon,lat,alt tuple per polygon vertex). The dev backend reads this
+    when it imports a KMZ to clip facade extraction and the waypoint-clip
+    polygon. ``djikmz`` generates only single-coord Point placemarks for
+    waypoints and drops the mission polygon entirely — so without this
+    re-injection an augmented KMZ has only 1-vertex "polygon" and dev's
+    filter_facades_by_polygon becomes a no-op.
+
+    Inserts a Placemark with cloudFilePath / overlap / globalShootHeight as
+    well; these mirror the source Smart3D KMZ's structure so dev's
+    ``parse_kmz`` reads everything it expects.
+    """
+    if not mission_area_wgs84 or len(mission_area_wgs84) < 3:
+        return
+    ns = {"kml": _KML_NS}
+    doc = root.find("kml:Document", ns) or root.find("Document")
+    if doc is None:
+        return
+    folder = doc.find("kml:Folder", ns) or doc.find("Folder")
+    if folder is None:
+        return
+    # Build the Placemark
+    pm = ET.Element(f"{{{_KML_NS}}}Placemark")
+    cp = ET.SubElement(pm, f"{{{_WPML_NS}}}cloudFilePath")
+    cp.text = "wpmz/res/ply/mission"
+    point = ET.SubElement(pm, f"{{{_KML_NS}}}Point")
+    coords_el = ET.SubElement(point, f"{{{_KML_NS}}}coordinates")
+    # mission_area_wgs84 from parse_kmz is list of (lon, lat, alt) tuples
+    # (KML coordinate convention).
+    coords_el.text = "\n            " + "\n            ".join(
+        f"{lon},{lat},{alt}" for lon, lat, alt in mission_area_wgs84
+    ) + "\n          "
+    # Insert BEFORE any waypoint Placemarks so parse_kmz's "first Placemark/Point/
+    # coordinates" descendant lookup finds the multi-coord polygon, not a
+    # 1-coord waypoint.
+    insert_at = 0
+    for i, child in enumerate(list(folder)):
+        if child.tag == f"{{{_KML_NS}}}Placemark":
+            insert_at = i
+            break
+        insert_at = i + 1
+    folder.insert(insert_at, pm)
+
+
 def _build_kmz_zip(
     waypoints: list[Waypoint],
     config: MissionConfig,
     algo: AlgorithmConfig | None = None,
     bundled_cloud_ply: bytes | None = None,
     bundled_mission_name: str | None = None,
+    mission_area_wgs84: list[tuple[float, float, float]] | None = None,
 ) -> bytes:
     """Build a complete KMZ (ZIP) with both template.kml and waylines.wpml.
 
@@ -507,6 +559,8 @@ def _build_kmz_zip(
     _inject_m4e_enums(template_root)
     _dedupe_pose_actions(template_root, config)
     _renumber_action_ids(template_root)
+    if mission_area_wgs84:
+        _inject_mission_area_polygon(template_root, mission_area_wgs84)
     template_xml = ET.tostring(template_root, encoding="unicode", xml_declaration=True)
 
     # Generate waylines.wpml from the (already-patched) template
@@ -541,6 +595,7 @@ def build_kmz(
     output_path: str,
     algo: AlgorithmConfig | None = None,
     bundled_cloud_ply: bytes | None = None,
+    mission_area_wgs84: list[tuple[float, float, float]] | None = None,
 ) -> str:
     """Generate a DJI WPML-compliant KMZ file.
 
@@ -558,7 +613,11 @@ def build_kmz(
         The absolute path to the generated KMZ file.
     """
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
-    data = _build_kmz_zip(waypoints, config, algo, bundled_cloud_ply=bundled_cloud_ply)
+    data = _build_kmz_zip(
+        waypoints, config, algo,
+        bundled_cloud_ply=bundled_cloud_ply,
+        mission_area_wgs84=mission_area_wgs84,
+    )
     with open(output_path, "wb") as f:
         f.write(data)
     return os.path.abspath(output_path)
@@ -569,6 +628,11 @@ def build_kmz_bytes(
     config: MissionConfig,
     algo: AlgorithmConfig | None = None,
     bundled_cloud_ply: bytes | None = None,
+    mission_area_wgs84: list[tuple[float, float, float]] | None = None,
 ) -> bytes:
     """Generate a DJI WPML-compliant KMZ file as bytes (in-memory)."""
-    return _build_kmz_zip(waypoints, config, algo, bundled_cloud_ply=bundled_cloud_ply)
+    return _build_kmz_zip(
+        waypoints, config, algo,
+        bundled_cloud_ply=bundled_cloud_ply,
+        mission_area_wgs84=mission_area_wgs84,
+    )

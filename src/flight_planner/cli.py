@@ -274,8 +274,11 @@ def augment_mission(
     # for a 1 m voxel fingerprint that's ~150 KB; for a full curated cloud
     # it's ~13 MB.
     bundled_cloud = icp_target_ply.read_bytes()
-    out_path = build_kmz(new_waypoints, config, str(output_kmz),
-                         bundled_cloud_ply=bundled_cloud)
+    out_path = build_kmz(
+        new_waypoints, config, str(output_kmz),
+        bundled_cloud_ply=bundled_cloud,
+        mission_area_wgs84=intent.mission_area_wgs84,
+    )
     out_size = Path(out_path).stat().st_size
     _log(f"      done. {out_size:,} bytes")
 
