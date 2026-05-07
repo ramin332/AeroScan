@@ -99,10 +99,26 @@ def rewrite_gimbals_perpendicular(
 
         idx, _dist = pick
         facade = facades[idx]
-        n = _unit(np.asarray(facade.normal, dtype=np.float64))
+        center = np.asarray(facade.center, dtype=np.float64)
 
-        # Camera look direction = -outward_normal (into the facade).
-        look = -n
+        # Camera look direction = WP → facade center (aim AT the facet).
+        #
+        # Earlier this was `look = -facade.normal` for "perpendicular"
+        # framing, but that fails on noisy facade extractions: when the
+        # picker matches a downward-tilted soffit/overhang, perpendicular-
+        # to-its-normal sends the camera up at the sky instead of at the
+        # building. Aim-at-center always points the camera AT the chosen
+        # facet — for a well-placed WP directly in front of a wall, the
+        # WP→center vector reduces to -normal anyway, so good cases stay
+        # good. Bad picks (which CGAL produces from noisy /blackbox-style
+        # clouds) at least still aim at the building rather than empty
+        # sky/ground.
+        look = center - pos
+        norm = float(np.linalg.norm(look))
+        if norm < 1e-6:
+            out.append(replace(wp, facade_index=wp.facade_index))
+            continue
+        look = look / norm
         # Yaw: bearing from north, clockwise. ENU x=East, y=North.
         yaw_rad = math.atan2(look[0], look[1])
         yaw_deg = (math.degrees(yaw_rad) + 360.0) % 360.0
