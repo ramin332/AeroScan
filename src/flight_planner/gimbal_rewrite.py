@@ -32,27 +32,43 @@ def _pick_facade_for_waypoint(
     wp_xyz: np.ndarray,
     facades: Sequence[Facade],
     max_distance_m: float,
+    wall_distance_bonus: float = 0.5,
 ) -> tuple[int, float] | None:
-    """Find the closest outward-facing facade to this waypoint.
+    """Find the best outward-facing facade for this waypoint.
 
     Returns (facade_index, signed_perp_distance) or None if no facade is
     within ``max_distance_m`` on its outward side.
+
+    Walls (label starts with ``wall_``) get their selection distance
+    multiplied by ``wall_distance_bonus`` (default 0.5). This biases the
+    picker toward walls when both wall and non-wall (roof/tilted) are
+    candidates at similar range — e.g., a wall at 8 m beats a roof at
+    4.5 m, but a roof at 3 m beats a wall at 8 m.
+
+    Why: on field clouds (especially /blackbox-derived ones with ~5:1
+    roof:wall facet ratios) the closest facet to a WP flying alongside
+    the building is frequently a roof corner at WP altitude rather than
+    a wall below. The aim-at-center pose for that roof points the camera
+    horizontally at building height, instead of down at the actual wall.
+    The bonus restores walls' priority for inspection use.
+
+    For wide ratio gaps the bonus stops mattering — a roof at 1 m always
+    beats a wall at 10 m (1 < 5), so genuine "fly over the roof" cases
+    still produce roof matches.
     """
     best: tuple[int, float] | None = None
-    best_abs = float("inf")
+    best_weighted = float("inf")
 
     for i, f in enumerate(facades):
         n = _unit(np.asarray(f.normal, dtype=np.float64))
         c = np.asarray(f.center, dtype=np.float64)
         signed = float(np.dot(n, wp_xyz - c))
-        # Outward side only — if the waypoint is behind the facade (signed < 0)
-        # we'd be pointing the camera at the inside wall, skip.
-        if signed <= 0:
+        if signed <= 0 or signed > max_distance_m:
             continue
-        if signed > max_distance_m:
-            continue
-        if signed < best_abs:
-            best_abs = signed
+        is_wall = (f.label or "").startswith("wall_")
+        weighted = signed * (wall_distance_bonus if is_wall else 1.0)
+        if weighted < best_weighted:
+            best_weighted = weighted
             best = (i, signed)
 
     return best

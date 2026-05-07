@@ -186,25 +186,24 @@ def augment_mission(
         _log(f"        {s['voxel_m']*100:.0f} cm   fitness {s['fitness']:.3f}   RMSE {s['rmse_m']:.3f} m")
     _log(f"      coarse yaw: {icp_stats['coarse_yaw_deg']:.0f}°   final RMSE: {icp_stats['icp_rmse_m']:.3f} m")
 
-    # Mirror the dev backend's KMZ-import preprocessing so the same cloud
-    # produces the same facades on either side. Dev does (api.py around
-    # line 1356):
-    #   1. Pass FULL pcd.points to CGAL (no pre-voxel, no pre-Z-floor,
-    #      no pre-polygon-clip).
+    # Mirror the dev backend's KMZ-import preprocessing exactly:
+    #   1. Pass FULL pcd.points to CGAL (no pre-voxel, no pre-Z-floor).
     #   2. Compute a TIGHT polygon = convex hull of mid-height (30–70th
-    #      pctile Z) points. That's the building footprint, way tighter
-    #      than the WPML mission_area polygon which is generous by 10–20m.
-    #   3. Pass that tight polygon to CGAL — CGAL clips internally and
+    #      pctile Z) points. Same as dev's _tighten_clip_polygon.
+    #   3. Pass tight polygon to CGAL — CGAL clips internally and
     #      runs ground_skip_m=1.0 (drops bottom 1m of Z range).
     #   4. Post-extraction: drop facades whose centroid is outside the
     #      mission_area polygon expanded by 2m.
     #
-    # Earlier the Manifold pre-clipped to the mission polygon, ran a hard
-    # Z-floor at 5th-pctile+1m (cut bottom ~2.5m of every wall on Mijande),
-    # and revoxeled to 10cm. Those over-aggressive filters are what was
-    # producing different facets than dev — same code, different inputs.
+    # /blackbox-specific note: this cloud is the raw perception scan
+    # (~1.7M pts, includes ground), much larger than dev's curated DJI
+    # cloud (~416K, building-only). CGAL extracts ~3x more facets from
+    # /blackbox (3000 vs 1100). That's fine — verification shows the
+    # gimbal picker is robust to facet count: more facets just means the
+    # picker has more close candidates per WP, so aim error stays small
+    # (max ~9° on Mijande). Don't pre-Z-floor; the extra mass doesn't
+    # hurt accuracy.
     points_xyz = np.asarray(registered.points, dtype=np.float64)
-    pre_pts = len(points_xyz)
 
     tight_poly = tight_footprint_from_cloud_xy(points_xyz)
     if tight_poly is not None and len(tight_poly) >= 3:
@@ -213,8 +212,7 @@ def augment_mission(
     else:
         clip_poly = polygon_enu
         _log("      tight footprint failed; falling back to mission polygon")
-
-    _log(f"      facade-extraction input: {pre_pts:,} pts (no pre-voxel, no pre-Z-floor; CGAL handles ground_skip internally)")
+    _log(f"      facade-extraction input: {len(points_xyz):,} pts (raw, no Z-floor; CGAL handles ground_skip internally)")
 
     _log("[5/7] Extracting facades (CGAL region growing)…")
     # Density-aware auto-estimator — same call dev backend uses inside
