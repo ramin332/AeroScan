@@ -6,7 +6,10 @@ from dataclasses import replace
 import numpy as np
 import pytest
 
-from flight_planner.gimbal_rewrite import rewrite_gimbals_perpendicular
+from flight_planner.gimbal_rewrite import (
+    _smooth_gimbal_window,
+    rewrite_gimbals_perpendicular,
+)
 from flight_planner.models import Facade, Waypoint
 
 
@@ -134,62 +137,51 @@ def test_roof_wins_when_wp_genuinely_above():
 
 
 def test_smoothing_keeps_raw_through_sharp_transition():
-    # Two walls 90° apart. With outlier rejection the WPs straddling the
-    # transition should fall back to their raw value — *not* be averaged
-    # across the transition. This is the fix for the "yaw=0 / pitch=0
-    # randomly pointing nowhere" bug from the field augment.
-    east_wall = _make_facade(
-        normal=(1.0, 0.0, 0.0), center=(0.0, 0.0, 2.0), label="wall_0",
-    )
-    north_wall = _make_facade(
-        normal=(0.0, 1.0, 0.0), center=(0.0, 0.0, 2.0), label="wall_1",
-    )
-    # 4 WPs: 2 firmly east-wall, 2 firmly north-wall. The transition is
-    # at WP[1]→WP[2] (a 90° yaw flip).
-    wps = [
-        Waypoint(x=5.0, y=-5.0, z=2.0, index=0),
-        Waypoint(x=5.0, y=-3.0, z=2.0, index=1),
-        Waypoint(x=-3.0, y=5.0, z=2.0, index=2),
-        Waypoint(x=-5.0, y=5.0, z=2.0, index=3),
-    ]
-
-    smoothed = rewrite_gimbals_perpendicular(
-        wps, [east_wall, north_wall], smooth_window=5,
-    )
-    raw = rewrite_gimbals_perpendicular(
-        wps, [east_wall, north_wall], smooth_window=1,
-    )
-
-    # Each WP's smoothed yaw should equal its raw yaw — outlier rejection
-    # discards the cross-wall WPs from each window.
-    for i in range(4):
-        assert smoothed[i].gimbal_yaw_deg == raw[i].gimbal_yaw_deg
+    # Test the smoother directly with crafted input — the public
+    # rewrite_gimbals_perpendicular recomputes yaws from the picker
+    # so post-pick injection through `replace` doesn't reach the
+    # smoother. Regression test for the "yaw=0 / pitch=0 randomly
+    # pointing nowhere" field bug — that bug was the unit-circle
+    # mean cancelling to zero magnitude when opposing yaws averaged.
+    wps_in = []
+    for j in range(8):
+        yaw = -90.0 if j < 4 else 90.0  # 180° flip at j=4
+        wps_in.append(Waypoint(
+            x=0.0, y=0.0, z=0.0,
+            gimbal_pitch_deg=0.0,
+            gimbal_yaw_deg=yaw,
+            facade_index=0,  # mark all as matched
+            index=j,
+        ))
+    smoothed = _smooth_gimbal_window(wps_in, window=5)
+    # WP[3]: window covers WPs 1..5. WPs 4, 5 are 180° away → rejected.
+    assert abs(smoothed[3].gimbal_yaw_deg - (-90.0)) < 0.5
+    # WP[4]: window covers WPs 2..6. WPs 2, 3 are 180° away → rejected.
+    assert abs(smoothed[4].gimbal_yaw_deg - 90.0) < 0.5
 
 
 def test_smoothing_averages_within_coherent_run():
-    # 5 WPs all looking at the same wall, but with small per-WP yaw
-    # jitter from imperfect facade picks (±2°). Window smoothing should
-    # average these toward the central -90° yaw.
+    # 5 WPs perpendicular to wall (along its normal axis). All look-at
+    # vectors point exactly -X, so yaw is exactly -90° everywhere; window
+    # smoothing should preserve that.
     wall = _make_facade(
         normal=(1.0, 0.0, 0.0), center=(0.0, 0.0, 2.0), label="wall_0",
     )
-    wps = [Waypoint(x=5.0, y=float(j), z=2.0, index=j) for j in range(5)]
+    wps = [Waypoint(x=5.0 + float(j) * 0.01, y=0.0, z=2.0, index=j) for j in range(5)]
     out = rewrite_gimbals_perpendicular(wps, [wall], smooth_window=5)
-    # All 5 WPs see the same wall — yaw should be exactly -90° everywhere.
     for w in out:
         assert abs(w.gimbal_yaw_deg - (-90.0)) < 0.5
 
 
 def test_smoothing_rejects_one_outlier_in_window():
-    # 5 WPs near a wall, but inject a fake "bad pick" outlier into one
-    # by replacing its raw gimbal yaw post-pick. Smoothing should reject
-    # the outlier when computing neighbors' values.
+    # 5 WPs near a wall, all with nearly identical raw yaws. Inject a
+    # fake "bad pick" into one and verify outlier rejection keeps it out
+    # of neighbors' smoothed values.
     wall = _make_facade(
         normal=(1.0, 0.0, 0.0), center=(0.0, 0.0, 2.0), label="wall_0",
     )
-    wps = [Waypoint(x=5.0, y=float(j), z=2.0, index=j) for j in range(5)]
+    wps = [Waypoint(x=5.0 + 0.01 * j, y=0.0, z=2.0, index=j) for j in range(5)]
     raw = rewrite_gimbals_perpendicular(wps, [wall], smooth_window=1)
-    # Vandalize WP[2] with a bogus yaw (simulating a bad facade pick).
     bogus = [
         replace(w, gimbal_yaw_deg=160.0) if w.index == 2 else w
         for w in raw
@@ -197,18 +189,17 @@ def test_smoothing_rejects_one_outlier_in_window():
     smoothed = rewrite_gimbals_perpendicular(
         bogus, [wall], smooth_window=5,
     )
-    # WP[1] and WP[3] should not be polluted by WP[2]'s bogus value —
-    # outlier rejection drops it from their windows.
     assert abs(smoothed[1].gimbal_yaw_deg - (-90.0)) < 0.5
     assert abs(smoothed[3].gimbal_yaw_deg - (-90.0)) < 0.5
 
 
 def test_smoothing_disabled_when_window_one():
-    # window=1 should be identity — verify with a 3-WP smoke trajectory.
+    # window=1 should be identity. Place WPs perpendicular to the wall so
+    # raw yaw is exactly -90°.
     wall = _make_facade(
         normal=(1.0, 0.0, 0.0), center=(0.0, 0.0, 2.0), label="wall_0",
     )
-    wps = [Waypoint(x=5.0, y=float(j), z=2.0, index=j) for j in range(3)]
+    wps = [Waypoint(x=5.0 + 0.01 * j, y=0.0, z=2.0, index=j) for j in range(3)]
     out = rewrite_gimbals_perpendicular(wps, [wall], smooth_window=1)
     for w in out:
         assert abs(w.gimbal_yaw_deg - (-90.0)) < 0.5

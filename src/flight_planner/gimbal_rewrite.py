@@ -218,10 +218,27 @@ def rewrite_gimbals_perpendicular(
 
         idx, _dist = pick
         facade = facades[idx]
-        n = _unit(np.asarray(facade.normal, dtype=np.float64))
+        center = np.asarray(facade.center, dtype=np.float64)
 
-        # Camera look direction = -outward_normal (into the facade).
-        look = -n
+        # Camera look direction = WP → facade center (aim AT the facet).
+        #
+        # Earlier we used `look = -facade.normal` for "perpendicular"
+        # inspection geometry, but that breaks badly when the WP is offset
+        # from the facet's extent (e.g., the picker matches a high-altitude
+        # WP to a downward-tilted soffit far below — perpendicular-to-
+        # downward-tilted-normal sends the camera looking up at the sky).
+        # Aim-at-center always points the camera AT the chosen facet, which
+        # degrades gracefully: a perfectly-placed WP gets a near-perpendicular
+        # view anyway (look-vector ≈ -normal when WP is centered in front of
+        # the facet), and a poorly-placed WP at least doesn't aim at empty
+        # sky/ground.
+        look = center - pos
+        norm = float(np.linalg.norm(look))
+        if norm < 1e-6:
+            out.append(replace(wp, facade_index=wp.facade_index))
+            continue
+        look = look / norm
+
         # Yaw: bearing from north, clockwise. ENU x=East, y=North.
         yaw_rad = math.atan2(look[0], look[1])
         yaw_deg = (math.degrees(yaw_rad) + 360.0) % 360.0
