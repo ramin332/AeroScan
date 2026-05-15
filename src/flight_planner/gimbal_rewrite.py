@@ -80,6 +80,7 @@ def rewrite_gimbals_perpendicular(
     max_distance_m: float = 60.0,
     pitch_margin_deg: float = 2.0,
     preserve_heading: bool = True,
+    wall_distance_bonus: float = 0.5,
 ) -> list[Waypoint]:
     """Rewrite ``gimbal_pitch_deg`` / ``gimbal_yaw_deg`` so each waypoint
     photographs the nearest facade head-on.
@@ -108,7 +109,7 @@ def rewrite_gimbals_perpendicular(
     out: list[Waypoint] = []
     for wp in waypoints:
         pos = np.array([wp.x, wp.y, wp.z], dtype=np.float64)
-        pick = _pick_facade_for_waypoint(pos, facades, max_distance_m)
+        pick = _pick_facade_for_waypoint(pos, facades, max_distance_m, wall_distance_bonus=wall_distance_bonus)
         if pick is None:
             out.append(replace(wp, facade_index=wp.facade_index))
             continue

@@ -220,6 +220,17 @@ def augment_mission(
     # to the cloud's actual NN spacing and surface density.
     fd_kwargs = estimate_facade_detection_defaults(points_xyz)
     fd_kwargs.pop("_estimator", None)
+    # Augmenter-specific area thresholds. Defaults (0.5 / 0.4 m²) are tuned
+    # for dev's KMZ cloud (~416K pts) which produces ~1100 facets.
+    # The /blackbox perception cloud is ~4× denser and produces ~3000 facets
+    # at those thresholds — many tiny roof corners / window sills / parapet
+    # fragments at WP altitude. The gimbal picker then favors those small
+    # near-WP facets over walls below, biasing pitch toward horizontal
+    # (median -7° vs dev's -11°). Bumping the area floor to 2.0 / 1.5 m²
+    # drops the noise fragments without losing any inspection-meaningful
+    # surface, and brings the pitch distribution back in line with dev.
+    fd_kwargs["min_roof_area_m2"] = 2.0
+    fd_kwargs["min_tilted_area_m2"] = 1.5
     if fd_kwargs:
         _log("      auto-estimated CGAL knobs: "
              + ", ".join(f"{k}={v}" for k, v in fd_kwargs.items()))
