@@ -231,25 +231,15 @@ def augment_mission(
     facades = facades_from_pointcloud_cgal(points_xyz, clip_poly, **fd_kwargs)
     _log(f"      facades after CGAL: {len(facades)}")
 
-    # Vegetation / non-building mask. The /blackbox perception cloud captures
-    # everything in the scene — buildings, trees, ground clutter, wires.
-    # CGAL happily extracts planar patches in tree canopies and aims gimbals
-    # at them. The KMZ-bundled cloud.ply (= our ICP target fingerprint) is
-    # Smart3D-curated and vegetation-stripped: it samples building surfaces
-    # densely and *omits* vegetation. Use it as a presence mask — drop any
-    # extracted facade whose centroid is far from every fingerprint point.
-    # At 1 m voxel, real building-facade centers land within ≲ 0.7 m of a
-    # fingerprint point; 2.5 m is conservative for noise + ICP residual.
-    fp_pc = kmz_pc  # the ICP target cloud, already loaded above
-    if fp_pc is not None and len(fp_pc.points) > 0:
-        fp_tree = o3d.geometry.KDTreeFlann(fp_pc)
-        keep: list = []
-        for f in facades:
-            _n, _idx, d2 = fp_tree.search_knn_vector_3d(np.asarray(f.center, dtype=np.float64), 1)
-            if _n > 0 and float(np.sqrt(d2[0])) <= 2.5:
-                keep.append(f)
-        _log(f"      facades after vegetation mask: {len(keep)} (dropped {len(facades) - len(keep)} likely-non-building)")
-        facades = keep
+    # NOTE: vegetation mask removed — at 1 m fingerprint voxel resolution
+    # the 2.5 m presence threshold drops some real building facets in
+    # corners/concavities, so the picker falls back to a worse facet there
+    # (visible in the dev viewer as gimbals pointing differently than the
+    # dev path's `dji_pinned` rewrite which has no such mask). If we want
+    # this back, we need either a denser fingerprint over the wire (so a
+    # tighter threshold is workable) or a different vegetation-rejection
+    # signal (e.g. inlier-coherence, density, or per-facet surface
+    # roughness rather than positional proximity to fingerprint).
 
     # Post-extraction: drop facades whose centroid is outside the WPML
     # mission_area polygon expanded by 2m — same final gate the dev backend
