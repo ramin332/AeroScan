@@ -278,6 +278,19 @@ def augment_mission(
     config = MissionConfig(
         flight_speed_ms=inspection_speed_ms,
         mission_name=f"NEN-2767: {intent.name}",
+        # Disable per-WP gimbal-action dedup. The default MissionConfig drops
+        # any gimbalRotate whose pose is within 2° of the previous WP's, which
+        # for inspection missions strips the gimbal action from most adjacent
+        # WPs aiming at the same wall section. The dev viewer's parser then
+        # sees no gimbalRotate for those WPs, falls back to the mission-level
+        # default (yaw_base="aircraft", raw_yaw=0), and renders the gimbal
+        # arrow pointing along the aircraft heading — which is the "gimbal
+        # follows flight direction" artifact users see in the viewer. Setting
+        # the threshold to a negative value forces every WP to emit its own
+        # explicit gimbalRotate with the absolute pose. ~10-30% larger XML;
+        # unambiguous parser/render.
+        gimbal_dedup_threshold_deg=-1.0,
+        heading_dedup_threshold_deg=-1.0,
     )
     output_kmz = Path(output_kmz)
     output_kmz.parent.mkdir(parents=True, exist_ok=True)
