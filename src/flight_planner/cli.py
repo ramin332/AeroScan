@@ -391,6 +391,22 @@ def augment_mission(
     out_size = Path(out_path).stat().st_size
     _log(f"      done. {out_size:,} bytes")
 
+    # Lean copy (no bundled cloud) — what we upload to the aircraft via
+    # DjiWaypointV3_UploadKmzFile. The full KMZ above has the registered
+    # Manifold cloud baked in for rc-companion's preview viewer; the aircraft
+    # only needs waypoints + gimbal commands + the mission-area polygon, so
+    # stripping the 7 MB cloud cuts the over-air upload from ~10 min to ~30 s
+    # and keeps Pilot 2's widget channel from saturating during the transfer.
+    lean_path = Path(str(output_kmz).replace(".kmz", ".lean.kmz"))
+    build_kmz(
+        new_waypoints, config, str(lean_path),
+        bundled_cloud_ply=None,
+        mission_area_wgs84=intent.mission_area_wgs84,
+        bundled_sfm_geo_desc=sfm_geo_desc,
+    )
+    lean_size = lean_path.stat().st_size
+    _log(f"      lean (no cloud) → {lean_path.name} ({lean_size:,} bytes)")
+
     elapsed = time.monotonic() - t0
     _log(f"Total: {elapsed:.1f} s")
 
@@ -399,7 +415,9 @@ def augment_mission(
         "name": intent.name,
         "flight_id": flight_id,
         "output_kmz": out_path,
+        "output_kmz_lean": str(lean_path),
         "output_bytes": out_size,
+        "output_bytes_lean": lean_size,
         "waypoints_total": len(new_waypoints),
         "waypoints_aimed": aimed,
         "facades": len(facades),
