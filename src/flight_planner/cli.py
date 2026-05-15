@@ -116,6 +116,49 @@ def _gimbal_summary(waypoints: list[Waypoint]) -> dict:
     }
 
 
+_PILOT2_CARD_MAX_BYTES = 255  # DJI_WIDGET_FLOATING_WINDOW_MSG_MAX_LEN
+
+
+def _format_pilot2_card(summary: dict) -> str:
+    """Render the augment summary as a 7-line ASCII card that fits in the
+    255-byte Pilot 2 floating-window budget. Shown after the KMZ is on the
+    aircraft so the pilot can sanity-check before tapping Fly."""
+    name = (summary.get("name") or "mission")[:24]
+    flight_id = summary.get("flight_id") or "?"
+    icp = summary.get("icp") or {}
+    fit = float(icp.get("icp_fitness") or 0.0)
+    rmse = float(icp.get("icp_rmse_m") or 0.0)
+    gs = summary.get("gimbal_stats") or {}
+    total = int(gs.get("waypoint_count") or summary.get("waypoints_total") or 0)
+    aimed = int(gs.get("waypoints_aimed_at_facade") or summary.get("waypoints_aimed") or 0)
+    facets = int(summary.get("facades") or 0)
+    aim_pct = (100.0 * aimed / total) if total else 0.0
+    pitch = gs.get("pitch_deg") or {}
+    p_med = float(pitch.get("median") or 0.0)
+    p_min = float(pitch.get("min") or 0.0)
+    p_max = float(pitch.get("max") or 0.0)
+    lines = [
+        "AeroScan ready",
+        f"{name} -> {flight_id}",
+        f"ICP fit {fit:.2f}  RMSE {rmse:.2f}m",
+        f"WPs {total}  Facets {facets}  Aim {aim_pct:.0f}%",
+        f"Pitch med {p_med:+.0f}  range {p_min:+.0f}..{p_max:+.0f}",
+        "Custom gimbal: ENABLED",
+        "Tap [AeroScan Fly] when ready",
+    ]
+    card = "\n".join(lines)
+    if len(card.encode("utf-8")) > _PILOT2_CARD_MAX_BYTES:
+        # Drop pitch range first (least critical), then fall back to a 3-line card.
+        lines = [
+            "AeroScan ready",
+            f"{name} -> {flight_id}",
+            f"WPs {total}  Aim {aim_pct:.0f}%  Custom gimbal ON",
+            "Tap [AeroScan Fly] when ready",
+        ]
+        card = "\n".join(lines)
+    return card
+
+
 def _load_icp_target(icp_target_ply: Path) -> o3d.geometry.PointCloud:
     pc = o3d.io.read_point_cloud(str(icp_target_ply))
     if len(pc.points) == 0:
@@ -369,6 +412,9 @@ def augment_mission(
         summary_json.parent.mkdir(parents=True, exist_ok=True)
         summary_json.write_text(json.dumps(summary, indent=2))
         _log(f"      summary → {summary_json} ({summary_json.stat().st_size:,} bytes)")
+        card_path = summary_json.with_suffix(".card.txt")
+        card_path.write_text(_format_pilot2_card(summary))
+        _log(f"      pilot2 card → {card_path} ({card_path.stat().st_size} bytes)")
 
     return summary
 
