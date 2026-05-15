@@ -36,25 +36,29 @@ def _pick_facade_for_waypoint(
 ) -> tuple[int, float] | None:
     """Find the best outward-facing facade for this waypoint.
 
-    Returns (facade_index, signed_perp_distance) or None if no facade is
-    within ``max_distance_m`` on its outward side.
+    Returns (facade_index, 3d_distance_to_center) or None if no facade is
+    within ``max_distance_m`` in 3D on its outward side.
 
-    Walls (label starts with ``wall_``) get their selection distance
-    multiplied by ``wall_distance_bonus`` (default 0.5). This biases the
-    picker toward walls when both wall and non-wall (roof/tilted) are
-    candidates at similar range — e.g., a wall at 8 m beats a roof at
-    4.5 m, but a roof at 3 m beats a wall at 8 m.
+    Gate: the WP must be on the facet's outward side (``dot(normal,
+    WP - center) > 0``). Sort metric: 3D distance from the WP to the
+    facet's centroid (lower wins).
 
-    Why: on field clouds (especially /blackbox-derived ones with ~5:1
-    roof:wall facet ratios) the closest facet to a WP flying alongside
-    the building is frequently a roof corner at WP altitude rather than
-    a wall below. The aim-at-center pose for that roof points the camera
-    horizontally at building height, instead of down at the actual wall.
-    The bonus restores walls' priority for inspection use.
+    Walls (label starts with ``wall_``) get their distance multiplied by
+    ``wall_distance_bonus`` (default 0.5). This biases the picker toward
+    walls when both wall and non-wall (roof/tilted) are candidates at
+    similar 3D range — e.g., a wall at 8 m beats a roof at 4.5 m, but
+    a roof at 3 m beats a wall at 8 m.
 
-    For wide ratio gaps the bonus stops mattering — a roof at 1 m always
-    beats a wall at 10 m (1 < 5), so genuine "fly over the roof" cases
-    still produce roof matches.
+    History: this used to gate AND sort on signed perpendicular standoff
+    (the projection of WP-to-center onto the normal). That had a hidden
+    failure mode — a small facet 30 m away laterally could have a tiny
+    perp standoff (because the WP happens to be 'in front of' its
+    infinite plane) and beat a much closer facet whose plane is slightly
+    further. Verified on Mijande/flight0016: 46% of WPs were picking
+    facets > 20 m away in 3D, even with ``max_distance_m=60``, because
+    the picker only bounded perp standoff. Switching the sort metric to
+    3D distance makes the picker prefer geometrically near facets, which
+    is what 'aim at the building's nearby surface' actually means.
     """
     best: tuple[int, float] | None = None
     best_weighted = float("inf")
@@ -63,13 +67,16 @@ def _pick_facade_for_waypoint(
         n = _unit(np.asarray(f.normal, dtype=np.float64))
         c = np.asarray(f.center, dtype=np.float64)
         signed = float(np.dot(n, wp_xyz - c))
-        if signed <= 0 or signed > max_distance_m:
+        if signed <= 0:
+            continue  # WP is on the inward side or coplanar — facet not reachable
+        dist3d = float(np.linalg.norm(c - wp_xyz))
+        if dist3d > max_distance_m:
             continue
         is_wall = (f.label or "").startswith("wall_")
-        weighted = signed * (wall_distance_bonus if is_wall else 1.0)
+        weighted = dist3d * (wall_distance_bonus if is_wall else 1.0)
         if weighted < best_weighted:
             best_weighted = weighted
-            best = (i, signed)
+            best = (i, dist3d)
 
     return best
 
@@ -114,22 +121,11 @@ def rewrite_gimbals_perpendicular(
             out.append(replace(wp, facade_index=wp.facade_index))
             continue
 
-        idx, _dist = pick
+        idx, _ = pick
         facade = facades[idx]
         center = np.asarray(facade.center, dtype=np.float64)
 
-        # Camera look direction = WP → facade center (aim AT the facet).
-        #
-        # Earlier this was `look = -facade.normal` for "perpendicular"
-        # framing, but that fails on noisy facade extractions: when the
-        # picker matches a downward-tilted soffit/overhang, perpendicular-
-        # to-its-normal sends the camera up at the sky instead of at the
-        # building. Aim-at-center always points the camera AT the chosen
-        # facet — for a well-placed WP directly in front of a wall, the
-        # WP→center vector reduces to -normal anyway, so good cases stay
-        # good. Bad picks (which CGAL produces from noisy /blackbox-style
-        # clouds) at least still aim at the building rather than empty
-        # sky/ground.
+        # Camera look direction = WP → facade center.
         look = center - pos
         norm = float(np.linalg.norm(look))
         if norm < 1e-6:
