@@ -126,8 +126,16 @@ def _format_pilot2_card(summary: dict) -> str:
     name = (summary.get("name") or "mission")[:24]
     flight_id = summary.get("flight_id") or "?"
     icp = summary.get("icp") or {}
-    fit = float(icp.get("icp_fitness") or 0.0)
     rmse = float(icp.get("icp_rmse_m") or 0.0)
+    # Translation magnitude is the pilot-meaningful "did the algorithm land
+    # near the right spot" signal. Final-scale fitness is misleading: it
+    # measures correspondence at the 2 cm voxel resolution and naturally
+    # collapses to a small number even on excellent registrations (the noise
+    # floor of the dense Manifold cloud + sparse fingerprint pair). Reporting
+    # drift in cm matches pilot intuition.
+    trans = icp.get("total_translation_m") or [0.0, 0.0, 0.0]
+    drift_m = float((trans[0] ** 2 + trans[1] ** 2 + trans[2] ** 2) ** 0.5)
+    yaw_total = float(icp.get("total_yaw_deg") or 0.0)
     gs = summary.get("gimbal_stats") or {}
     total = int(gs.get("waypoint_count") or summary.get("waypoints_total") or 0)
     aimed = int(gs.get("waypoints_aimed_at_facade") or summary.get("waypoints_aimed") or 0)
@@ -140,7 +148,7 @@ def _format_pilot2_card(summary: dict) -> str:
     lines = [
         "AeroScan ready",
         f"{name} -> {flight_id}",
-        f"ICP fit {fit:.2f}  RMSE {rmse:.2f}m",
+        f"Align drift {drift_m * 100:.0f}cm  RMSE {rmse:.2f}m  yaw {yaw_total:+.0f}",
         f"WPs {total}  Facets {facets}  Aim {aim_pct:.0f}%",
         f"Pitch med {p_med:+.0f}  range {p_min:+.0f}..{p_max:+.0f}",
         "Custom gimbal: ENABLED",
