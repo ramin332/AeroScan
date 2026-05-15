@@ -7,7 +7,7 @@ Pipeline (same as flight_planner.cli.augment_mission, steps 2–4 of 7):
 
 1. Load the merged Manifold cloud (already voxel-downsampled to ~10 cm
    when produced by the Manifold blackbox merge tooling).
-2. Register to the source KMZ's ENU frame via multi-scale point-to-plane
+2. Register to the source KMZ's ENU frame via multi-scale point-to-point
    ICP (flight_planner.manifold.register_to_kmz_frame).
 3. Apply the dev-match prep: polygon clip to mission_area_wgs84,
    Z-floor at (5th-percentile-Z + 1 m), revoxel to 10 cm.

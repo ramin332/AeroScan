@@ -8,7 +8,7 @@ whether we need a separate cloud-transport channel (file MOP / depot pre-stage).
 For each target-cloud voxel size:
   1. Voxel-downsample the full KMZ cloud
   2. Measure raw + gzipped size of the downsampled PLY
-  3. Multi-scale point-to-plane ICP from the Manifold cloud against this target
+  3. Multi-scale point-to-point ICP from the Manifold cloud against this target
   4. Compare the final transform against the FULL-cloud baseline:
      - rotation delta (axis-angle, deg)
      - translation delta (m)

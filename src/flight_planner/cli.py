@@ -180,7 +180,7 @@ def augment_mission(
     kmz_pc = _load_icp_target(icp_target_ply)
     _log(f"      icp target: {len(kmz_pc.points):,} pts")
 
-    _log("[4/7] Registering Manifold → KMZ frame (multi-scale point-to-plane ICP)…")
+    _log("[4/7] Registering Manifold → KMZ frame (multi-scale point-to-point ICP)…")
     registered, _T, icp_stats = register_to_kmz_frame(manifold_pc, kmz_pc)
     for s in icp_stats["icp_per_scale"]:
         _log(f"        {s['voxel_m']*100:.0f} cm   fitness {s['fitness']:.3f}   RMSE {s['rmse_m']:.3f} m")
@@ -266,18 +266,48 @@ def augment_mission(
     )
     output_kmz = Path(output_kmz)
     output_kmz.parent.mkdir(parents=True, exist_ok=True)
-    # Bundle the ICP target cloud (the same cloud the augment used) into the
-    # output KMZ at wpmz/res/ply/<name>/cloud.ply. Aircraft ignores it;
-    # makes the artifact self-contained so it can be imported directly into
-    # the dev frontend (server.api._process expects a Smart3D-style KMZ
-    # with the cloud bundled). Adds the icp-target's bytes to the output —
-    # for a 1 m voxel fingerprint that's ~150 KB; for a full curated cloud
-    # it's ~13 MB.
-    bundled_cloud = icp_target_ply.read_bytes()
+    # Bundle the *registered Manifold cloud* (the actual cloud the facade
+    # extraction ran on, in the KMZ frame) into the output KMZ at
+    # wpmz/res/ply/<name>/cloud.ply. Aircraft ignores it; the dev viewer
+    # uses it for visual reconstruction and "Detect Facades" pass.
+    # Bundling the ICP target (the 1 m fingerprint, ~130 KB) instead would
+    # leave the dev viewer reconstructing a Swiss-cheese alpha-wrap mesh
+    # off ~10K points — facades re-extracted in the viewer don't match
+    # what the augmenter actually used. The Manifold cloud at 10 cm voxel
+    # is ~1.7M pts ≈ 20 MB binary float xyz; aircraft upload over E-Port
+    # USB-C handles that fine.
+    bundled_cloud_pts = np.asarray(registered.points, dtype=np.float32)
+    _bundled_n = len(bundled_cloud_pts)
+    _hdr = (
+        b"ply\n"
+        b"format binary_little_endian 1.0\n"
+        b"comment AeroScan augmenter: registered Manifold cloud in KMZ frame\n"
+        + f"element vertex {_bundled_n}\n".encode()
+        + b"property float x\nproperty float y\nproperty float z\nend_header\n"
+    )
+    bundled_cloud = _hdr + bundled_cloud_pts.tobytes()
+    _log(f"      bundling registered Manifold cloud: {_bundled_n:,} pts ({len(bundled_cloud):,} bytes)")
+    # sfm_geo_desc.json — anchors the dev viewer's ENU origin so waypoints
+    # render at the correct altitude. Without this, parse_kmz falls back to
+    # using waypoints[0].alt as the origin → every waypoint sinks ~5 m and
+    # the flight path appears inside the building. Mirrors the structure
+    # Smart3D ships in its KMZs.
+    sfm_geo_desc = {
+        "cs_type": "LOCAL_ENU_CS",
+        "offset": [0.0, 0.0, 0.0],
+        "ref_GPS": {
+            "altitude": float(intent.ref_alt),
+            "latitude": float(intent.ref_lat),
+            "longitude": float(intent.ref_lon),
+        },
+        "rvec": [0.0, 0.0, 0.0],
+        "scale": 1.0,
+    }
     out_path = build_kmz(
         new_waypoints, config, str(output_kmz),
         bundled_cloud_ply=bundled_cloud,
         mission_area_wgs84=intent.mission_area_wgs84,
+        bundled_sfm_geo_desc=sfm_geo_desc,
     )
     out_size = Path(out_path).stat().st_size
     _log(f"      done. {out_size:,} bytes")

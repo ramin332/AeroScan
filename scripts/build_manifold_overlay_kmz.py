@@ -79,7 +79,7 @@ def build_overlay_kmz(
     manifold_pc = o3d.io.read_point_cloud(str(manifold_ply))
     print(f"  Manifold cloud: {len(manifold_pc.points):,} pts")
 
-    print("Registering Manifold → KMZ frame (multi-scale point-to-plane ICP)…")
+    print("Registering Manifold → KMZ frame (multi-scale point-to-point ICP)…")
     registered, T, stats = register_manifold_to_kmz(manifold_pc, kmz_pc)
     print(f"  coarse yaw seed: {stats['coarse_yaw_deg']:.0f}°")
     for s in stats["icp_per_scale"]:

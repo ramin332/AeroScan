@@ -536,6 +536,7 @@ def _build_kmz_zip(
     bundled_cloud_ply: bytes | None = None,
     bundled_mission_name: str | None = None,
     mission_area_wgs84: list[tuple[float, float, float]] | None = None,
+    bundled_sfm_geo_desc: dict | None = None,
 ) -> bytes:
     """Build a complete KMZ (ZIP) with both template.kml and waylines.wpml.
 
@@ -544,6 +545,15 @@ def _build_kmz_zip(
     is self-contained for the dev-frontend import workflow (which expects
     a Smart3D-style KMZ with a reference cloud). The aircraft's WaypointV3
     flow ignores the cloud — only the dev viewer needs it.
+
+    If [bundled_sfm_geo_desc] is non-None, it is JSON-serialised to
+    ``wpmz/res/ply/<bundled_mission_name>/sfm_geo_desc.json``. This file is
+    what the dev viewer's parse_kmz reads to find the ENU origin altitude
+    (``ref_GPS.altitude``); without it, parse_kmz falls back to the first
+    waypoint's altitude as the origin and renders every waypoint shifted
+    downwards by (waypoints[0].alt - true_ref_alt). Smart3D KMZs always
+    ship this file — augmented KMZs need to re-emit it to render correctly
+    in the dev viewer.
     """
     mission = _build_mission(waypoints, config, algo)
     kml = mission.build()
@@ -573,15 +583,23 @@ def _build_kmz_zip(
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
         zf.writestr("wpmz/template.kml", template_xml)
         zf.writestr("wpmz/waylines.wpml", waylines_xml)
-        if bundled_cloud_ply is not None:
+        if bundled_cloud_ply is not None or bundled_sfm_geo_desc is not None:
             # Mirrors the Smart3D KMZ structure so /api/import-kmz on the
             # dev backend (server.api._process) can find the cloud at
-            # wpmz/res/ply/<name>/cloud.ply.
+            # wpmz/res/ply/<name>/cloud.ply and the sfm_geo_desc at
+            # wpmz/res/ply/<name>/sfm_geo_desc.json.
             name = bundled_mission_name or config.mission_name or "mission"
             # Strip path-unfriendly characters; the dev import doesn't care
             # about the inner-folder name beyond non-empty + path-clean.
             safe_name = "".join(c if (c.isalnum() or c in "-_") else "_" for c in name) or "mission"
-            zf.writestr(f"wpmz/res/ply/{safe_name}/cloud.ply", bundled_cloud_ply)
+            if bundled_cloud_ply is not None:
+                zf.writestr(f"wpmz/res/ply/{safe_name}/cloud.ply", bundled_cloud_ply)
+            if bundled_sfm_geo_desc is not None:
+                import json as _json
+                zf.writestr(
+                    f"wpmz/res/ply/{safe_name}/sfm_geo_desc.json",
+                    _json.dumps(bundled_sfm_geo_desc, indent=4),
+                )
     return buf.getvalue()
 
 
@@ -596,6 +614,7 @@ def build_kmz(
     algo: AlgorithmConfig | None = None,
     bundled_cloud_ply: bytes | None = None,
     mission_area_wgs84: list[tuple[float, float, float]] | None = None,
+    bundled_sfm_geo_desc: dict | None = None,
 ) -> str:
     """Generate a DJI WPML-compliant KMZ file.
 
@@ -608,6 +627,10 @@ def build_kmz(
             ``wpmz/res/ply/<mission>/cloud.ply``. The aircraft ignores it;
             only the dev frontend's import workflow needs it. Pass-through to
             :func:`_build_kmz_zip`.
+        bundled_sfm_geo_desc: Optional dict to JSON-serialise at
+            ``wpmz/res/ply/<mission>/sfm_geo_desc.json``. Required for the
+            dev viewer to render waypoints at the correct ENU z; without
+            it the viewer falls back to using waypoints[0].alt as origin.
 
     Returns:
         The absolute path to the generated KMZ file.
@@ -617,6 +640,7 @@ def build_kmz(
         waypoints, config, algo,
         bundled_cloud_ply=bundled_cloud_ply,
         mission_area_wgs84=mission_area_wgs84,
+        bundled_sfm_geo_desc=bundled_sfm_geo_desc,
     )
     with open(output_path, "wb") as f:
         f.write(data)

@@ -108,11 +108,17 @@ def register_to_kmz_frame(
       1. Coarse yaw seed — search a few rotations around Z (Manifold's
          perception frame is yaw-aligned to aircraft takeoff heading), pick
          the one whose centroid is closest to the KMZ centroid.
-      2. Multi-scale point-to-plane ICP from coarse voxel down to fine.
-         Point-to-plane uses cloud normals so it converges to better minima
-         for surface-aligned data than point-to-point.
+      2. Multi-scale point-to-point ICP from coarse voxel down to fine.
 
-    Verified on flight0016/Mijande: ~9 sec, ICP RMSE 0.093 m at 2 cm voxel.
+    Why point-to-point and not point-to-plane: the wire-side fingerprint
+    shipped from the RC is XYZ-only (no normals — see
+    `rc-companion/.../PlyVoxelDownsample.kt`), and the augmenter has to
+    estimate normals on a 1 m-spaced ~10K-pt cloud. Estimated normals on a
+    cloud that sparse are unreliable, and point-to-plane ICP doesn't just
+    fail to refine with bad normals — it actively converges to a wrong
+    pose. Measured on flight0016/Mijande: point-to-plane left an 86 cm XY
+    drift vs the dense-cloud reference; point-to-point on the same input
+    landed within 3 cm.
     """
     kmz_centroid = np.asarray(kmz_pc.points).mean(axis=0)
 
@@ -138,21 +144,17 @@ def register_to_kmz_frame(
 
     coarse = manifold_pc.transform(rot_z(best_yaw))
 
-    # Step 2 — multi-scale point-to-plane ICP.
+    # Step 2 — multi-scale point-to-point ICP.
     T = np.eye(4)
     per_scale_stats: list[dict] = []
     for vox, max_d, max_iter in schedule:
         a = coarse.voxel_down_sample(vox)
         b = kmz_pc.voxel_down_sample(vox)
-        if not a.has_normals():
-            a.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=vox * 3, max_nn=30))
-        if not b.has_normals():
-            b.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=vox * 3, max_nn=30))
         r = o3d.pipelines.registration.registration_icp(
             a, b,
             max_correspondence_distance=max_d,
             init=T,
-            estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPlane(),
+            estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPoint(),
             criteria=o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=max_iter),
         )
         T = r.transformation
