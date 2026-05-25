@@ -31,11 +31,13 @@ question the pilot must be able to see *before* augmenting.
 - **Readiness handshake (Part B):** RC-companion can ask the Manifold app for a
   status snapshot and render a banner: app up? env healthy? latest flight has a
   mesh (chunks + point count)? `/blackbox` free space?
-- **Managed service (Part A):** Run `kmz_runner` under `systemd --user` (DJI's
-  sanctioned mechanism for non-DPK, complex-runtime apps) with crash recovery
-  and a clean start/stop/status surface. Ships in a mode that is **correct
-  regardless of whether the app can coexist with Smart3D**, with boot-enable as a
-  documented one-step upgrade gated on a hardware coexistence test.
+- **Managed service (Part A):** ~~Run `kmz_runner` under `systemd --user`~~
+  **SUPERSEDED 2026-05-25 — production deployment is now a DJI DPK package
+  managed through Pilot 2, not a `systemd --user` service.** See
+  `docs/architecture/manifold-deployment.md`. Part A below is retained as the
+  historical design record; the deployment goal it described is met by the DPK
+  path. (Crash recovery + clean start/stop/status are provided by DJI's
+  auto-generated root SYSTEM service for the DPK.)
 
 ## Non-goals (separate workstreams, explicitly out of scope here)
 
@@ -43,7 +45,9 @@ question the pilot must be able to see *before* augmenting.
 - Visual/geometric mission preview before approve (the PNG-in-PRVW idea).
 - Mesh durability / harvest-on-flight-complete (fixes the *cause* of missing
   mesh; this spec only *surfaces* it).
-- Packaging AeroScan as a DPK / RC-driven app launch.
+- ~~Packaging AeroScan as a DPK / RC-driven app launch.~~ **No longer a non-goal
+  — this became the chosen deployment (DONE & validated 2026-05-25). See
+  `docs/architecture/manifold-deployment.md`.**
 - Disambiguating *why* recent flights lack a mesh (needs a fresh Smart3D flight).
 
 ## Codebases touched
@@ -51,7 +55,7 @@ question the pilot must be able to see *before* augmenting.
 | Change | Repo | Path |
 | --- | --- | --- |
 | C: PING/STAT frames, status builder | `aeroscan-psdk` (`git@github.com:ramin332/aeroscan-psdk.git`, lives at `/open_app/dev`) | `src/manifold3_app/kmz_runner.{c,h}` |
-| systemd `--user` unit + installer + coexistence-test doc | `aeroscan-psdk` | `scripts/`, `docs/` |
+| ~~systemd `--user` unit + installer + coexistence-test doc~~ **superseded by DPK packaging** (see `docs/architecture/manifold-deployment.md`) | `aeroscan-psdk` | `scripts/`, `docs/` |
 | Kotlin: PING/STAT codec, status query, banner | `aero-scan` (this repo) | `rc-companion/app/src/main/kotlin/com/aeroscan/rccompanion/{mop,ui}/` |
 
 Python engine is unchanged. The `env_ok` probe imports it but adds no code there.
@@ -176,7 +180,28 @@ connection open). New defines: `KMZRUN_MAGIC_PING "PING"`,
 
 EnvError outranks NoMesh (a broken env blocks augment regardless of mesh).
 
-## Part A — systemd `--user` service
+## Part A — systemd `--user` service — SUPERSEDED
+
+> **SUPERSEDED 2026-05-25.** Production deployment is now a **DJI DPK package**
+> installed via `dji_app_ctl install -i <file>.dpk` and managed through DJI Pilot
+> 2 — see `docs/architecture/manifold-deployment.md` for the canonical model.
+> The `systemd --user` service described below was installed as a dev convenience
+> and has since been **removed** from the Manifold. Two premises in this section
+> are now known to be wrong and are kept only as a historical record:
+>
+> 1. **"systemd `--user` is the sanctioned path."** It is not the *production*
+>    path. DJI's docs (`Payload-SDK-Tutorial/docs/en/40.manifold-quick-start/03.manifold-platform-capabilities/05.system-tools.md`)
+>    state the raw-exec / `dji_app_ctl`-direct path is *"intended only for
+>    development and debugging"* and that production startup must be tested via
+>    Pilot; `00.index.md` notes the raw executable *"may cause abnormal
+>    termination."* DPK is the production posture.
+> 2. **"`--user` can't auto-start without linger/root."** Wrong — the service
+>    **did** survive a cold reboot (the Manifold graphically auto-logs-in `dji`,
+>    which starts `systemd --user`, which starts the enabled service; the app
+>    even reconnected to the E-Port). DPK was chosen for production posture +
+>    stability + **widget support** (managed DPK apps surface interactive Custom
+>    Widgets on Pilot's live view; the raw `systemd` binary did not), **not**
+>    because auto-start was impossible.
 
 Per DJI FAQ §"How to Configure Auto Startup Using `systemd --user`" — the
 sanctioned path for non-DPK, complex-runtime (conda/open3d) apps. Runs as the
@@ -277,14 +302,21 @@ Until the test runs, the default manual-start variant is correct either way.
 
 1. **Part B first** (handshake) — independent of the coexistence question and
    delivers the highest-value fix (surfaces the missing-mesh failure up front).
-   C frames + builder → Kotlin codec + StatusSession → banner.
-2. **Part A** (service) — install script + unit (manual-start), then the
-   coexistence test, then flip `--enable-boot` if it passes.
+   C frames + builder → Kotlin codec + StatusSession → banner. **Still the
+   active workstream.**
+2. ~~**Part A** (service) — install script + unit, then the coexistence test,
+   then flip `--enable-boot`.~~ **SUPERSEDED — deployment is the DPK path (DONE &
+   validated 2026-05-25). The coexistence test is moot: one app holds the E-Port
+   at a time and the pilot manually switches Smart3D → our app in Pilot after the
+   scan; the boot app stays Smart3DExplore. See
+   `docs/architecture/manifold-deployment.md`.**
 
 ## Risks / open questions
 
-- **Coexistence unknown** — resolved by the test above; default mode is safe
-  either way.
+- ~~**Coexistence unknown** — resolved by the test above; default mode is safe
+  either way.~~ **Moot under the DPK path:** only one DPK app holds the E-Port at
+  a time, so there is no coexistence to verify. The pilot manually switches from
+  Smart3DExplore to our app in Pilot after the scan (expected/accepted flow).
 - **Deep env probe latency** — 5 s worst case on the accept thread. Mitigated by
   the bound + (later) caching. If open3d import routinely exceeds 5 s on the
   Manifold, raise the bound or fall back to a shallow `access()` check; decide

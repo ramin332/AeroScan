@@ -3,6 +3,8 @@
 **Date:** 2026-05-03 (supersedes 2026-05-01 version — see "What changed" below)
 **Status:** Pivot complete. We are **not** transporting KMZ files over the radio. The Smart3D mesh is already on the Manifold; we read it from there, augment with gimbal aim, and push the modified KMZ back over the same wired path the dev workflow already uses.
 
+> **Deployment note (added 2026-05-25):** the "AeroScan PSDK widget" referenced below runs as a **DJI DPK package** managed through Pilot 2 (not a raw binary / `systemd --user` service) — that is what makes the widget render and respond on Pilot's live view. Canonical deployment model: `docs/architecture/manifold-deployment.md`.
+
 ---
 
 ## What changed since the previous version

@@ -77,7 +77,7 @@ Wacht op de RC, draait de augmenter, stuurt het resultaat terug, en — als de p
 | Goedkeuren/afwijzen vanaf de RC | **Getest, werkt** |
 | Aangevulde missie in het toestel laden | **Getest, MD5 klopt** |
 | Camera wijst naar de juiste gevel | **97 % goed** (controle-script), 3 % nog mis-aim |
-| "AeroScan: Fly"-knop op Pilot 2 vinden | **Niet gevonden** in de UI ondanks correcte registratie — vergt verkenning |
+| Widgets op Pilot 2 (live view) | **Opgelost (2026-05-25):** widgets verschijnen én zijn interactief **mits de app als DPK draait** (niet als ruwe `systemd`-binary). De stock gimbal-widget werkte. Een eigen "AeroScan: Fly"-widget is nog te bouwen. |
 | **Daadwerkelijk vliegen met aangevulde missie** | **Nog niet uitgevoerd.** Propellers zijn er bewust afgehouden tijdens de pipeline-test. |
 
 ---
@@ -131,7 +131,7 @@ Wacht op de RC, draait de augmenter, stuurt het resultaat terug, en — als de p
 ## Volgende stappen
 
 1. **Werkelijk vliegen op Mijande** — alle data ziet er goed uit, één props-on flight bevestigt het.
-2. **Pilot 2 widget UI verkennen** — registratie staat goed; locatie op het scherm vergt 5 minuten klikken op de RC.
+2. ~~**Pilot 2 widget UI verkennen**~~ **Opgelost (2026-05-25):** de boord-app is nu als **DPK** geïnstalleerd (`dji_app_ctl install -i <file>.dpk`, beheerd via Pilot 2) en widgets renderen interactief op de live view. De ruwe `systemd`-binary deed dat niet. Deployment-model: `manifold-deployment.md`. Resteert: een eigen "Fly"-widget bouwen.
 3. **Tweede en derde locatie** — Mijande is één gebouw. Elk gebouw heeft eigen detectie-uitdagingen (overhangs, balkons, dakdetails).
 4. **Anomalie-drempels kalibreren** — na 5-10 echte vluchten weten we wat de piloot daadwerkelijk als waarschuwing wil zien.
 5. **Manifold disk-management** — `/blackbox/` groeit ~1 GB per vlucht. Retentie-script nodig vóór de 50ste vlucht.
