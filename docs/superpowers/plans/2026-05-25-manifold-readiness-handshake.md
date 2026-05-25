@@ -12,6 +12,38 @@
 
 **Companion plan (separate):** the systemd `--user` service (spec Part A) is a sibling plan, written after this one. This plan is self-contained and testable on its own.
 
+## Status — 2026-05-25 (verified)
+
+- **PING/STAT readiness handshake — DONE.** The C `kmzrun_status` module + the
+  PING dispatch in `kmz_runner.c` and the RC-companion codec/`StatusSession`/banner
+  are wired; PING → STAT round-trips. This plan's core deliverable is complete.
+- **Whole fly-ready chain is wired** (the cockpit plan owns it):
+  `PING/STAT` → `AUGM` → augment → `PRVW` → `EXEC` (pilot approve) →
+  `DjiWaypointV3_UploadKmzFile` → `READY_TO_FLY` → Fly-widget tap →
+  `Action(START)`, with mission/action state callbacks registered.
+- **In progress:**
+  - 🟢 **Fail-fast augment gating** — make the rc-companion refuse to augment when
+    PING/STAT reports no mesh, instead of uploading a KMZ and running a doomed
+    augment. (Natural extension of the banner this plan adds.)
+  - 🟠 **Stale-MOP-channel recovery** — a half-open MOP connection currently
+    requires an app restart to reconnect; fold recovery into the runner's accept
+    loop.
+- **Blockers (the GO/NO-GO, both in the cockpit plan):**
+  - 🔴 **Mesh** — none on `/blackbox` now (flight0019's was pruned by the ring
+    buffer); a *successful* augment needs a **fresh Smart3D scan**. Data blocker.
+  - 🔴 **First M4E WaypointV3 upload + START has never run on hardware** (no mesh
+    ever reached it); also confirms whether the M4E even supports WaypointV3 (DJI's
+    V3 model list omits it, `waypoint-mission.md:204`, "Manifold-3 implied" only).
+- **Reclassified — pre-flight safety checks (was loosely "DJI does this"):**
+  `Action(START)` is documented to run **only a mission-validity check**
+  (`waypoint-mission.md:164`), **not** battery/GPS/home/obstacle safety
+  pre-checks — that guidance (`40.flight-control.md:433`) is for the
+  Joystick/manual-PSDK-without-RC path, a different API. So AeroScan **relies on
+  the FC validity gate + the aircraft's standard autonomous-flight interlocks (RC
+  present)** and adds no checks of its own — but **whether those interlocks fire
+  for a PSDK WaypointV3 START is undocumented; verify it on the device test.** Do
+  not record this as "dropped because DJI does it."
+
 ---
 
 ## Environments & repos

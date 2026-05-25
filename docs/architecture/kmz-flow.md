@@ -14,7 +14,12 @@ PSDK actually supports for that last-mile step. Last researched 2026-04-24.
   `DjiWaypointV3_Action(START)` from a Manifold-hosted PSDK app**, with a PSDK
   Custom Widget for pilot control from Pilot 2's live-flight view. This bypasses
   Pilot 2's mission library entirely — Pilot 2 becomes the monitoring surface, not
-  the mission chooser.
+  the mission chooser. **Status 2026-05-25: this chain is fully wired in the
+  on-drone app** (`kmz_runner.c`: PING/STAT → AUGM → PRVW → EXEC → upload →
+  `Action(START)` from the Fly widget, with mission/action state callbacks
+  registered). It has **not** yet flown on hardware — see `manifold-deployment.md`
+  and the two plan docs for the GO/NO-GO blockers (mesh data + first M4E
+  WaypointV3 upload).
 - Whether DJI's built-in **Smart 3D Capture / Explore** writes an interceptable
   KMZ/WPML after a scan is **not confirmed by any public doc**. Needs a device test
   before any "Smart3D-first" architecture is committed to.
@@ -26,7 +31,7 @@ PSDK actually supports for that last-mile step. Last researched 2026-04-24.
 | Capability | API / Surface | Notes |
 |---|---|---|
 | Upload KMZ to aircraft | `DjiWaypointV3_UploadKmzFile(bytes, len)` | From PSDK app on Manifold; aircraft accepts the file directly. |
-| Execute / control mission | `DjiWaypointV3_Action(START \| STOP \| PAUSE \| RESUME)` | Mission control from Manifold. |
+| Execute / control mission | `DjiWaypointV3_Action(START \| STOP \| PAUSE \| RESUME)` | Mission control from Manifold. START runs only a **mission-validity check** (see below), not documented safety pre-checks. |
 | Pilot-facing controls | PSDK Custom Widget | Rendered on Pilot 2's live-flight screen only. Buttons / status / text. |
 | PSDK ↔ MSDK/OSDK peer comms | `dji_mop_channel.h` (MOP channel) | Peer apps, not Pilot 2. |
 | Sample reference | `samples/sample_c/module_sample/waypoint_v3/` in PSDK source | End-to-end "upload + fly" pattern. |
@@ -41,6 +46,24 @@ PSDK actually supports for that last-mile step. Last researched 2026-04-24.
   pre-flight mission library screen.
 - **MOP is not a Pilot 2 back-channel.** It connects PSDK to MSDK/OSDK peer apps,
   not to Pilot 2.
+
+### What `Action(START)` actually checks (verified 2026-05-25 against DJI docs)
+
+- DJI documents only a **mission-validity check** on START
+  (`50.function-overview/10.advanced-function/50.waypoint-mission.md:164`): *"it
+  will first check the mission information uploaded by the user; if the check
+  fails, the drone will not perform the mission… check the error code."*
+- The docs do **not** state that WaypointV3 START runs battery / GPS / home /
+  obstacle **safety** pre-checks. The explicit "subscribe to and rigorously check
+  battery / RTH / fail-safe / RTK / obstacle sensing" guidance
+  (`40.flight-control.md:433`) is about the **Joystick / manual PSDK
+  flight-control path WITHOUT the RC — a different API**, not WaypointV3.
+- **Conclusion:** AeroScan does **not** implement its own pre-flight safety
+  checks. It relies on the FC's documented mission-validity gate plus the
+  aircraft's standard autonomous-flight interlocks (RC present). **Whether those
+  interlocks fire for a PSDK WaypointV3 START is undocumented and must be confirmed
+  on the first real device test** — a GO/NO-GO item, not a guarantee. Surface any
+  START refusal (the FC validity error code) to the pilot.
 
 ### Unverified
 

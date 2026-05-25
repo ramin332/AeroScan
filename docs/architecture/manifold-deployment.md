@@ -178,10 +178,15 @@ A managed-DPK app's PSDK **Custom Widgets render and are interactive on Pilot's
 live view** — verified this session (the stock gimbal-mover widget worked). The
 earlier raw-`systemd` binary did **not** surface widgets in Pilot.
 
-Consequence: a future Pilot "fly / start mission" widget (tap →
-`DjiWaypointV3_Action(START)`, the Phase 2.3 trigger) **requires the DPK path**.
-The app currently ships the stock sample `widget_config.json`; a custom AeroScan
-widget is future work.
+Consequence: the Pilot "fly / start mission" widget (tap →
+`DjiWaypointV3_Action(START)`) **requires the DPK path**. As of 2026-05-25 the app
+ships a **custom** AeroScan `widget_config.json` with a **Fly button** (the stock
+gimbal-mover is gone), and the tap→`Action(START)` handler is **wired**
+(`kmz_runner.c`: `HandleApprovalFrame` → upload → `READY_TO_FLY` → Fly tap →
+`Action(START)`, gated on readiness; mission/action state callbacks registered).
+What remains unproven is on-hardware: the first M4E WaypointV3 upload + START has
+never run (no mesh ever reached it). See the cockpit plan
+(`docs/superpowers/plans/2026-05-25-aeroscan-mission-cockpit.md`).
 
 ## App identity constraint
 
@@ -197,14 +202,31 @@ The DPK **display** name (`psdk-demo`) is cosmetic packaging metadata only.
 must stay as-is unless the app is re-registered with DJI. (This supersedes the
 earlier open question of whether to rename the app to "AeroScan".)
 
-## Data caveat: volatile mesh
+## Data caveat: volatile mesh (the ring-buffer model)
 
-`/blackbox` is a **~30-flight rolling ring buffer**; the perception mesh is
-volatile. The latest flight often has **no mesh**, so a *successful* augment needs
-either a flight that still has a mesh or a fresh Smart3D scan. The readiness
-handshake (`docs/superpowers/specs/2026-05-25-manifold-service-readiness-handshake-design.md`)
+`/blackbox` is a **~30-slot rolling ring buffer that cycles** (verified
+2026-05-25). The operational model:
+
+- Slots `flight0020`–`flight0049` are **reused**; slot numbers are **not
+  chronological** (confirmed by mtimes, not by slot index). Use the
+  `the_latest_flight` symlink, never a `flightNNNN` guess.
+- **A new flight slot is created by an aircraft POWER-CYCLE, not by app updates.**
+  A DPK install / rebuild does **nothing** to `/blackbox`.
+- The perception mesh (`mesh_binary_*.ply`) exists for a slot **only if a Smart3D
+  Auto-Exploration scan ran in that session**, and it is **evicted as the buffer
+  cycles**.
+- **Verified 2026-05-25: the previously-only mesh (`flight0019`) has been pruned —
+  no flight currently has a mesh.** So a *successful* augment now requires a
+  **fresh Smart3D scan** (there is no longer a fallback flight with a mesh).
+
+**Operational rule (intended flow):** fly a Smart3D scan, then **immediately** run
+the RC/augment so the fresh mesh is used before the buffer churns it — do not do
+many reboots between scan and augment. The readiness handshake
+(`docs/superpowers/specs/2026-05-25-manifold-service-readiness-handshake-design.md`)
 surfaces "does the latest flight have a mesh" to the pilot before they ship the
-augment payload. See memory `manifold-mesh-volatile`.
+augment payload, and the rc-companion is being changed to **refuse to augment when
+PING/STAT reports no mesh** rather than upload a KMZ and run a doomed augment. See
+memory `manifold-mesh-volatile`.
 
 ## See also
 

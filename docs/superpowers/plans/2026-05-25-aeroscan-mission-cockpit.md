@@ -30,6 +30,42 @@ Reading `kmz_runner.c` before building (DRY) revealed the cockpit backend was
 still exists on `/blackbox`, to exercise augment → upload → fly end-to-end and
 verify mission progress on the window live.
 
+### Fly-ready status — 2026-05-25 (verified)
+
+The **whole fly-ready software chain is wired** (code audit of `kmz_runner.c` +
+the rc-companion): `PING/STAT` → `AUGM` → augment subprocess → `PRVW` → `EXEC`
+(pilot approve) → `DjiWaypointV3_UploadKmzFile` → `READY_TO_FLY` → Fly-widget tap →
+`Action(START)`, with `RegMissionStateCallback`/`RegActionStateCallback` feeding
+the floating window. `DjiWaypointV3_Init` + both callbacks register in
+`AeroscanKmzRunner_Init`; `HandleApprovalFrame` sets `s_pendingExecute` and the
+worker uploads. (The stale comment "Phase 2.2 wires EXEC; for now nothing" is
+WRONG — EXEC is wired.) PING/STAT readiness handshake: **done**.
+
+Remaining gaps (honest status):
+
+- 🔴 **Mesh** — none on `/blackbox` right now (flight0019's was pruned); needs a
+  fresh Smart3D scan. **Data blocker.**
+- 🔴 **First M4E WaypointV3 upload + START has never run on hardware** (no mesh
+  ever reached it). This is the real **GO/NO-GO** (Phase 4.4) and also confirms
+  whether the M4E even supports WaypointV3 — DJI's V3 model list
+  (`waypoint-mission.md:204`) predates and **omits the M4E** ("Manifold-3 implied"
+  only).
+- 🟠 **Stale-MOP-channel recovery** — a half-open MOP connection currently requires
+  an app restart to reconnect (being fixed; see the Parallel section).
+- 🟢 **Fail-fast augment gating** — the rc-companion should refuse to augment when
+  PING/STAT reports no mesh, instead of uploading the KMZ and running a doomed
+  augment (being added).
+
+**START-check correction (Phase 4.2):** `Action(START)` is documented to run only
+a **mission-validity** check (`waypoint-mission.md:164`), **not** battery / GPS /
+home / obstacle safety pre-checks — that guidance (`40.flight-control.md:433`) is
+for the *Joystick / manual-PSDK-without-RC* path, a different API. AeroScan does
+**not** add its own safety checks; it relies on the FC validity gate + the
+aircraft's standard autonomous-flight interlocks (RC present). **Whether those
+interlocks fire for a PSDK WaypointV3 START is undocumented — confirm on the device
+test (Phase 4.4); do not assume "DJI does all the checks."** Surface any START
+refusal (the FC error code) to the pilot.
+
 **Goal:** Turn the Pilot 2 on-aircraft live view into an AeroScan "mission cockpit" —
 a floating-window status line (readiness + augment progress + mission state),
 action-bar buttons (Augment, FLY), HMS alerts, and live telemetry — and make the

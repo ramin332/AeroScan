@@ -20,11 +20,16 @@ blocker — a **mesh** for a successful augment.
 
 ## What we found (investigation)
 
-1. **Mesh is volatile.** `/blackbox` is a ~30-flight ring buffer. flight0016
-   (Mijande) is pruned. **Only flight0019** still has `mesh_binary_*.ply`;
-   flight0048 (latest) has none. → augment on the latest flight fails (the exact
-   failure from this morning). See memory `manifold-mesh-volatile`. **Still the
-   live data blocker.**
+1. **Mesh is volatile.** `/blackbox` is a ~30-slot ring buffer that **cycles** —
+   slots `flight0020`–`flight0049` get **reused** and slot numbers are **not
+   chronological** (verified by mtimes). A new slot is created by an aircraft
+   **power-cycle**, not by app updates. flight0016 (Mijande) was pruned long ago;
+   **update (re-verified 2026-05-25 later): flight0019's mesh has now ALSO been
+   pruned — no flight currently has a mesh.** → a *successful* augment requires a
+   **fresh Smart3D scan**; there is no longer a fallback flight. The mesh exists
+   for a slot only if a Smart3D scan ran that session, and only until the buffer
+   churns it — so run the augment **immediately** after a scan. See memory
+   `manifold-mesh-volatile`. **The live data blocker.**
 2. **DPK is the production deployment** (not raw `systemd`). `dji_app_ctl install
    -i <file>.dpk` works **without** sudo. DJI's docs say the raw-exec path is
    dev-only and may terminate abnormally; production must go through Pilot. (The
@@ -60,8 +65,23 @@ blocker — a **mesh** for a successful augment.
    restart cleared it — stale-channel recovery is a hardening TODO.
 7. **WaypointV3 upload + `Action(START)` is the sanctioned transport** (docs
    confirmed). By design two human gates: approve in companion → upload; Pilot
-   widget tap → START. The **START trigger (Phase 2.3) is not implemented**, and
-   the companion shows **stats only, no visual preview**.
+   widget tap → START. **Update (verified 2026-05-25 by code audit): the START
+   trigger IS implemented** — the Fly-widget tap → `Action(START)` handler is
+   wired in `kmz_runner.c` (gated on `READY_TO_FLY`), and `DjiWaypointV3_Init` +
+   mission/action state callbacks register in `AeroscanKmzRunner_Init`. (The stale
+   comment "Phase 2.2 wires EXEC; for now nothing" is wrong — EXEC is wired.) What
+   is unproven is **on-hardware**: the first M4E WaypointV3 upload + START has
+   never run (no mesh ever reached it). The companion still shows **stats only, no
+   visual preview**.
+8. **`Action(START)` checks mission VALIDITY only, not safety** (verified against
+   DJI docs). `waypoint-mission.md:164` documents a mission-validity check on
+   START; it does **not** document battery/GPS/home/obstacle safety pre-checks.
+   The "subscribe to and rigorously check battery/RTH/RTK/obstacle" guidance
+   (`40.flight-control.md:433`) is for the Joystick/manual-PSDK-without-RC path, a
+   **different API**. So we rely on the FC validity gate + the aircraft's standard
+   autonomous-flight interlocks (RC present) and add no checks of our own — but
+   whether those interlocks fire for a PSDK WaypointV3 START is **undocumented;
+   confirm on the device test.**
 
 ## What we built / did this session
 
@@ -127,13 +147,14 @@ blocker — a **mesh** for a successful augment.
 
 1. **Mesh for a successful augment — THE blocker (field task).** Fly a fresh
    Smart3D scan (also answers firmware-persistence H1/H2: does current firmware
-   keep the mesh in `/blackbox`?), OR use flight0019's mesh + its source KMZ — but
-   flight0019 is at the ring-buffer prune edge (latest is **flight0049**, ~30-flight
-   buffer), so **verify it still exists** before relying on it. Everything else
-   works; this is the only thing standing between us and a successful augment.
-2. **Phase 2 — PSDK PING/STAT wiring** in `kmz_runner.c` (codeable now, no aircraft
-   needed). `kmzrun_status` builds clean; add the `is_ping` dispatch + STAT reply.
-   End-to-end testable once Phase 3 lands.
+   keep the mesh in `/blackbox`?). The old fallback — "use flight0019's mesh + its
+   source KMZ" — is **gone: flight0019's mesh has been pruned by the ring buffer
+   (re-verified 2026-05-25), so no flight currently has a mesh.** A fresh scan is
+   now the only route to a successful augment; run the augment **immediately**
+   after the scan, before the buffer churns the mesh. Everything else works.
+2. ~~**Phase 2 — PSDK PING/STAT wiring** in `kmz_runner.c`~~ **DONE (2026-05-25):**
+   the `is_ping` dispatch + STAT reply are wired; PING → STAT round-trips. (Was:
+   `kmzrun_status` builds clean, add the dispatch.)
 3. **Phase 3 — RC-companion Kotlin** (Constants / AugmentFraming PING-STAT /
    StatusSession / HomeViewModel banner / HomeScreen). **User builds in Android
    Studio.** This is also the answer to "how do we see managed-app status" — the
@@ -145,9 +166,12 @@ blocker — a **mesh** for a successful augment.
 5. **Stale MOP-channel recovery.** The first connect left a half-open channel
    ("unable to send" until a restart). The handler should detect + recover stale
    sessions instead of needing a manual restart.
-6. **Phase 2.3 — fly trigger** (Fly widget tap → `Action(START)`, with the human
-   gate) + **visual preview** (PNG into the PRVW frame). Deployment side unblocked
-   (widgets interactive); the START handler + gate is the work.
+6. ~~**Phase 2.3 — fly trigger** (Fly widget tap → `Action(START)`)~~ **WIRED
+   (2026-05-25):** the Fly-widget tap → `Action(START)` handler + the human gate
+   (`READY_TO_FLY`) are implemented in `kmz_runner.c`; mission/action state
+   callbacks register. Remaining: the **first on-hardware** WaypointV3 upload +
+   START (the GO/NO-GO — needs a mesh first) and the **visual preview** (PNG into
+   the PRVW frame, still stats-only).
 7. **Manifold-side docs.** Mirror the dev/prod deployment model into
    `/open_app/dev/docs/` + `INDEX.md` (laptop `docs/` already updated).
 8. **Commit the branch work** (both repos, `feat/manifold-readiness-handshake`):
