@@ -119,10 +119,10 @@ fun HomeScreen(viewModel: HomeViewModel = viewModel()) {
 @Composable
 private fun ConnectionBanner(state: Connection.State) {
     val (text, container) = when (state) {
-        is Connection.State.Initializing -> "Initializing MSDK…" to MaterialTheme.colorScheme.surfaceVariant
-        is Connection.State.Registered -> "MSDK registered, waiting for aircraft" to MaterialTheme.colorScheme.surfaceVariant
-        is Connection.State.RegisterFailed -> "MSDK registration failed: ${state.reason}" to MaterialTheme.colorScheme.errorContainer
-        is Connection.State.AircraftConnected -> "M4E connected (id ${state.productId})" to MaterialTheme.colorScheme.primaryContainer
+        is Connection.State.Initializing -> "Initializing App..." to MaterialTheme.colorScheme.surfaceVariant
+        is Connection.State.Registered -> "App registered, waiting for aircraft" to MaterialTheme.colorScheme.surfaceVariant
+        is Connection.State.RegisterFailed -> "App registration failed: ${state.reason}" to MaterialTheme.colorScheme.errorContainer
+        is Connection.State.AircraftConnected -> "Your drone has connected!)" to MaterialTheme.colorScheme.primaryContainer
         is Connection.State.AircraftDisconnected -> "Aircraft disconnected" to MaterialTheme.colorScheme.errorContainer
     }
     Card(
