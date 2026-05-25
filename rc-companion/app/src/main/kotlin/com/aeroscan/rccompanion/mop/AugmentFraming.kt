@@ -24,6 +24,13 @@ import java.nio.ByteOrder
  *
  * EXEC body (RC → Manifold):
  *   mission_id_len(4) + mission_id_utf8   (mission_id may be empty)
+ *
+ * PING body (RC → Manifold):
+ *   (none — body_len 0, the request is the magic alone)
+ *
+ * STAT body (Manifold → RC):
+ *   UTF-8 JSON readiness blob — mirrors `aeroscan-psdk:kmzrun_status.c`'s
+ *   `kmzrun_build_status_json` output. Parsed into [ManifoldStatus].
  * ```
  *
  * Bytes-on-the-wire compatibility with `aeroscan-psdk:kmz_runner.c` is the
@@ -43,6 +50,9 @@ object AugmentFraming {
 
     fun buildExecHeader(bodyLen: Int): ByteArray =
         encodeHeader(MopConstants.MAGIC_EXEC, bodyLen)
+
+    /** PING is header-only (body 0) — the readiness request is the magic alone. */
+    fun buildPingFrame(): ByteArray = frame(MopConstants.MAGIC_PING, ByteArray(0))
 
     /** Length-prefixed concat of two byte slabs (intent+cloud or summary+kmz). */
     fun buildAugmBody(intentJson: ByteArray, cloudPly: ByteArray): ByteArray =
@@ -86,6 +96,47 @@ object AugmentFraming {
     fun parsePreviewBody(body: ByteArray): PreviewBody {
         val (a, b) = splitLengthPrefixedPair(body)
         return PreviewBody(summaryJson = a, augmentedKmz = b)
+    }
+
+    /**
+     * Manifold augment-readiness snapshot — the decoded STAT body. Field names
+     * mirror `aeroscan-psdk:src/manifold3_app/kmzrun_status.c`'s JSON exactly.
+     */
+    data class ManifoldStatus(
+        val appVersion: String,
+        val flightId: String,
+        val latestFlight: String,
+        val meshPresent: Boolean,
+        val meshChunks: Int,
+        val nPoints: Long,
+        val meshBytes: Long,
+        val blackboxFreeGb: Double,
+        val envOk: Boolean,
+        val envDetail: String,
+    )
+
+    /**
+     * Parse a STAT body's UTF-8 JSON into [ManifoldStatus]. Defensive: missing
+     * fields fall back to safe defaults so a partial/old-Manifold blob never
+     * crashes the banner. Throws only if the body isn't valid JSON at all.
+     */
+    fun parseStatJson(body: ByteArray): ManifoldStatus =
+        parseStatJson(String(body, Charsets.UTF_8))
+
+    fun parseStatJson(json: String): ManifoldStatus {
+        val o = org.json.JSONObject(json)
+        return ManifoldStatus(
+            appVersion = o.optString("app_version", "?"),
+            flightId = o.optString("flight_id", "?"),
+            latestFlight = o.optString("latest_flight", "?"),
+            meshPresent = o.optBoolean("mesh_present", false),
+            meshChunks = o.optInt("mesh_chunks", 0),
+            nPoints = o.optLong("n_points", 0L),
+            meshBytes = o.optLong("mesh_bytes", 0L),
+            blackboxFreeGb = o.optDouble("blackbox_free_gb", -1.0),
+            envOk = o.optBoolean("env_ok", false),
+            envDetail = o.optString("env_detail", ""),
+        )
     }
 
     // ---------------------------------------------------------------------

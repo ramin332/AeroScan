@@ -8,6 +8,7 @@ import com.aeroscan.rccompanion.cloud.PlyParser
 import com.aeroscan.rccompanion.cloud.PlyVoxelDownsample
 import com.aeroscan.rccompanion.filepick.PickedFile
 import com.aeroscan.rccompanion.mop.AugmentSession
+import com.aeroscan.rccompanion.mop.StatusSession
 import com.aeroscan.rccompanion.wpml.WpmlParser
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -38,6 +39,58 @@ import java.util.TimeZone
  * once we hit ReadyToFly, the rc-companion's job is done. The card in that
  * state nudges the pilot to switch to Pilot 2.
  */
+
+/**
+ * Readiness-banner state for the Manifold augment service. Surfaced from
+ * [HomeViewModel.checkStatus] via [HomeViewModel.banner] and rendered by
+ * HomeScreen. Drives a single coloured banner the pilot reads BEFORE augmenting.
+ */
+sealed class BannerState {
+    /** No check has run yet (initial). */
+    data object Idle : BannerState()
+
+    /** A PING is in flight. */
+    data object Checking : BannerState()
+
+    /** Env healthy + mesh present — augment will work. (green) */
+    data class Ready(val label: String) : BannerState()
+
+    /** Env healthy but the latest flight has no mesh — won't augment. (red) */
+    data class NoMesh(val label: String) : BannerState()
+
+    /** The Manifold's Python env probe failed — augment would crash. (amber) */
+    data class EnvError(val label: String) : BannerState()
+
+    /** No STAT reply (app down, link down, old Manifold). (grey) */
+    data class Unreachable(val label: String) : BannerState()
+}
+
+/**
+ * Pure mapping from a [StatusSession.Result] to a [BannerState]. Priority is
+ * EnvError > NoMesh > Ready so the most blocking problem wins the banner.
+ * Kept top-level + side-effect-free so it's unit-testable without the MSDK.
+ */
+fun bannerFor(result: StatusSession.Result): BannerState = when (result) {
+    is StatusSession.Result.Unreachable ->
+        BannerState.Unreachable("Manifold not reachable — is the app running? (${result.reason})")
+
+    is StatusSession.Result.Ok -> {
+        val s = result.status
+        when {
+            !s.envOk -> BannerState.EnvError("env error: ${s.envDetail}")
+            !s.meshPresent -> BannerState.NoMesh("Not ready — no mesh on ${s.latestFlight}")
+            else -> {
+                val pts = if (s.nPoints >= 1_000_000) "%.1fM pts".format(s.nPoints / 1e6)
+                    else "${s.nPoints} pts"
+                BannerState.Ready(
+                    "Ready · ${s.latestFlight} · mesh ✓ (${s.meshChunks} chunks, $pts) · env ✓ · %.1f GB free"
+                        .format(s.blackboxFreeGb),
+                )
+            }
+        }
+    }
+}
+
 class HomeViewModel(app: Application) : AndroidViewModel(app) {
 
     /** Per-WP voxel size used to downsample the KMZ's cloud.ply before
@@ -118,10 +171,15 @@ class HomeViewModel(app: Application) : AndroidViewModel(app) {
     private val _ui = MutableStateFlow<UiState>(UiState.Idle)
     val ui: StateFlow<UiState> = _ui.asStateFlow()
 
+    /** Manifold readiness banner — driven by [checkStatus]. */
+    private val _banner = MutableStateFlow<BannerState>(BannerState.Idle)
+    val banner: StateFlow<BannerState> = _banner.asStateFlow()
+
     val connection: StateFlow<Connection.State> = Connection.state
 
     private var augmentJob: Job? = null
     private var session: AugmentSession? = null
+    private var statusJob: Job? = null
 
     fun onFilePicked(picked: PickedFile) {
         _ui.value = UiState.Picked(picked)
@@ -272,6 +330,32 @@ class HomeViewModel(app: Application) : AndroidViewModel(app) {
             sess.approve(missionId = rr.summary.name)
             // ExecuteSent event → ReadyToFly transition wired in the events
             // collector above.
+        }
+    }
+
+    /**
+     * Run a one-shot Manifold readiness check (PING → STAT) and map the result
+     * onto [banner]. Bounded by [StatusSession.query]'s own timeout.
+     *
+     * Skipped (no-op, banner left as-is) while an augment is in flight — the
+     * augment session owns the MOP channel and a concurrent status PING would
+     * collide with it. Also short-circuits to [BannerState.Unreachable] if the
+     * aircraft link isn't up, since the PING can't reach the Manifold without it.
+     */
+    fun checkStatus() {
+        if (session != null || augmentJob?.isActive == true) return
+        if (statusJob?.isActive == true) return
+
+        if (connection.value !is Connection.State.AircraftConnected) {
+            _banner.value = bannerFor(
+                StatusSession.Result.Unreachable("M4E not connected — power on the aircraft and pair the RC"),
+            )
+            return
+        }
+
+        statusJob = viewModelScope.launch {
+            _banner.value = BannerState.Checking
+            _banner.value = bannerFor(StatusSession().query())
         }
     }
 

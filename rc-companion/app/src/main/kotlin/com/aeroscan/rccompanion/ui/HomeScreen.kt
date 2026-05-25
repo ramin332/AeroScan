@@ -18,9 +18,12 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -32,9 +35,17 @@ import com.aeroscan.rccompanion.filepick.rememberKmzPicker
 fun HomeScreen(viewModel: HomeViewModel = viewModel()) {
     val ui by viewModel.ui.collectAsStateWithLifecycle()
     val conn by viewModel.connection.collectAsStateWithLifecycle()
+    val banner by viewModel.banner.collectAsStateWithLifecycle()
     val ctx = LocalContext.current
 
     val pick = rememberKmzPicker { viewModel.onFilePicked(it) }
+
+    // Probe the Manifold once when the screen first appears so the pilot sees
+    // readiness without an extra tap. Re-probes whenever the aircraft link
+    // (re)connects, since the PING can't reach the Manifold until it's up.
+    LaunchedEffect(conn) {
+        if (conn is Connection.State.AircraftConnected) viewModel.checkStatus()
+    }
 
     Scaffold { padding ->
         Column(
@@ -51,6 +62,7 @@ fun HomeScreen(viewModel: HomeViewModel = viewModel()) {
         ) {
             Text("AeroScan RC", style = MaterialTheme.typography.headlineMedium)
             ConnectionBanner(conn)
+            ReadinessBanner(state = banner, onRefresh = viewModel::checkStatus)
 
             when (val s = ui) {
                 is HomeViewModel.UiState.Idle -> IdleCard(onPick = pick)
@@ -118,6 +130,45 @@ private fun ConnectionBanner(state: Connection.State) {
         colors = CardDefaults.cardColors(containerColor = container),
     ) {
         Text(text, modifier = Modifier.padding(12.dp))
+    }
+}
+
+@Composable
+private fun ReadinessBanner(state: BannerState, onRefresh: () -> Unit) {
+    // Colour + glyph encode the readiness verdict at a glance. Greens/reds are
+    // explicit hex (not theme roles) so the verdict reads the same regardless
+    // of the active Material colour scheme.
+    val ready = Color(0xFF2E7D32)
+    val problem = Color(0xFFC62828)
+    val neutral = Color(0xFF455A64)
+    val (container, label) = when (state) {
+        is BannerState.Idle -> neutral to "Manifold readiness — tap Check"
+        is BannerState.Checking -> neutral to "Checking Manifold…"
+        is BannerState.Ready -> ready to "🟢 ${state.label}"
+        is BannerState.NoMesh -> problem to "🔴 ${state.label}"
+        is BannerState.EnvError -> problem to "🟠 ${state.label}"
+        is BannerState.Unreachable -> neutral to "⚪ ${state.label}"
+    }
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(containerColor = container),
+    ) {
+        Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+            Text(
+                label,
+                color = Color.White,
+                style = MaterialTheme.typography.bodyMedium,
+            )
+            TextButton(
+                onClick = onRefresh,
+                enabled = state !is BannerState.Checking,
+            ) {
+                Text(
+                    if (state is BannerState.Checking) "Checking…" else "Check Manifold",
+                    color = Color.White,
+                )
+            }
+        }
     }
 }
 

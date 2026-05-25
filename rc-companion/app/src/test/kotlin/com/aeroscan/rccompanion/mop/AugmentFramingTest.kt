@@ -94,4 +94,56 @@ class AugmentFramingTest {
             // expected
         }
     }
+
+    @Test
+    fun `PING frame is header-only with zero body`() {
+        val frame = AugmentFraming.buildPingFrame()
+        assertEquals(AugmentFraming.HEADER_LEN, frame.size)
+        val hdr = AugmentFraming.parseHeader(frame)
+        assertEquals(MopConstants.MAGIC_PING, hdr.magic)
+        assertEquals(0, hdr.bodyLen)
+        assertEquals(MopConstants.FRAME_VERSION, hdr.version)
+    }
+
+    @Test
+    fun `parseStatJson reads all fields`() {
+        val json = """
+            {"app_version":"0.4.0","flight_id":"the_latest_flight",
+             "latest_flight":"flight0048","mesh_present":false,"mesh_chunks":0,
+             "n_points":0,"mesh_bytes":0,"blackbox_free_gb":42.1,
+             "env_ok":true,"env_detail":"ok"}
+        """.trimIndent().toByteArray(Charsets.UTF_8)
+        val s = AugmentFraming.parseStatJson(json)
+        assertEquals("0.4.0", s.appVersion)
+        assertEquals("flight0048", s.latestFlight)
+        assertEquals(false, s.meshPresent)
+        assertEquals(0L, s.nPoints)
+        assertEquals(true, s.envOk)
+        assertEquals("ok", s.envDetail)
+        assertEquals(42.1, s.blackboxFreeGb, 0.001)
+    }
+
+    @Test
+    fun `parseStatJson tolerates missing fields`() {
+        val s = AugmentFraming.parseStatJson("""{"latest_flight":"flight0019"}""")
+        assertEquals("flight0019", s.latestFlight)
+        assertEquals(false, s.meshPresent)
+        assertEquals(0, s.meshChunks)
+        assertEquals(false, s.envOk)
+    }
+
+    @Test
+    fun `parseStatJson reads a ready-with-mesh blob`() {
+        val json = """
+            {"app_version":"0.4.0","flight_id":"flight0019",
+             "latest_flight":"flight0019","mesh_present":true,"mesh_chunks":25,
+             "n_points":18800000,"mesh_bytes":1048576000,"blackbox_free_gb":12.4,
+             "env_ok":true,"env_detail":"ok"}
+        """.trimIndent()
+        val s = AugmentFraming.parseStatJson(json)
+        assertEquals(true, s.meshPresent)
+        assertEquals(25, s.meshChunks)
+        assertEquals(18_800_000L, s.nPoints)
+        assertEquals(1_048_576_000L, s.meshBytes)
+    }
 }

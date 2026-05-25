@@ -20,6 +20,8 @@ object MopConstants {
     const val MAGIC_AUGM: String = "AUGM"  // RC → Manifold: intent + cloud
     const val MAGIC_PRVW: String = "PRVW"  // Manifold → RC: KMZ + summary
     const val MAGIC_EXEC: String = "EXEC"  // RC → Manifold: pilot approval
+    const val MAGIC_PING: String = "PING"  // RC → Manifold: request status (body 0)
+    const val MAGIC_STAT: String = "STAT"  // Manifold → RC: readiness JSON
 
     // Header layout version. Bump if the framing changes incompatibly.
     const val FRAME_VERSION: Int = 1
@@ -34,4 +36,9 @@ object MopConstants {
     // Augment subprocess wall-clock can hit 4 min on a Mijande-class building.
     // Receive timeout for PRVW frames must comfortably exceed that.
     const val AUGMENT_PRVW_TIMEOUT_MS: Long = 10 * 60 * 1000L
+
+    // Status query must return fast; bounded well under the augment timeout.
+    // The Manifold's STAT build includes a 5 s env-import probe, so the round
+    // trip can run a few seconds — 15 s leaves headroom over OcuSync latency.
+    const val STATUS_TIMEOUT_MS: Long = 15 * 1000L
 }
