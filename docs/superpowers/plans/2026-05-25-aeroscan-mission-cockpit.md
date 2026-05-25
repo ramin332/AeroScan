@@ -6,6 +6,30 @@
 > edited via scp + built there). The RC-companion Kotlin lives in this laptop repo
 > (`rc-companion/`). Mesh data is parked.
 
+## Status — 2026-05-25 (most of this was already built; scope trimmed)
+
+Reading `kmz_runner.c` before building (DRY) revealed the cockpit backend was
+~80% already implemented. Actual state:
+
+- **Phase 1 — DONE** (Manifold `6fd6a34`): self-contained DPK (lean `app.json`
+  `userconfig` → `widget_file`; `.dpk` 159 MB → 432 KB; exe-relative config load).
+  Verified in Pilot: the **AeroScan Fly button renders** (no more stock gimbal mover).
+- **Phase 2 — DONE**: `Status()` already pushed every state transition to the
+  floating window; added live **mission progress** (Manifold `3f63a84`) — the
+  WaypointV3 state callback now shows "Mission: flying — waypoint N" for active
+  states. (Verifies live only on a real flight.)
+- **Phase 4 — already built**: the Fly button calls `DjiWaypointV3_Action(START)`
+  gated on `READY_TO_FLY`; mission + action state callbacks registered.
+- **Phase 5 — already started**: `DjiFcSubscription_Init` + `STATUS_FLIGHT`
+  (START preconditions).
+- **Phase 3 (HMS alerts) + idle-readiness — DROPPED** (kept simple): the
+  rc-companion readiness banner already surfaces pre-flight warnings
+  (no mesh / env bad / unreachable), so no on-aircraft HMS/buzzer duplication.
+
+**Remaining is the data blocker, not code:** a flight whose `mesh_binary_*.ply`
+still exists on `/blackbox`, to exercise augment → upload → fly end-to-end and
+verify mission progress on the window live.
+
 **Goal:** Turn the Pilot 2 on-aircraft live view into an AeroScan "mission cockpit" —
 a floating-window status line (readiness + augment progress + mission state),
 action-bar buttons (Augment, FLY), HMS alerts, and live telemetry — and make the
