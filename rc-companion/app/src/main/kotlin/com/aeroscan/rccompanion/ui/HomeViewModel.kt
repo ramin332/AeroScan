@@ -78,7 +78,7 @@ fun bannerFor(result: StatusSession.Result): BannerState = when (result) {
         val s = result.status
         when {
             !s.envOk -> BannerState.EnvError("env error: ${s.envDetail}")
-            !s.meshPresent -> BannerState.NoMesh("Not ready — no mesh on ${s.latestFlight}")
+            !s.meshPresent -> BannerState.NoMesh("Not ready — run auto-explore first ${s.latestFlight}")
             else -> {
                 val pts = if (s.nPoints >= 1_000_000) "%.1fM pts".format(s.nPoints / 1e6)
                     else "${s.nPoints} pts"
@@ -207,6 +207,20 @@ class HomeViewModel(app: Application) : AndroidViewModel(app) {
 
         if (connection.value !is Connection.State.AircraftConnected) {
             _ui.value = UiState.Error(picked, "M4E not connected. Power on the aircraft and pair the RC.")
+            return
+        }
+
+        // Fail fast on a known-bad readiness state (from the PING/STAT banner) —
+        // don't upload a KMZ and run a doomed ~2-min augment when the Manifold has
+        // already told us it can't succeed (no mesh / bad env / unreachable).
+        val blockReason: String? = when (val b = banner.value) {
+            is BannerState.NoMesh -> "No mesh on the latest flight — fly a Smart3D scan, then augment."
+            is BannerState.EnvError -> "Manifold env not ready (${b.label}). Augment can't run."
+            is BannerState.Unreachable -> "Manifold not reachable — start the AeroScan app on the drone, then retry."
+            else -> null  // Idle / Checking / Ready — proceed
+        }
+        if (blockReason != null) {
+            _ui.value = UiState.Error(picked, blockReason)
             return
         }
 
