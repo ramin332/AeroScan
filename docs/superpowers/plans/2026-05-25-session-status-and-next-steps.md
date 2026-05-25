@@ -6,13 +6,17 @@
 ## One-line status
 
 The Manifold PSDK app **builds, is installed as a DPK, and runs live on the
-aircraft** (binds MOP 49154, **widgets render in Pilot's live view**, RC→Manifold
-transport works); the **Phase 1 C readiness module is built & unit-tested**.
-**Deployment is settled: DPK + DJI Pilot 2** — installed & validated 2026-05-25,
-the dev `systemd --user` service is removed. See
-`docs/architecture/manifold-deployment.md` for the canonical deployment model.
-Remaining: wire Phase 2 (PING/STAT), build Phase 3 (RC banner), and get a
-**mesh** for a successful augment (the data blocker).
+aircraft**, and the **augment pipeline is now proven end-to-end on real hardware**:
+RC → MOP 49154 → handler received a 351 KB mission → venv Python parsed the
+584-waypoint MijandeExtra mission → clean, correct no-mesh failure (flight0049
+has none). **Deployment is settled: DPK + DJI Pilot 2** (installed & validated
+2026-05-25; dev `systemd --user` service removed). The **dev path is now one
+command** — `./run.sh` stops both production apps and runs the raw binary with
+readable logs (`docs/architecture/manifold-deployment.md` for dev-vs-prod). Widget
+clutter (TTS/mic) removed; the AeroScan **Fly** button + status window + dev textbox
+remain. **Phase 1 C readiness module built & unit-tested.** Remaining: Phase 2
+(PING/STAT), Phase 3 (RC banner), widget-config packaging, and the one real
+blocker — a **mesh** for a successful augment.
 
 ## What we found (investigation)
 
@@ -40,11 +44,20 @@ Remaining: wire Phase 2 (PING/STAT), build Phase 3 (RC banner), and get a
    **Custom Widgets render and are interactive on Pilot's live view** (the stock
    gimbal-mover widget worked). The earlier raw-`systemd` binary never surfaced
    widgets. → a future "tap → fly" widget (`Action(START)`) requires the DPK
-   path. App currently ships the stock `widget_config.json`; a custom AeroScan
-   widget is future work.
-6. **Transport works.** Live test: RC sent a KMZ (302508 B intent + 57154 B
-   cloud) → Manifold **staged** it → augment **invoked** → **FAILED on no-mesh**
-   (flight0048). The RC↔Manifold chain is healthy up to the mesh step.
+   path. Update (this session): the app already ships a **custom**
+   `widget_config.json` (AeroScan **Fly** button); the TTS/microphone clutter came
+   from a `speaker` block copied from the sample — **removed** from both en/cn
+   configs. Remaining widget work: package `widgets/` into the DPK (binary-relative
+   load path, not the hardcoded `/open_app/dev/...`) + the Fly tap→`Action(START)`
+   handler (Phase 2.3).
+6. **Transport + augment proven end-to-end (dev path, 2026-05-25).** RC → MOP
+   49154 → `kmz_runner` received a 351 KB mission payload → staged → launched the
+   venv Python → augment parsed the mission (`[1/7] MijandeExtra, 584 waypoints,
+   9-vertex polygon`) → `[2/7]` mesh load → clean `FileNotFoundError` (no mesh on
+   flight0049) → handler logged `Augment FAILED` (exit 1). The whole chain works;
+   only mesh data is missing. **Caveat:** the first connect left a stale/half-open
+   MOP channel (`channelHandle … closed` + send retries, "unable to send"); a
+   restart cleared it — stale-channel recovery is a hardening TODO.
 7. **WaypointV3 upload + `Action(START)` is the sanctioned transport** (docs
    confirmed). By design two human gates: approve in companion → upload; Pilot
    widget tap → START. The **START trigger (Phase 2.3) is not implemented**, and
@@ -100,25 +113,46 @@ Remaining: wire Phase 2 (PING/STAT), build Phase 3 (RC banner), and get a
   works under the sandboxed DPK user. App identity kept as the registered triple
   (not renamed). Canonical model: `docs/architecture/manifold-deployment.md`.
 - **systemd `--user` service — REMOVED.** No longer the deployment path.
+- **`run.sh` is now the one-command dev launcher.** Stops BOTH production apps
+  (Smart3DExplore + psdk-demo DPK), builds, runs the raw binary foreground with
+  readable logs; banner notes a reboot/Pilot re-tap restores production. (Manifold
+  repo, uncommitted.)
+- **Transport + augment validated end-to-end on the dev path** (see #6) — the full
+  RC→Manifold→augment chain works; fails only on missing mesh.
+- **Widget clutter removed.** Dropped the `speaker` (TTS/voice) block from both
+  `en/cn widget_config.json` → just the AeroScan Fly button + status window +
+  textbox. (Manifold repo, uncommitted.)
 
 ## What's left to do (ordered)
 
-1. **Phase 2 — PSDK PING/STAT wiring** in `kmz_runner.c` (plan Phase 2). The
-   `kmzrun_status` module already builds clean into the app; just add the
-   `is_ping` dispatch + STAT reply. Can't end-to-end test PING until Phase 3.
-2. **Phase 3 — RC-companion Kotlin** (plan Phase 3): Constants / AugmentFraming
-   (PING/STAT) / StatusSession / HomeViewModel banner / HomeScreen. **User builds
-   in Android Studio** (laptop has the AS JBR + cached gradle 8.9, but no
-   `java`/`gradle`/`gradlew` on PATH for headless builds).
-3. **Mesh for a successful augment** (the data blocker): fly a fresh Smart3D scan
-   (also answers the firmware-persistence question H1/H2 — does current firmware
-   keep the mesh in `/blackbox`?), OR use flight0019's mesh + its source KMZ.
-   Without a mesh, augment correctly fails.
-4. **Phase 2.3 fly trigger** (widget tap → `Action(START)`) + **visual preview**
-   (render a PNG into the PRVW frame) — later production items. The DPK path is
-   confirmed to surface interactive widgets, so the START-widget is unblocked on
-   the deployment side; a custom AeroScan `widget_config.json` is the remaining
-   work (the app currently ships the stock sample widget set).
+1. **Mesh for a successful augment — THE blocker (field task).** Fly a fresh
+   Smart3D scan (also answers firmware-persistence H1/H2: does current firmware
+   keep the mesh in `/blackbox`?), OR use flight0019's mesh + its source KMZ — but
+   flight0019 is at the ring-buffer prune edge (latest is **flight0049**, ~30-flight
+   buffer), so **verify it still exists** before relying on it. Everything else
+   works; this is the only thing standing between us and a successful augment.
+2. **Phase 2 — PSDK PING/STAT wiring** in `kmz_runner.c` (codeable now, no aircraft
+   needed). `kmzrun_status` builds clean; add the `is_ping` dispatch + STAT reply.
+   End-to-end testable once Phase 3 lands.
+3. **Phase 3 — RC-companion Kotlin** (Constants / AugmentFraming PING-STAT /
+   StatusSession / HomeViewModel banner / HomeScreen). **User builds in Android
+   Studio.** This is also the answer to "how do we see managed-app status" — the
+   DPK's logs aren't `dji`-readable over SSH, so the RC banner is the status surface.
+4. **Widget-config packaging.** Copy `widgets/` into the DPK + load via a
+   binary-relative path (drop the hardcoded `/open_app/dev/src/...`), so a DPK
+   shipped to a device without the dev tree still finds its config. Small
+   CMake/`setup_psdk.sh` change. (TTS/mic already removed.)
+5. **Stale MOP-channel recovery.** The first connect left a half-open channel
+   ("unable to send" until a restart). The handler should detect + recover stale
+   sessions instead of needing a manual restart.
+6. **Phase 2.3 — fly trigger** (Fly widget tap → `Action(START)`, with the human
+   gate) + **visual preview** (PNG into the PRVW frame). Deployment side unblocked
+   (widgets interactive); the START handler + gate is the work.
+7. **Manifold-side docs.** Mirror the dev/prod deployment model into
+   `/open_app/dev/docs/` + `INDEX.md` (laptop `docs/` already updated).
+8. **Commit the branch work** (both repos, `feat/manifold-readiness-handshake`):
+   laptop doc updates; Manifold `run.sh` dev-mode + `widget_config` cleanup are
+   uncommitted.
 
 ## How to resume (quick commands)
 

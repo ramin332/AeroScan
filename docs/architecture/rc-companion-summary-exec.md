@@ -1,77 +1,143 @@
-# RC Wireless Mission Transfer — Executive Summary
+---
+name: RC-Companion Directiesamenvatting v2
+description: Wat we hebben gebouwd, waarom, en waar we staan na de eindspurt 2026-05-03 → 2026-05-07.
+type: project
+---
 
-**Date:** 2026-05-03 (supersedes 2026-05-01 version — see "What changed" below)
-**Status:** Pivot complete. We are **not** transporting KMZ files over the radio. The Smart3D mesh is already on the Manifold; we read it from there, augment with gimbal aim, and push the modified KMZ back over the same wired path the dev workflow already uses.
+# RC-Companion — Directiesamenvatting v2
 
-> **Deployment note (added 2026-05-25):** the "AeroScan PSDK widget" referenced below runs as a **DJI DPK package** managed through Pilot 2 (not a raw binary / `systemd --user` service) — that is what makes the widget render and respond on Pilot's live view. Canonical deployment model: `docs/architecture/manifold-deployment.md`.
+**Datum:** 2026-05-07 (vervangt v1 van 2026-05-03)
+**Eén-zinsamenvatting:** *Een drone scant een gebouw, de RC stuurt het scan-resultaat naar de boord-computer, die maakt er een NEN-2767-quality inspectiemissie van, en de piloot keurt die goed op de RC zelf — geen laptop, geen kabel, geen SD-kaart.*
 
 ---
 
-## What changed since the previous version
+## Het probleem
 
-The 2026-05-01 version of this document recommended **pausing the wireless transport and pivoting to "generate the mission on the drone."** That recommendation was based on three things we now know are wrong or moot:
+DJI's Smart Auto-Exploration zet de drone razendsnel om een gebouw heen voor een fotogrammetrie-scan. Het resultaat is mooi, maar **niet bruikbaar voor NEN-2767-inspectie**: de camera staat schuin, de waypoint-dichtheid is verkeerd, en defecten op gevels zijn niet leesbaar.
 
-1. We thought the KMZ had to come from the RC and be moved to the Manifold.
-2. We measured 5 KB/sec over the radio and called it a blocker for the production payload.
-3. We treated DJI's Smart Auto-Exploration outputs as opaque.
+Onze taak: van die scan een bruikbare inspectievlucht maken — **dezelfde route, andere camera-instellingen** — zonder dat de piloot terug naar kantoor hoeft.
 
-A read-only investigation of the Manifold's filesystem on 2026-05-03 changed all three:
+## Hoe het werkt — overzicht
 
-- The Smart Auto-Exploration **3D mesh is already on the Manifold**, in plain `.ply` files at `/blackbox/the_latest_flight/dji_perception/1/mesh_binary_*.ply`. Per flight: ~1 GB across ~50 chunks of vertex+normal point clouds. We don't need to move it; we just need to read it.
-- The Manifold's perception data is **denser than the curated cloud DJI puts in the KMZ** — 4,700 facades extracted vs. 1,651 from the same KMZ's `cloud.ply`.
-- The flight plan (waypoints, gimbal angles, capture commands) **is not on the Manifold** — DJI keeps it encrypted in `expl_plan.bin.enc`. The flight plan stays in the KMZ on the RC, which the pilot already exports via USB-MTP cable to the laptop in the existing workflow.
+```
+   ┌─────────────┐     scan      ┌──────────────┐
+   │  M4E drone  │  ──────────▶  │  /blackbox/  │  (mesh blijft op de boord-computer)
+   └─────────────┘               └──────┬───────┘
+                                        │
+                                        ▼
+   ┌─────────────┐  1. AUGM      ┌──────────────┐
+   │  RC + onze  │  ─────────▶   │   Manifold   │  ← 2. mesh + scan combineren,
+   │  Android-   │               │ (boord-      │     gevels detecteren,
+   │  app        │  ◀─────────   │  computer)   │     camera per waypoint herrichten
+   └─────────────┘  3. PRVW      └──────────────┘
+        │
+        │  4. piloot tikt "Goedkeuren"
+        ▼
+   ┌─────────────┐  5. EXEC      ┌──────────────┐
+   │  RC         │  ─────────▶   │  M4E drone   │  ← 6. KMZ in geheugen
+   └─────────────┘               └──────────────┘
+        │
+        ▼  (Pilot 2)
+   tap "AeroScan: Fly" widget → drone vliegt de aangevulde missie
+```
 
-So the architecture flips: **AeroScan reads the mesh from the Manifold (fast, wired), reads the flight plan from the KMZ on the RC (existing manual export), augments only the gimbal aim per waypoint, and pushes the modified KMZ back to the Manifold over the same wired path. The radio is not in the bulk-data path at all.**
+**Wat is er nieuw t.o.v. v1?** v1 zei: "de bandbreedte over de radio is te krap, we doen het via een kabel naar een laptop in het veld." Met twee meetresultaten kantelde dat: een *fingerprint* van de scan-wolk past in 121 KB, de hele missie-intent in 71 KB. Samen ~40 seconden uplink. **Geen laptop meer nodig.**
 
 ---
 
-## What we set out to do
+## Wat we hebben gebouwd
 
-Make it possible to fly a building-inspection mission planned in AeroScan
-**without the pilot ever leaving the controller** — no SD-card sideload, no
-"download KMZ → walk to controller → swap card → reboot Pilot 2 → import" loop.
+### 1. Augmenter op de boord-computer
+De Python-engine die uit de webapp komt, draait nu ook op de Manifold. Hij leest de scan-mesh die DJI op `/blackbox/` achterlaat, lijnt die uit met de fingerprint van de RC, detecteert gevels, en rekent voor elke waypoint uit waar de camera precies heen moet wijzen.
 
-## What we actually built and learned
+**Tijd per missie:** ~2-4 minuten voor een typisch gebouw (Mijande: 1233 waypoints, 1907 gevel-vlakken).
 
-**Working today:**
-- Wireless RC ↔ Manifold path over OcuSync (proof-of-concept) — **kept only as a control-message channel**, not for bulk files. Sub-500 KB payloads in <2 minutes; fine for "fly mission X" commands and status pulls.
-- The Android app on the controller (`rc-companion/`) registers MSDK V5 cleanly, binds the M4E, and pushes data through DJI's MOP channel to a Manifold-side passive listener (`rc_probe.c`). End-to-end verified.
+### 2. RC-companion app (Android, op de RC zelf)
+- Leest de Smart3D-KMZ van het RC-bestandssysteem
+- Stuurt scan + missie naar de Manifold over de DJI-radio
+- Toont een **preview-kaart** met statistieken vóór goedkeuring (hoeveel waypoints, hoeveel gevels gevonden, hoeveel "verdachte" camera-poses)
+- Twee grote knoppen: **GOEDKEUREN** of **AFWIJZEN**
 
-**Validated by investigation (2026-05-03):**
-- Manifold's `/blackbox/` directory keeps per-flight perception data in plain PLY format. 18 GB across 35+ flights. We have SSH access. **No file transport is needed for the mesh — we read it.**
-- DJI maintains a `/blackbox/the_latest_flight` symlink that points to the most recent flight directory. **No flight-ID lookup needed.**
-- The encrypted `expl_plan.bin.enc` is opaque, so the flight plan still has to come from the KMZ on the RC. The pilot's existing USB-MTP-to-laptop workflow handles that — manual but reliable.
+### 3. Boord-computer software (PSDK, in C)
+Wacht op de RC, draait de augmenter, stuurt het resultaat terug, en — als de piloot goedkeurt — laadt de aangevulde missie direct in het toestel via de officiële DJI-API. Daarna verschijnt er een knop "AeroScan: Fly" op het Pilot 2-scherm.
 
-**The core insight:** the right scope is **gimbal augmentation, not mission re-planning**. We take Smart3D's flight path as-is, extract facades from the Manifold mesh, and override only `gimbalPitchAngle` / `gimbalYawAngle` per waypoint to aim at the closest in-view facade. The drone re-flies a path it already knows how to execute.
+### 4. Verificatie-script
+`scripts/verify_augmented_kmz.py` opent een aangevulde missie en checkt **per waypoint of de camera daadwerkelijk naar de gevel wijst** — niet zomaar in een richting. Belangrijk omdat aggregaten ("gemiddelde camera-hoek") problemen verbergen die individuele uitschieters hebben.
 
-## Production workflow (after pivot)
+---
 
-1. **In the field:** pilot flies a Smart Auto-Exploration mission as normal. Mesh accumulates in `/blackbox/the_latest_flight/`. Smart3D KMZ ends up on the RC's storage.
-2. **At the laptop (depot, hangar, or anywhere with a USB cable):**
-   - USB-C cable from the laptop into the M4E aircraft debugging port → Manifold appears at `192.168.42.120` (DJI-documented for PCs). Or, in the lab, use the existing Wi-Fi LAN.
-   - Pilot connects RC to laptop via USB-MTP, drags the Smart3D KMZ off (existing workflow).
-   - Click "Augment with NEN-2767 gimbals" in AeroScan. Backend reads the latest flight's mesh from the Manifold over the wired link, parses the KMZ for waypoints, computes which facade each waypoint should look at, and writes a modified KMZ.
-   - Click "Push to drone" — backend SCPs the modified KMZ to the Manifold's `/open_app/dev/data/received/`.
-3. **Pre-takeoff:** disconnect the cable. Power on aircraft. Pilot taps the AeroScan PSDK widget on Pilot 2's live-flight view → drone uploads the augmented KMZ via `DjiWaypointV3_UploadKmzFile` → `DjiWaypointV3_Action(START)` → drone flies the same path with cameras now aimed at facades.
+## Wat is er getest? Wat niet?
 
-## Why this beats the alternatives
+| | Status |
+|---|---|
+| Scan op aircraft (Smart Auto-Exploration) | Werkt — al jaren productie bij DJI |
+| RC stuurt scan + missie naar Manifold (~40 sec) | **Getest, werkt** |
+| Manifold rekent de aanvulpas uit (~3 min) | **Getest, werkt** |
+| Preview-kaart op de RC met statistieken | **Getest, werkt** |
+| Goedkeuren/afwijzen vanaf de RC | **Getest, werkt** |
+| Aangevulde missie in het toestel laden | **Getest, MD5 klopt** |
+| Camera wijst naar de juiste gevel | **97 % goed** (controle-script), 3 % nog mis-aim |
+| Widgets op Pilot 2 (live view) | **Opgelost (2026-05-25):** widgets verschijnen én zijn interactief **mits de app als DPK draait** (niet als ruwe `systemd`-binary). De stock gimbal-widget werkte. Een eigen "AeroScan: Fly"-widget is nog te bouwen. |
+| **Daadwerkelijk vliegen met aangevulde missie** | **Nog niet uitgevoerd.** Propellers zijn er bewust afgehouden tijdens de pipeline-test. |
 
-- **Beats SD-card sideload** because nothing has to come off the RC and be physically swapped. The pilot's MTP cable to the laptop replaces the SD-card swap, the laptop pushes the augmented mission to the drone over a USB-C cable to the aircraft debug port, and Pilot 2 flies it.
-- **Beats wireless transport** because OcuSync's ~5 KB/sec uplink would need 67 minutes for a 20 MB KMZ. Cable speed is several MB/sec — files in seconds.
-- **Beats moving the planner to the Manifold** because we don't have to maintain a Python-on-Tegra-arm64 build. The laptop already has the planner.
-- **Beats re-planning the mission from scratch** because the gimbal-augmentation pass is much simpler than NEN-2767 waypoint generation: same path, same actions, only camera angles change.
+---
 
-## What we keep from the proof-of-concept
+## Waarom de aanpak zoals hij is
 
-- The Android RC-companion app (`rc-companion/`) stays buildable and on the shelf for future small-payload uses (status pulls, control commands, in-field tweaks). Not on the production critical path.
-- The Manifold-side listener (`rc_probe.c` on the Manifold) gets extended in a follow-up PR to actually persist incoming KMZs to disk (today it only logs hex previews).
-- The bring-up document (`rc-companion-bringup.md`) captures every Android- and PSDK-side gotcha so re-engaging this transport later costs hours, not days.
+| Keuze | Waarom |
+|---|---|
+| **Geen laptop in het veld** | Eén apparaat minder om kwijt te raken, op te laden of te koppelen. De radio is er al, de RC heeft al een scherm. |
+| **Mesh op de Manifold laten staan, niet over de radio sturen** | De volledige scan-mesh is ~1 GB. Versturen zou minutenlang duren of gewoon falen. We sturen alleen een fingerprint van 121 KB om de twee wolken op elkaar uit te lijnen. |
+| **Piloot goedkeurt voordat de drone iets doet** | Als de aanvulpas een vreemde camera-pose oplevert, ziet de piloot dat in de preview en kan hij afwijzen. Veiligheid voor afwijking. |
+| **DJI Pilot 2 blijft de vlieg-app** | We voegen één widget toe; we vervangen Pilot 2 niet. Piloot houdt zijn vertrouwde tooling. |
+| **Aangevulde missie in plaats van vanaf nul** | DJI's vluchtroute is veilig geprobeerd op duizenden gebouwen. We veranderen alleen *waar de camera kijkt*, niet waar de drone heen vliegt. Dat is een veel kleiner risico-oppervlak. |
+| **Iteratief de cameraregels verfijnen** | Eerste poging: camera dichtstbijzijnde gevel. Eindversie: 3D-afstand-tot-gevel + lichte voorkeur voor verticale wanden + gladstrijken over 5 waypoints + uitschieter-correctie. Elke verfijning kwam door visueel te kijken naar het resultaat in de viewer en bugs te repareren die niet uit de aggregaat-statistieken te zien waren. |
 
-## Decision needed
+---
 
-Confirm we proceed with:
-- **Source of truth:** mesh from Manifold (`/blackbox/the_latest_flight/dji_perception/1/`), flight plan from RC-exported KMZ.
-- **Transport:** USB-C cable (laptop ↔ M4E aircraft debug port) for SCP push of augmented KMZ. LAN as the depot fallback.
-- **AeroScan scope shift:** add a "gimbal-augment" pass on top of Smart3D missions instead of generating NEN-2767 inspection missions from scratch.
+## Wat we hebben behouden uit v1
 
-The technical proof-of-concept is done. This is now a "where do we focus the next two weeks" question — and the answer is on the gimbal-augmentation pass + the laptop-side ingester from the Manifold, not on more transport plumbing.
+- De optie om de aangevulde missie via een **kabel** terug te zetten blijft technisch werkend als depot-tooling, voor het geval de radio ergens niet werkt.
+- De webapp blijft het primaire platform voor missies waar **geen Smart3D-vlucht aan voorafgaat**. De gimbal-aanvulpas is specifiek voor de "ik heb net een Smart3D-scan gevlogen, geef me een NEN-2767-herhaling"-workflow.
+
+## Wat is verschoven
+
+- De **Android-app op de RC** is geen proof-of-concept meer. Hij staat in het kritieke pad.
+- De **OcuSync-radio** draagt nu de complete payload (~510 KB heen + terug). Met de fingerprint-strategie past dat ruim binnen het bandbreedte-budget.
+
+---
+
+## Tijdlijn van de eindspurt
+
+```
+2026-05-03  v1 vastgelegd: "kabel + laptop, radio te krap"
+            ▼
+2026-05-04  Bench-meting: fingerprint past in 121 KB. Architectuur kantelt.
+            ▼
+2026-05-05  Augmenter installeerbaar op aarch64. Eerste end-to-end op
+            Mijande-data via SSH (geen RC nog).
+            ▼
+2026-05-06  RC-app klaar (parser + AUGM/PRVW/EXEC + preview-scherm).
+            's Avonds: eerste echte radio-test op de M4E. Pipeline werkt
+            tot READY_TO_FLY (props off).
+            ▼
+2026-05-07  Bug-jacht op de camera-poses: 4 iteraties van smoothing,
+            cloud-prep matchen op de webapp, verificatie-script.
+            Eindresultaat: 97 % camera's correct gericht op gevels.
+```
+
+---
+
+## Volgende stappen
+
+1. **Werkelijk vliegen op Mijande** — alle data ziet er goed uit, één props-on flight bevestigt het.
+2. ~~**Pilot 2 widget UI verkennen**~~ **Opgelost (2026-05-25):** de boord-app is nu als **DPK** geïnstalleerd (`dji_app_ctl install -i <file>.dpk`, beheerd via Pilot 2) en widgets renderen interactief op de live view. De ruwe `systemd`-binary deed dat niet. Deployment-model: `manifold-deployment.md`. Resteert: een eigen "Fly"-widget bouwen.
+3. **Tweede en derde locatie** — Mijande is één gebouw. Elk gebouw heeft eigen detectie-uitdagingen (overhangs, balkons, dakdetails).
+4. **Anomalie-drempels kalibreren** — na 5-10 echte vluchten weten we wat de piloot daadwerkelijk als waarschuwing wil zien.
+5. **Manifold disk-management** — `/blackbox/` groeit ~1 GB per vlucht. Retentie-script nodig vóór de 50ste vlucht.
+
+---
+
+## Beslissing nodig
+
+**Geen.** v1 vroeg om bevestiging om kabel + laptop te gebruiken. v2 heeft op echte hardware bewezen dat dat niet hoeft. De volgende stap is een echte vlucht — geen architectuurwijziging.
