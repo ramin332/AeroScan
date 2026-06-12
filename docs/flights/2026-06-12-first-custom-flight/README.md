@@ -11,17 +11,17 @@ Debugging data for two issues observed during our custom flight:
 2. **"Gimbal motor overload"** warnings — frequent during flight. Cause unknown
    (too many gimbal commands? bad angles? mechanical?).
 
-## Flights (slot numbers are NOT chronological — ring buffer)
-| slot | size | mesh chunks | ours / standard? |
-|------|------|-------------|------------------|
-| flight0064 | 10M | 0 | TBD (see analysis) |
-| flight0065 | 122M | 10 | Smart3D auto-exploration SCAN (has mesh) |
-| flight0066 | 92M | 0 | TBD |
-| flight0067 | 12M | 0 | TBD |
+## Flights (slot numbers are NOT chronological — real order: 64→65→66→67)
+| slot | size | role | keep? |
+|------|------|------|-------|
+| flight0064 | 10M | our app ran, **augment FAILED** (stale mesh) — no flight | deletable |
+| flight0065 | 122M | **Smart3D scan** (built the mesh) + our augment→upload (no START) | **keep** |
+| flight0066 | 92M | **OUR CUSTOM FLIGHT** — flew 288 waypoints (2 START attempts) | **keep** |
+| flight0067 | 12M | idle Smart3D-only boot, our app absent | deletable |
 
-Known: the two relevant flights flew the **same physical route** — one DJI standard
-auto-scan route, one our PSDK WaypointV3 custom mission. The identification is in
-`ANALYSIS.md` (written by the analysis agent).
+No separate "standard route" comparison flight exists. Pairing is **0065 (DJI scan
+that mapped the building) ↔ 0066 (our custom inspection over it).** Full evidence +
+the jitter/gimbal root-cause are in `ANALYSIS.md`.
 
 ## TODO / off-machine backup
 This is on the laptop only. Back it up off-machine (external/cloud) — the drone
