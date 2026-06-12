@@ -14,3 +14,7 @@ frontend/dist/
 *.db
 kmz/*
 Payload-SDK-Tutorial/
+
+# macOS + transient field-debug artifacts (pulled logs/KMZs may contain SDK keys)
+.DS_Store
+flight-debug/

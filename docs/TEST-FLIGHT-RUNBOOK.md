@@ -3,6 +3,19 @@
 > Keep this open on your phone. **No internet in the field** — everything here is self-contained.
 > Decision locked: **full chain incl. START**, **laptop carried as cable fallback**.
 
+## ✅ RESULT — IT FLEW (2026-06-12)
+
+**GO confirmed.** The M4E accepts a PSDK `DjiWaypointV3_UploadKmzFile` + `Action(START)` and autonomously flies the augmented mission. First success: a 3-facade open-field mission. Four blockers had to be cleared first — keep these in mind, they will bite again:
+
+1. **Fly-widget START no-op** — the widget only renders after an app restart, but the restart wiped the in-memory `READY_TO_FLY` state, so every tap was silently ignored (`fly tap ignored — state=0`). Fixed in `aeroscan-psdk/kmz_runner.c`: persist a `ready_to_fly.marker`, restore on startup, re-upload + START from the worker thread. A crash/restart no longer strands a staged mission.
+2. **Wrong aircraft code** — `kmz_builder.py` emitted `droneEnumValue=77` / `payloadEnumValue=66` (Mavic 3E). The M4E FC rejected the upload with **`error_code: 4 — Load waypoint v3 wpmz file error`**. Real M4E values are **droneEnumValue=99, payloadEnumValue=88** (confirmed against 7 Smart3D exports). Fixed.
+3. **Malformed wayline** — the mission-area polygon Placemark (`cloudFilePath`, multi-coord `<Point>`, no `<wpml:index>`) leaked from `template.kml` into the executable `waylines.wpml` via a `deepcopy`, and the FC's wpmz parser choked on it (also `error_code: 4`). Fixed: strip `cloudFilePath` Placemarks from waylines; keep them in template (dev's `parse_kmz` needs them there).
+4. **`error_code: 778 — drone on ground motor on`** — WaypointV3 refuses START if motors are already armed on the ground. **Leave motors off; let START auto-take-off.**
+
+**Diagnostics that unblocked this:** the DPK runs as a sandboxed root service — `dji` cannot read its log file (`/open_app/psdk-demo/`, mode 750). But `dji` is in group `adm`, so **`journalctl --since today`** reads the full PSDK/FC log (strip ANSI: `sed -E 's/\x1b\[[0-9;]*m//g'`). The FC's real reason (`dji_waypoint_v3.c … error_code: N`) lives there, not in `Action(START)`'s generic `0x000000FF` return.
+
+**Mesh-per-scan rule (learned the hard way):** the augment registers the `/blackbox` perception mesh against the mission's cloud. A mesh exists for a slot **only if a full Smart3D Auto-Exploration ran that session.** A quick/manual flight leaves no mesh → the resolver silently falls back to the newest *other* mesh (a different scene) → ICP can't register → `augment-mission exited 1` in ~4 s. Symptom of "augment failing fast / forever": wrong-scene mesh. Fix: scan the target with Smart3D Auto-Exploration, **don't power-cycle**, augment immediately.
+
 ## What we are testing (priority order)
 1. **GO/NO-GO:** does the M4E accept a PSDK `DjiWaypointV3` upload + `Action(START)` and actually fly it? (never done; M4E not explicitly listed for WaypointV3 in DJI docs)
 2. Does a **fresh Smart3D scan** land a readable mesh on `/blackbox` and get consumed by the on-Manifold augment? (live data, not canned Mijande)
