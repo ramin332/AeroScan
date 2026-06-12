@@ -71,3 +71,33 @@ from per-waypoint aiming.
 `flown-kmz/20260612T122123Z_441.augmented.lean.kmz` → `wpmz/waylines.wpml` has the
 exact per-waypoint heading + gimbal pitch/yaw. Parse consecutive deltas to quantify
 both issues precisely. (This is the file the FC actually executed.)
+
+Measured on the flown KMZ: **581 waypoints**, global `waypointHeadingMode=followWayline`,
+**0 explicit per-waypoint headings** (so the FC derives heading from the path → the
+zig-zag jitter), **581 gimbalRotate + 581 photo actions** (1743 total).
+
+## Fix — status + plan
+
+**Landed 2026-06-12 (safe, behavior-neutral, tested):** `gimbal_dedup_threshold_deg`
+2°→5° (`models.py`). Drops the small per-waypoint gimbal re-aims (the gimbal holds
+its pose between actions) → fewer slews → lower HMS-overload risk. No path/heading
+change. UI-tunable. *Partial* fix — it can't remove the yaw variation that drives
+most of the slews.
+
+**Needs implementation + FLIGHT VALIDATION (the real fix — both issues at once):**
+make the **aircraft face the facade** so heading is stable per pass and gimbal yaw
+is ~constant (gimbal only pitches):
+1. `gimbal_rewrite.rewrite_gimbals_perpendicular(... preserve_heading=False)` at the
+   two call sites (`cli.py:317`, `server/api.py:2983`) → sets `heading_deg` to the
+   facade bearing; gimbal absolute yaw == heading ⇒ relative gimbal yaw ≈ 0.
+2. `kmz_builder`: emit per-waypoint `waypointHeadingAngle` (from `wp.heading_deg`) and
+   set global `waypointHeadingMode = smoothTransition` (djikmz currently emits
+   `followWayline` and NO per-wp heading — both must change together, else the FC has
+   nothing to interpolate). Verify the KMZ still loads (don't reintroduce `error_code 4`).
+3. Result: heading changes only *between* facades (smooth) not per-waypoint (no jitter);
+   gimbal yaw constant per pass so the 5° dedup collapses the gimbalRotates to a handful.
+
+**Why not landed blind:** it changes how the airframe orients during autonomous flight
+and edits the WPML heading schema — must be bench-checked (KMZ loads, angles sane) then
+flown low/cautious/abort-ready before trusting. Gate behind a `MissionConfig` flag so it
+can be A/B'd against the known-good `followWayline` output.

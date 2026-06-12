@@ -460,7 +460,13 @@ class MissionConfig:
     # action when the delta from the last-emitted pose is below the threshold.
     # The gimbal holds its last-commanded pose between actions, so dedup is
     # behavior-neutral (the camera still aims correctly at each photo WP).
-    gimbal_dedup_threshold_deg: float = 2.0
+    # Raised 2->5° after the 2026-06-12 flight: the augment fired ~581
+    # gimbalRotate actions (~3.9/s sustained) and tripped the M4E HMS "gimbal
+    # motor overload". A 5° dedup drops the small per-waypoint re-aims (gimbal
+    # holds its pose between actions, so aim stays within tolerance) and cuts
+    # the slew rate. Tunable from the UI; the deeper fix (face-facade heading so
+    # gimbal yaw is ~constant) is tracked in docs/flights/.../ANALYSIS.md.
+    gimbal_dedup_threshold_deg: float = 5.0
     heading_dedup_threshold_deg: float = 5.0
 
     # DJI Pilot 2 safety defaults (pre-populate the operator's UI)
