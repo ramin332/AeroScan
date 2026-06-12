@@ -1,0 +1,90 @@
+{
+  "schema_version": 1,
+  "name": "testbus2-12-6",
+  "flight_id": "flight0065",
+  "output_kmz": "/open_app/dev/data/received/20260612T122123Z_441.augmented.kmz",
+  "output_kmz_lean": "/open_app/dev/data/received/20260612T122123Z_441.augmented.lean.kmz",
+  "output_bytes": 2793613,
+  "output_bytes_lean": 128770,
+  "waypoints_total": 581,
+  "waypoints_aimed": 581,
+  "facades": 481,
+  "gimbal_stats": {
+    "waypoint_count": 581,
+    "waypoints_aimed_at_facade": 581,
+    "waypoints_unmatched": 0,
+    "pitch_deg": {
+      "min": -88.0,
+      "max": 6.847952952043764,
+      "median": -53.655440982150765,
+      "p25": -70.10304458952658,
+      "p75": -28.862547374418153
+    },
+    "yaw_unique_deg": 524,
+    "anomaly_thresholds": {
+      "pitch_up_deg": 25.0,
+      "pitch_down_deg": -85.0
+    },
+    "anomaly_counts": {
+      "pitch_up": 0,
+      "pitch_down": 13
+    },
+    "anomaly_indices": {
+      "pitch_up": [],
+      "pitch_down": [
+        92,
+        140,
+        166,
+        173,
+        175,
+        249,
+        275,
+        280,
+        298,
+        377,
+        383,
+        418,
+        492
+      ]
+    }
+  },
+  "icp": {
+    "coarse_yaw_deg": 90.0,
+    "icp_rmse_m": 0.13489145894194457,
+    "icp_fitness": 0.09050282119139162,
+    "total_yaw_deg": 90.79895690582012,
+    "total_translation_m": [
+      0.009932020190610456,
+      0.029768273837599418,
+      0.004015474782046266
+    ]
+  },
+  "icp_per_scale": [
+    {
+      "voxel_m": 0.5,
+      "fitness": 1.0,
+      "rmse_m": 0.5307023549412188
+    },
+    {
+      "voxel_m": 0.2,
+      "fitness": 0.9995748195027023,
+      "rmse_m": 0.5123741899996249
+    },
+    {
+      "voxel_m": 0.1,
+      "fitness": 0.9816649104320337,
+      "rmse_m": 0.48329230532678275
+    },
+    {
+      "voxel_m": 0.05,
+      "fitness": 0.6135244066278549,
+      "rmse_m": 0.35296427166198807
+    },
+    {
+      "voxel_m": 0.02,
+      "fitness": 0.09050282119139162,
+      "rmse_m": 0.13489145894194457
+    }
+  ],
+  "elapsed_s": 26.439550816000065
+}

@@ -18,3 +18,8 @@ Payload-SDK-Tutorial/
 # macOS + transient field-debug artifacts (pulled logs/KMZs may contain SDK keys)
 .DS_Store
 flight-debug/
+
+# Raw /blackbox flight dumps must NEVER be committed (large; psdk logs carry SDK
+# keys). Under docs/flights/ keep only the curated .md reports + lean KMZ.
+docs/flights/**/flight[0-9]*/
+docs/flights/**/*.augmented.kmz
