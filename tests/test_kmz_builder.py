@@ -279,6 +279,38 @@ class TestWPMLSpecCompliance:
         root = ET.fromstring(xml)
         assert root.tag.endswith("kml")
 
+    def test_mission_polygon_only_in_template_not_waylines(self):
+        """The mission-area polygon Placemark (cloudFilePath + multi-coord Point,
+        no <wpml:index>) must live in template.kml for dev's parse_kmz round-trip,
+        but must NOT appear in waylines.wpml — it is not a flyable waypoint and
+        the FC's WaypointV3 validity check parses the executable wayline on the
+        PSDK UploadKmzFile/START path. Regression for field-test no-fly (06-12).
+        """
+        poly = [
+            (5.80, 53.20, 40.0),
+            (5.81, 53.20, 40.0),
+            (5.81, 53.21, 40.0),
+            (5.80, 53.21, 40.0),
+        ]
+        data = build_kmz_bytes(
+            _make_test_waypoints(), MissionConfig(), mission_area_wgs84=poly
+        )
+        with zipfile.ZipFile(io.BytesIO(data)) as zf:
+            template_xml = zf.read("wpmz/template.kml").decode("utf-8")
+            waylines_xml = zf.read("wpmz/waylines.wpml").decode("utf-8")
+
+        # template.kml keeps the polygon (dev round-trip depends on it)
+        assert "cloudFilePath" in template_xml
+
+        # waylines.wpml must be free of the non-waypoint Placemark
+        assert "cloudFilePath" not in waylines_xml
+        wl_root = ET.fromstring(waylines_xml)
+        for pm in wl_root.iter(f"{{{_KML_NS}}}Placemark"):
+            assert pm.find(f"{{{_WPML_NS}}}index") is not None, (
+                "waylines.wpml has a Placemark with no <wpml:index> — "
+                "FC validity check may reject the mission"
+            )
+
 
 class TestGimbalYaw:
     """Verify gimbal yaw is correctly handled in KMZ output."""

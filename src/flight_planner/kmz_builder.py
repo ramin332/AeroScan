@@ -47,16 +47,17 @@ from .models import (
 )
 
 # ---------------------------------------------------------------------------
-# M4E drone / payload enum values — PROVISIONAL until confirmed against a
-# DJI-exported M4E mission. To discover the real values: create a mission in
-# DJI Pilot 2 with an M4E connected, export the KMZ, then run:
-#   python -m flight_planner.tools.inspect_kmz <exported.kmz> --patch
-# That tool prints the discovered values and rewrites these constants.
+# M4E drone / payload enum values — CONFIRMED 2026-06-12 against 7 real M4E
+# Smart3D KMZ exports (Mijande, MijandeExtra, NewSmart3DExploreTask2,
+# Slochteren, Woonhuis, Mijande_manifold): all carry droneEnumValue=99,
+# droneSubEnumValue=0, payloadEnumValue=88. The old PROVISIONAL 77/66 (copied
+# from M3E) made the M4E FC reject WaypointV3 uploads with error_code 4
+# "Load waypoint v3 wpmz file error" — the file declared the wrong aircraft.
 # ---------------------------------------------------------------------------
-M4E_DRONE_ENUM = 77       # PROVISIONAL — same as M3E
-M4E_DRONE_SUB_ENUM = 0    # PROVISIONAL
-M4E_PAYLOAD_ENUM = 66     # PROVISIONAL — same as M3E payload
-M4E_PAYLOAD_SUB_ENUM = 0  # PROVISIONAL
+M4E_DRONE_ENUM = 99       # confirmed from M4E Smart3D exports
+M4E_DRONE_SUB_ENUM = 0    # confirmed
+M4E_PAYLOAD_ENUM = 88     # confirmed from M4E Smart3D exports
+M4E_PAYLOAD_SUB_ENUM = 0  # confirmed
 
 # Register Matrice 4E in djikmz (library only ships M3E/M3D/M30/M300/M350).
 # djikmz's emitted enum values get overwritten in post-processing by
@@ -457,6 +458,16 @@ def _generate_waylines_wpml(
         # startActionGroup — prime gimbal + camera focus before first waypoint
         if folder.find(f"{{{_WPML_NS}}}startActionGroup") is None:
             folder.append(_build_start_action_group(initial_pitch))
+
+        # Drop the mission-area polygon Placemark. It belongs in template.kml
+        # only — dev's parse_kmz reads it there for facade/waypoint clipping.
+        # In waylines.wpml it is a non-waypoint Placemark with no <wpml:index>
+        # and a multi-coordinate <Point>, which the flight controller's
+        # WaypointV3 validity check parses on the PSDK UploadKmzFile/START path.
+        # Keep the executable wayline spec-clean: indexed waypoint Placemarks only.
+        for placemark in list(folder.findall(f"{{{_KML_NS}}}Placemark")):
+            if placemark.find(f"{{{_WPML_NS}}}cloudFilePath") is not None:
+                folder.remove(placemark)
 
         # Process each waypoint Placemark (also in KML namespace)
         for placemark in folder.findall(f"{{{_KML_NS}}}Placemark"):
