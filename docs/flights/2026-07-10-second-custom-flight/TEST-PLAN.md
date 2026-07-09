@@ -77,12 +77,9 @@ Manifold — not this `aero-scan` repo):
   only, as designed) — confirmed 2026-07-09.
 - **Not yet tested:** real pause→resume mid-flight — can only be verified
   in the air, tomorrow.
-- **Not yet committed** — `aeroscan-psdk` git access needs SSH to the
-  Manifold, which went down at the end of tonight's session (worked earlier,
-  then started refusing auth for no clear reason, still down as of the last
-  retry). **Confirm SSH is back before flying and commit before or between
-  flights** — don't leave this live-code-only on the drone with no git
-  history. See the pre-flight checklist below.
+- **Committed + pushed** — `aeroscan-psdk` commit `02c1721` on `main`
+  (`d7cd77f..02c1721`). SSH had gone down mid-session, came back after
+  `scripts/fix_ssh_perms.sh` on the Manifold; both repos are clean.
 
 ## Pre-flight (tonight or at the depot, before the field)
 
@@ -112,16 +109,9 @@ Manifold — not this `aero-scan` repo):
 - [x] **Ground-tested 2026-07-09:** tapped the pause switch while idle
   (nothing flying) — correctly a no-op, no crash. This is the designed
   behavior (gated on the FC's actual mission state, not a bug).
-- [ ] **STILL OPEN — commit `aeroscan-psdk`.** SSH to the Manifold went down
-  at the end of 2026-07-09's session (was working earlier that same night)
-  and did not come back before the session ended. The pause/resume + icon
-  fix is built, installed, and ground-tested on the drone, but **has no git
-  history** — it only exists as live files on the Manifold. First thing
-  tomorrow: get SSH working (reboot the Manifold if needed, or connect over
-  the depot LAN instead of field wifi) and `cd /open_app/dev/aero-scan &&
-  git add -A && git commit`. Do not treat "it's running" as equivalent to
-  "it's saved" — a Manifold reboot or DPK reinstall gone wrong loses
-  uncommitted work.
+- [x] **`aeroscan-psdk` committed + pushed** (resolved 2026-07-09, same
+  night — SSH came back after `scripts/fix_ssh_perms.sh`). Commit `02c1721`
+  on `main`, `d7cd77f..02c1721`. Manifold repo `git status` clean.
 - [x] **rc-companion does NOT need rebuilding for tomorrow** (resolved
   2026-07-09, no longer an open question). Confirmed by reading
   `AugmentSession.kt`: it treats the augmented KMZ and summary JSON as
