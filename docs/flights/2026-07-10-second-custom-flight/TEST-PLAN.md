@@ -73,14 +73,16 @@ Manifold — not this `aero-scan` repo):
   (`psdk-demo` v01.00.00.00, installed 2026-07-09 19:30:41).
 - **Ground-tested:** both widgets confirmed rendering correctly in Pilot 2
   (play icon fixed, pause/resume switch present) with the aircraft powered.
-- **Not yet tested:** tapping pause while idle (should be a silent no-op —
-  gated to only fire during `MISSION` state) is queued as the next ground
-  check. Real pause→resume behavior can only be verified mid-flight.
+  Tapping pause while idle correctly does nothing (gated to `MISSION` state
+  only, as designed) — confirmed 2026-07-09.
+- **Not yet tested:** real pause→resume mid-flight — can only be verified
+  in the air, tomorrow.
 - **Not yet committed** — `aeroscan-psdk` git access needs SSH to the
-  Manifold, which was flaky at the end of tonight's session (worked earlier,
-  then started refusing auth for no clear reason). Confirm SSH is back before
-  the field, and commit from there or over the depot LAN — don't leave this
-  livecode-only on the drone with no git history.
+  Manifold, which went down at the end of tonight's session (worked earlier,
+  then started refusing auth for no clear reason, still down as of the last
+  retry). **Confirm SSH is back before flying and commit before or between
+  flights** — don't leave this live-code-only on the drone with no git
+  history. See the pre-flight checklist below.
 
 ## Pre-flight (tonight or at the depot, before the field)
 
@@ -107,10 +109,29 @@ Manifold — not this `aero-scan` repo):
   If either check fails, do not fly on unverified code — re-run `deploy_to_manifold.sh`.
 - [ ] Re-confirm the four blockers from 2026-06-12 (`TEST-FLIGHT-RUNBOOK.md`) are still true: M4E drone/payload enums (99/88), motors OFF before tapping Fly (let START auto-takeoff — `error_code 778` if armed), mission-area polygon stays out of `waylines.wpml`, Fly-widget state persists across a restart. None of today's changes touch these — should be unaffected, but the runbook says "these will bite again," so don't assume.
 - [ ] Charge batteries (≥2), RC, laptop. SD card in aircraft.
-- [ ] **Pause/resume widget:** confirm SSH to the Manifold is working again
-  (was flaky at the end of last night's session) and commit the
-  `aeroscan-psdk` changes. Ground-test the last unverified bit: tap the
-  pause switch while idle (nothing flying) — must be a no-op, not a crash.
+- [x] **Ground-tested 2026-07-09:** tapped the pause switch while idle
+  (nothing flying) — correctly a no-op, no crash. This is the designed
+  behavior (gated on the FC's actual mission state, not a bug).
+- [ ] **STILL OPEN — commit `aeroscan-psdk`.** SSH to the Manifold went down
+  at the end of 2026-07-09's session (was working earlier that same night)
+  and did not come back before the session ended. The pause/resume + icon
+  fix is built, installed, and ground-tested on the drone, but **has no git
+  history** — it only exists as live files on the Manifold. First thing
+  tomorrow: get SSH working (reboot the Manifold if needed, or connect over
+  the depot LAN instead of field wifi) and `cd /open_app/dev/aero-scan &&
+  git add -A && git commit`. Do not treat "it's running" as equivalent to
+  "it's saved" — a Manifold reboot or DPK reinstall gone wrong loses
+  uncommitted work.
+- [x] **rc-companion does NOT need rebuilding for tomorrow** (resolved
+  2026-07-09, no longer an open question). Confirmed by reading
+  `AugmentSession.kt`: it treats the augmented KMZ and summary JSON as
+  opaque bytes — it doesn't parse WPML internals, just displays whatever
+  the Python augment engine (already fixed, already deployed) puts in the
+  summary JSON, which tonight's fixes didn't change the schema of. The
+  currently-installed APK already proved the full AUGM→PRVW→EXEC flow on
+  2026-06-12. The known gap (no `a37fce1` fail-fast hard-block) just means
+  a no-mesh augment fails a step later than it could (`exit 1` at `[2/7]`
+  instead of an earlier UI block) — same outcome, not a correctness gap.
 - [ ] **The unresolved item from `FLIGHT-REVIEW.md`:** verify the RC Plus 2 writes a DJI flight-record `.txt` for a PSDK WaypointV3 flight (`Internal shared storage/DJI/com.dji.industry.pilot/FlightRecord/`). Still unverified after the last flight. 5-minute check, do it opportunistically — it's the only source of *measured* (not commanded) telemetry, and would let us confirm the fix worked from ground-truth data, not just the KMZ we uploaded.
 
 ## Field procedure
