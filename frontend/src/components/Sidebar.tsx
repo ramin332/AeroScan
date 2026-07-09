@@ -543,7 +543,7 @@ export function Sidebar() {
         <SliderField label="Heading dedup" value={mission.heading_dedup_threshold_deg}
           min={0} max={30} step={1}
           format={(v) => `${v}°`}
-          tooltip="Skip rotateYaw action when heading change is below this threshold."
+          tooltip="Legacy: only affects rotateYaw actions, which this app no longer emits (heading is set via an inline per-waypoint field instead). No effect on generated missions."
           onChange={(v) => setMission({ heading_dedup_threshold_deg: v })} onCommit={autoGen} />
       </Section>
 

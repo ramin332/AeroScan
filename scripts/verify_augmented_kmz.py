@@ -1,18 +1,22 @@
 #!/usr/bin/env python3
-"""Verify an augmented KMZ against the bundled point cloud.
+"""Analyze any WPML KMZ — pre-flight (staged/augmented) or post-flight (archived).
 
-For every waypoint, compute the gimbal look ray and check what (if
-anything) the camera is actually aimed at:
+One tool for the whole flight-analysis lifecycle:
 
-* hit / miss        — is there a cloud point within the camera frustum?
-* aim error         — angle between (look ray) and (vector from WP to
-                      nearest cloud point), so ~0° means dead-on.
-* nearest distance  — how far is the nearest hit point from the WP?
-* roll-up stats     — % aimed at building, % at empty sky/ground,
-                      pitch/yaw distribution, adjacent-WP smoothness.
+* Action counts   — raw actionActuatorFunc tally from waylines.wpml (what the
+                    FC actually executes; catches dedup regressions like the
+                    2026-06-12 gimbal-motor-overload bug).
+* Pose smoothness — pitch/yaw/heading deltas between adjacent waypoints,
+                    including aircraft-heading (nose) jitter specifically
+                    (the 2026-06-12 heading-jitter bug's metric).
+* Aim check       — if a cloud.ply is bundled, also verifies what the camera
+                    is actually pointed at (hit/miss, aim error, range).
+                    Archived flown-mission KMZs (``*.lean.kmz``) never bundle
+                    one — stripped for MOP radio transfer — so this section
+                    is skipped automatically and everything else still runs.
 
-Inputs come straight from the .with_cloud.kmz the dev viewer loads, so
-this checks what the user is actually seeing.
+See docs/flights/2026-06-12-first-custom-flight/ANALYSIS.md for the bugs this
+was built to catch.
 """
 from __future__ import annotations
 
@@ -145,8 +149,14 @@ def _parse_waypoints(zf: zipfile.ZipFile, ref_lat, ref_lon, ref_alt):
     raise SystemExit("No placemarks with coords in KMZ.")
 
 
-def _parse_ply_xyz(zf: zipfile.ZipFile) -> np.ndarray:
-    """Read the bundled cloud.ply, return Nx3 float32 ENU."""
+def _parse_ply_xyz(zf: zipfile.ZipFile, required: bool = True) -> np.ndarray | None:
+    """Read the bundled cloud.ply, return Nx3 float32 ENU.
+
+    Archived flown-mission KMZs (``*.lean.kmz``) never bundle a cloud — it's
+    stripped for MOP radio transfer. Pass ``required=False`` to get None back
+    instead of exiting, so pose/action stats (which don't need the cloud) can
+    still run on those files.
+    """
     for name in zf.namelist():
         if name.lower().endswith("cloud.ply"):
             data = zf.read(name)
@@ -195,7 +205,9 @@ def _parse_ply_xyz(zf: zipfile.ZipFile) -> np.ndarray:
                 else:
                     raise SystemExit(f"PLY xyz unexpected type {ptype}")
             return xyz
-    raise SystemExit("No cloud.ply in KMZ.")
+    if required:
+        raise SystemExit("No cloud.ply in KMZ.")
+    return None
 
 
 def _look_dir(yaw_deg: float, pitch_deg: float) -> np.ndarray:
@@ -218,10 +230,63 @@ def _angular_diff_deg(a: float, b: float) -> float:
     return d
 
 
+def _count_actions(zf: zipfile.ZipFile) -> dict[str, int]:
+    """Raw actionActuatorFunc counts from waylines.wpml — what the FC executes."""
+    for name in zf.namelist():
+        if name.lower().endswith("waylines.wpml"):
+            root = ET.fromstring(zf.read(name))
+            counts: dict[str, int] = {}
+            for el in root.iter(f"{WPML_NS}actionActuatorFunc"):
+                if el.text:
+                    counts[el.text] = counts.get(el.text, 0) + 1
+            return counts
+    return {}
+
+
+def _print_smoothness_and_heading(wps: list[dict]) -> None:
+    """Pitch/yaw distribution, adjacent-WP gimbal smoothness, and aircraft
+    heading (nose) smoothness. Needs only parsed waypoints — no cloud.
+    """
+    n = len(wps)
+    pitches = np.array([w["pitch"] for w in wps])
+    print(f"=== Pitch/yaw distribution ===")
+    print(f"  pitch:  min {pitches.min():.1f}°  median {np.median(pitches):.1f}°  max {pitches.max():.1f}°")
+    print(f"          extreme up   (>+25°):  {int((pitches > 25).sum())}")
+    print(f"          extreme down (<-85°):  {int((pitches < -85).sum())}")
+    print(f"          horizontal-ish (-30..+10°): {int(((pitches > -30) & (pitches < 10)).sum())}  ({100*((pitches > -30) & (pitches < 10)).sum()/n:.1f}%)")
+
+    print()
+    print(f"=== Adjacent-WP smoothness (lower = smoother gimbal track) ===")
+    pitch_jumps = np.abs(np.diff(pitches))
+    yaws = np.array([w["yaw"] for w in wps])
+    yaw_jumps = np.array([abs(_angular_diff_deg(yaws[i], yaws[i-1])) for i in range(1, n)])
+    print(f"  pitch Δ between adjacent WPs:  median {np.median(pitch_jumps):.1f}°  p90 {np.percentile(pitch_jumps, 90):.1f}°  max {pitch_jumps.max():.1f}°")
+    print(f"  yaw Δ between adjacent WPs:    median {np.median(yaw_jumps):.1f}°  p90 {np.percentile(yaw_jumps, 90):.1f}°  max {yaw_jumps.max():.1f}°")
+    print(f"  WPs with |Δyaw| > 30° from prev:  {int((yaw_jumps > 30).sum())}  ({100*(yaw_jumps > 30).sum()/(n-1):.1f}%)")
+
+    # Aircraft heading (nose) smoothness — separate from gimbal yaw above.
+    # This is the specific metric for the 2026-06-12 flight's heading-jitter
+    # bug: WaypointV3's default (followWayline) pointed the nose toward the
+    # next waypoint, so the boustrophedon sweep flipped aircraft yaw at
+    # nearly every WP (~1s cadence, mean swing 11°, 46% of WPs >5°). The fix
+    # (facade-heading, smoothTransition WPML mode) should collapse this to
+    # near-zero except at facade-pass transitions. See
+    # docs/flights/2026-06-12-first-custom-flight/ANALYSIS.md.
+    headings = np.array([w["heading"] for w in wps])
+    heading_jumps = np.array([abs(_angular_diff_deg(headings[i], headings[i-1])) for i in range(1, n)])
+    print()
+    print(f"=== Aircraft heading (nose) smoothness — the 2026-06-12 jitter metric ===")
+    print(f"  heading Δ between adjacent WPs:  mean {heading_jumps.mean():.1f}°  median {np.median(heading_jumps):.1f}°  p90 {np.percentile(heading_jumps, 90):.1f}°  max {heading_jumps.max():.1f}°")
+    print(f"  WPs with |Δheading| > 5° from prev:  {int((heading_jumps > 5).sum())}  ({100*(heading_jumps > 5).sum()/(n-1):.1f}%)")
+    print(f"  (2026-06-12 flight measured: mean 11.1°, 46% of WPs >5° — this run should be well below that,")
+    print(f"   with large jumps clustered at facade-pass transitions rather than spread across every WP)")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("kmz", type=Path,
-                    help="Augmented KMZ with bundled cloud.ply + sfm_geo_desc.json")
+                    help="Any WPML KMZ (staged, augmented, or archived flown mission). "
+                         "Cloud.ply is optional — aim-check is skipped without one.")
     ap.add_argument("--max-aim-deg", type=float, default=15.0,
                     help="Aim error threshold in degrees: WPs whose nearest "
                          "in-frustum cloud point is within this angle of the "
@@ -239,13 +304,26 @@ def main():
     with zipfile.ZipFile(args.kmz, "r") as zf:
         ref_lat, ref_lon, ref_alt = _parse_geo_desc(zf)
         wps = _parse_waypoints(zf, ref_lat, ref_lon, ref_alt)
-        cloud = _parse_ply_xyz(zf)
+        cloud = _parse_ply_xyz(zf, required=False)
+        action_counts = _count_actions(zf)
 
     print(f"KMZ:        {args.kmz}")
     print(f"Ref WGS84:  lat={ref_lat:.6f} lon={ref_lon:.6f} alt={ref_alt:.2f} m")
     print(f"Waypoints:  {len(wps):,}")
-    print(f"Cloud pts:  {len(cloud):,}")
+    print(f"Cloud pts:  {len(cloud):,}" if cloud is not None else "Cloud pts:  none bundled (archived flown-mission KMZs never carry one — skipping aim check)")
     print()
+
+    print(f"=== Action counts (raw XML — what the FC actually executes) ===")
+    for func, count in sorted(action_counts.items(), key=lambda kv: -kv[1]):
+        print(f"  {func:20s} {count}")
+    total_actions = sum(action_counts.values())
+    if n_wps := len(wps):
+        print(f"  total: {total_actions}  ({total_actions / n_wps:.2f} actions/waypoint)")
+    print()
+
+    if cloud is None:
+        _print_smoothness_and_heading(wps)
+        return
 
     cloud64 = cloud.astype(np.float64)
     cone_cos = math.cos(math.radians(args.frustum_deg))
@@ -292,24 +370,8 @@ def main():
         print(f"  aim error: median {np.median(aims):.1f}°  mean {aims.mean():.1f}°  p90 {np.percentile(aims, 90):.1f}°  max {aims.max():.1f}°")
         print(f"  range:     median {np.median(ranges):.1f} m  mean {ranges.mean():.1f} m  p90 {np.percentile(ranges, 90):.1f} m  max {ranges.max():.1f} m")
 
-    # Pitch/yaw distribution
-    pitches = np.array([w["pitch"] for w in wps])
     print()
-    print(f"=== Pitch/yaw distribution ===")
-    print(f"  pitch:  min {pitches.min():.1f}°  median {np.median(pitches):.1f}°  max {pitches.max():.1f}°")
-    print(f"          extreme up   (>+25°):  {int((pitches > 25).sum())}")
-    print(f"          extreme down (<-85°):  {int((pitches < -85).sum())}")
-    print(f"          horizontal-ish (-30..+10°): {int(((pitches > -30) & (pitches < 10)).sum())}  ({100*((pitches > -30) & (pitches < 10)).sum()/n:.1f}%)")
-
-    # Smoothness — adjacent-WP jumps
-    print()
-    print(f"=== Adjacent-WP smoothness (lower = smoother gimbal track) ===")
-    pitch_jumps = np.abs(np.diff(pitches))
-    yaws = np.array([w["yaw"] for w in wps])
-    yaw_jumps = np.array([abs(_angular_diff_deg(yaws[i], yaws[i-1])) for i in range(1, n)])
-    print(f"  pitch Δ between adjacent WPs:  median {np.median(pitch_jumps):.1f}°  p90 {np.percentile(pitch_jumps, 90):.1f}°  max {pitch_jumps.max():.1f}°")
-    print(f"  yaw Δ between adjacent WPs:    median {np.median(yaw_jumps):.1f}°  p90 {np.percentile(yaw_jumps, 90):.1f}°  max {yaw_jumps.max():.1f}°")
-    print(f"  WPs with |Δyaw| > 30° from prev:  {int((yaw_jumps > 30).sum())}  ({100*(yaw_jumps > 30).sum()/(n-1):.1f}%)")
+    _print_smoothness_and_heading(wps)
 
     # Worst aimed
     if hits and args.show_worst > 0:
