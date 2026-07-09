@@ -32,6 +32,24 @@ airframe orients itself during autonomous flight and has never flown. Fixes
 146 tests pass (`.venv/bin/python -m pytest tests/`), frontend typechecks
 clean (`npx tsc --noEmit`). No hardware validation yet — that's tomorrow.
 
+**Independent adversarial verification (2026-07-09, separate agent, not the
+one that wrote the fix) — verdict:**
+- **Gimbal overload: CONFIRMED FIXED.** Mechanism verified by executing old
+  vs. new code, not just reading diffs — the regression test genuinely
+  fails on old code. Residual: the actual thermal/duty-cycle trip point
+  inside the FC's HMS logic isn't knowable statically; "no overload
+  warning" is a real-flight observable, not a proof.
+- **Heading jitter: PARTIALLY FIXED.** The mechanism that caused the
+  original bug (WaypointV3's point-toward-next-waypoint default) is
+  genuinely eliminated. But the fix aims at a facade *centroid*, which
+  pans smoothly rather than holding flat — a real behavior change from
+  what ANALYSIS.md assumed ("stable heading per pass"), not itself a bug.
+  More importantly: two specific, proven-by-construction paths can still
+  reintroduce the *original* jitter (waypoints with no facade in range;
+  the facade picker flip-flopping between two facades). Neither is
+  checkable without the real point cloud — see Stage 4.5 below, which
+  exists specifically to catch this on tomorrow's actual mission.
+
 ## Also landed tonight: real pause/resume + fixed widget icons (separate repo)
 
 Unrelated to the jitter/overload bugs, but landed the same night — a pilot
@@ -114,15 +132,40 @@ before takeoff:
 .venv/bin/python scripts/verify_augmented_kmz.py <path-to-augmented.kmz>
 ```
 
-Check the new **"Aircraft heading (nose) smoothness"** section specifically
-(added tonight for this):
+Check the **"Aircraft heading (nose) smoothness"** section. **Correction
+from an independent adversarial review done tonight (2026-07-09) — the
+original guidance here was wrong, don't use it:** ">5% of WPs" alone does
+NOT distinguish real jitter from the fix's *intended* behavior. The fix
+aims each waypoint's nose at its facade's centroid, which legitimately pans
+smoothly across a pass (heading changes almost every WP, in one direction)
+— that racks up a similar ">5° swing" percentage to real jitter, proven by
+constructing a synthetic clean-pan case and running it through the tool.
 
-- **Expect:** mean heading swing well under 11°, and the WPs with >5° swing
-  should be a small, clustered minority (facade-pass transitions), not
-  spread across ~half the mission like 2026-06-12.
-- **If it still looks like 2026-06-12** (mean ~11°, ~46% of WPs >5°, spread
-  evenly): the deploy didn't land, or facades weren't detected (falls back to
-  unrewritten heading) — **do not fly**, go back to the deploy step.
+What to actually check:
+
+- **`bounce fraction`** (new stat) — the nose visiting a heading, moving
+  away, then returning close to where it just was. Validated: 0% on a clean
+  pan, 100% on the two known failure modes below. **Elevated (>30%) = real
+  back-and-forth, investigate before flying.**
+- **Two specific proven-possible failure modes** (found by construction,
+  not just theory) that would still show up as real jitter despite the fix:
+  1. **Waypoints with no facade in range** (`gimbal_rewrite_perpendicular`
+     leaves `facade_index == -1` untouched) keep their *original* imported
+     DJI heading — i.e. the old zig-zag, unfixed, for those specific WPs.
+  2. **The facade picker flip-flopping** between two different facades on
+     adjacent waypoints (near a corner, or where two facets are similarly
+     close) — each flip snaps the nose to a different centroid bearing.
+  Neither is checkable by inspecting `gimbal_rewrite.py` alone — they only
+  show up once you have the *actual* facades from tomorrow's real point
+  cloud. **This is exactly what Stage 4.5 exists to catch, on the real
+  mission, not a synthetic one.**
+- **Neither stat is a clean automatic pass/fail** on real data — the actual
+  2026-06-12 flown KMZ (confirmed jittery, HMS overload, pilot abort) only
+  scores ~14% bounce fraction, because its real character was a continuous
+  wander across many small facade facets, not a strict bounce. If either
+  number looks even moderately elevated, or ambiguous, **don't trust the
+  threshold — look at which specific waypoints are large deltas** (cross-
+  reference `facade_index` per WP) and judge by eye.
 
 Also glance at the existing gimbal-aim stats (`=== Aim ===`, `=== Adjacent-WP
 smoothness ===`) — unchanged logic, just confirms the gimbal itself still

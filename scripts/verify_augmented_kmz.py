@@ -268,18 +268,66 @@ def _print_smoothness_and_heading(wps: list[dict]) -> None:
     # This is the specific metric for the 2026-06-12 flight's heading-jitter
     # bug: WaypointV3's default (followWayline) pointed the nose toward the
     # next waypoint, so the boustrophedon sweep flipped aircraft yaw at
-    # nearly every WP (~1s cadence, mean swing 11°, 46% of WPs >5°). The fix
-    # (facade-heading, smoothTransition WPML mode) should collapse this to
-    # near-zero except at facade-pass transitions. See
-    # docs/flights/2026-06-12-first-custom-flight/ANALYSIS.md.
+    # nearly every WP. The fix (facade-heading, smoothTransition WPML mode)
+    # aims each WP's nose at its facade's centroid, which pans smoothly
+    # across a pass (heading changes every WP, same direction) rather than
+    # holding dead flat — so raw ">5° of WPs" is NOT a reliable jitter
+    # signal alone; a legitimate smooth pan racks up a similar stat.
+    #
+    # bounce_fraction below tries to isolate real back-and-forth (the
+    # aircraft nose visits a heading, moves away, then returns close to
+    # where it just was) from a one-directional pan. It's validated against
+    # constructed cases (2026-07-09): 0% on a clean synthetic pan, 100% on a
+    # facade-picker flip-flop / no-facade-WP zig-zag (the actual failure
+    # modes gimbal_rewrite.py can still produce — see ANALYSIS.md), and it
+    # correctly catches an exact-180° flip-every-WP case that a naive
+    # signed-delta-sign check misses (+180 and -180 are the same rotation,
+    # so sign alone is undefined at exactly 180°).
+    #
+    # It is NOT a clean classifier on real flight data, though: the actual
+    # 2026-06-12 flight (confirmed jittery, HMS overload, pilot abort)
+    # scores only ~14% by this metric, because the real character wasn't a
+    # strict bounce — it was a continuous high-frequency wander across many
+    # small CGAL-detected facade facets (heading keeps changing, but not by
+    # doubling back). Report both numbers; if either looks elevated, or if
+    # anything here is ambiguous, LOOK AT THE ACTUAL PER-WP SEQUENCE
+    # (--show-worst, or plot it) rather than trusting a single threshold.
     headings = np.array([w["heading"] for w in wps])
-    heading_jumps = np.array([abs(_angular_diff_deg(headings[i], headings[i-1])) for i in range(1, n)])
+    heading_jumps = np.abs(np.array([_angular_diff_deg(headings[i], headings[i-1]) for i in range(1, n)]))
+
+    def _ang_dist(a, b):
+        d = abs(a - b) % 360.0
+        return min(d, 360.0 - d)
+
+    bounce_thresh = 8.0
+    bounces = 0
+    bounce_candidates = 0
+    for i in range(1, n - 1):
+        d1 = _ang_dist(headings[i - 1], headings[i])
+        d2 = _ang_dist(headings[i], headings[i + 1])
+        if d1 < bounce_thresh or d2 < bounce_thresh:
+            continue
+        bounce_candidates += 1
+        d_skip = _ang_dist(headings[i - 1], headings[i + 1])
+        if d_skip < 0.5 * (d1 + d2):
+            bounces += 1
+    bounce_frac = (bounces / bounce_candidates) if bounce_candidates else 0.0
+
     print()
     print(f"=== Aircraft heading (nose) smoothness — the 2026-06-12 jitter metric ===")
     print(f"  heading Δ between adjacent WPs:  mean {heading_jumps.mean():.1f}°  median {np.median(heading_jumps):.1f}°  p90 {np.percentile(heading_jumps, 90):.1f}°  max {heading_jumps.max():.1f}°")
-    print(f"  WPs with |Δheading| > 5° from prev:  {int((heading_jumps > 5).sum())}  ({100*(heading_jumps > 5).sum()/(n-1):.1f}%)")
-    print(f"  (2026-06-12 flight measured: mean 11.1°, 46% of WPs >5° — this run should be well below that,")
-    print(f"   with large jumps clustered at facade-pass transitions rather than spread across every WP)")
+    print(f"  WPs with |Δheading| > 5° from prev:  {int((heading_jumps > 5).sum())}  ({100*(heading_jumps > 5).sum()/(n-1):.1f}%)  "
+          f"(NOT reliable alone — see comment; a legit smooth pan racks up a similar %)")
+    print(f"  bounce fraction (nose visits then returns to ~same heading): {bounce_frac*100:.1f}%  "
+          f"({bounces}/{bounce_candidates} candidates)")
+    print(f"  (2026-06-12 flown baseline: mean 11.1°/46% >5°, bounce_frac ~14% — a continuous wander, not a clean bounce.")
+    print(f"   0% bounce = clean synthetic pan. 100% = facade-picker flip-flop / no-facade zig-zag, the known failure mode.)")
+    if bounce_frac > 0.3:
+        print(f"  -> ELEVATED bounce fraction — real back-and-forth present. Check which WPs (facade_index == -1,")
+        print(f"     or facade_index alternating between neighbors) before flying.")
+    print(f"  Neither number is a clean pass/fail classifier on real data — eyeball the per-WP sequence")
+    print(f"  ({{'--show-worst'}} shows gimbal aim outliers; for heading specifically, plot heading_deg vs index)")
+    print(f"  if anything above looks off, don't just trust the thresholds.")
 
 
 def main():
