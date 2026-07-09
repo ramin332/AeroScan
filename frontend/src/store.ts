@@ -27,7 +27,7 @@ export const DEFAULT_MISSION: MissionParams = {
   min_photo_distance_m: 1.5,
   yaw_rate_deg_per_s: 60.0,
   stop_at_waypoint: false,
-  gimbal_dedup_threshold_deg: 2.0,
+  gimbal_dedup_threshold_deg: 5.0,
   heading_dedup_threshold_deg: 5.0,
 };
 
@@ -46,7 +46,7 @@ export const NEN2767_MISSION: MissionParams = {
   min_photo_distance_m: 4.0,
   yaw_rate_deg_per_s: 60.0,
   stop_at_waypoint: true,
-  gimbal_dedup_threshold_deg: 2.0,
+  gimbal_dedup_threshold_deg: 5.0,
   heading_dedup_threshold_deg: 5.0,
 };
 

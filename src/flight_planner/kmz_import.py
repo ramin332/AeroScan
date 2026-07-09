@@ -226,6 +226,22 @@ def _parse_waylines(xml_bytes: bytes) -> list[ParsedWaypoint]:
 
     smart_oblique_groups = _parse_smart_oblique_groups(root)
 
+    # Carry-forward state for heading/gimbal pose across placemarks. The real
+    # flight controller holds the last-commanded heading/gimbal pose between
+    # explicit actions — it does not reset to zero. Our augmented KMZs rely on
+    # gimbalRotate/rotateYaw dedup (kmz_builder._dedupe_pose_actions) to drop
+    # actions whose pose repeats the previous waypoint's, so most waypoints in
+    # a facade pass have NO explicit action at all. Without carry-forward here,
+    # those waypoints parsed to heading=0/gimbal_pitch=0/gimbal_yaw=0 in the
+    # viewer, which is what forced cli.py to disable dedup entirely
+    # (gimbal_dedup_threshold_deg=-1.0) — emitting an explicit action on every
+    # single waypoint and driving the M4E gimbal motor at ~4-20 events/s
+    # (HMS "gimbal motor overload", see docs/flights/2026-06-12-first-custom-flight/ANALYSIS.md).
+    last_heading = 0.0
+    last_gimbal_pitch = 0.0
+    last_gimbal_yaw_raw = 0.0
+    last_gimbal_yaw_base = default_yaw_base
+
     for placemark in root.iter(f"{KML_NS}Placemark"):
         coords_el = placemark.find(f"{KML_NS}Point/{KML_NS}coordinates")
         if coords_el is None or not coords_el.text:
@@ -268,8 +284,8 @@ def _parse_waylines(xml_bytes: bytes) -> list[ParsedWaypoint]:
         alt = _f("ellipsoidHeight", 0.0)
         if alt == 0.0:
             alt = _f("executeHeight", 0.0)
-        heading = 0.0
-        gimbal_pitch = 0.0
+        heading = last_heading
+        gimbal_pitch = last_gimbal_pitch
 
         hp = placemark.find(f"{WPML_NS}waypointHeadingParam")
         if hp is not None:
@@ -280,7 +296,7 @@ def _parse_waylines(xml_bytes: bytes) -> list[ParsedWaypoint]:
                 except ValueError:
                     pass
 
-        gimbal_yaw_raw = 0.0
+        gimbal_yaw_raw = last_gimbal_yaw_raw
         gimbal_heading_mode = "smoothTransition"
         gimbal_yaw_base_for_wp: str | None = None
         gp = placemark.find(f"{WPML_NS}waypointGimbalHeadingParam")
@@ -350,6 +366,7 @@ def _parse_waylines(xml_bytes: bytes) -> list[ParsedWaypoint]:
                 poses_for_wp = list(grp_poses)
                 break
 
+        resolved_yaw_base = gimbal_yaw_base_for_wp or last_gimbal_yaw_base
         waypoints.append(ParsedWaypoint(
             index=wp_index,
             lon=lon, lat=lat, alt_egm96=alt,
@@ -360,9 +377,16 @@ def _parse_waylines(xml_bytes: bytes) -> list[ParsedWaypoint]:
             gimbal_heading_mode=gimbal_heading_mode,
             # Per-WP yaw base from a gimbalRotate action overrides the mission
             # default. Augmented KMZs always set 'north' here (absolute yaw).
-            gimbal_yaw_base=gimbal_yaw_base_for_wp or default_yaw_base,
+            gimbal_yaw_base=resolved_yaw_base,
             smart_oblique_poses=poses_for_wp,
         ))
+
+        # Carry this waypoint's resolved pose forward — the next placemark
+        # inherits it unless its own inline params / actions override it.
+        last_heading = heading
+        last_gimbal_pitch = gimbal_pitch
+        last_gimbal_yaw_raw = gimbal_yaw_raw
+        last_gimbal_yaw_base = resolved_yaw_base
 
     return waypoints
 

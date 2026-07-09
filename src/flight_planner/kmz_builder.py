@@ -27,6 +27,7 @@ import xml.etree.ElementTree as ET
 import zipfile
 
 from djikmz import DroneTask
+from djikmz.model.heading_param import WaypointHeadingMode, WaypointHeadingParam
 from djikmz.model.mission_config import (
     DroneModel,
     FinishAction,
@@ -151,8 +152,22 @@ def _build_mission(
         # when useGlobalHeight=0. wp.alt is ref_alt + wp.z from ENU→WGS84 conversion.
         wb._waypoint.ellipsoid_height = wp.alt if wp.alt != 0.0 else height
 
+        # Per-waypoint explicit heading via WPML smoothTransition, not a
+        # rotateYaw action. WaypointV3's default (followWayline) points the
+        # nose toward the *next* waypoint — our boustrophedon facade sweep
+        # zig-zags, so that flips aircraft yaw at nearly every waypoint
+        # (measured ~1s cadence on the 2026-06-12 flight, the root cause of
+        # that flight's heading jitter, see
+        # docs/flights/2026-06-12-first-custom-flight/ANALYSIS.md).
+        # smoothTransition instead interpolates evenly to each waypoint's own
+        # commanded angle, so heading only changes where wp.heading_deg
+        # actually changes (facade-pass transitions), not at every waypoint.
         heading = _heading_to_djikmz(wp.heading_deg)
-        wb.heading(heading)
+        wb._waypoint.heading_param = WaypointHeadingParam(
+            waypoint_heading_mode=WaypointHeadingMode.SMOOTH_TRANSITION,
+            waypoint_heading_angle=heading,
+        )
+        wb._waypoint.use_global_heading_param = 0
 
         if wp.is_transition:
             # Transit: fly through without stopping, no gimbal/photo
@@ -225,13 +240,20 @@ def _signed_angle_delta(a: float, b: float) -> float:
 
 
 def _dedupe_pose_actions(root: ET.Element, config: MissionConfig) -> None:
-    """Strip redundant gimbalRotate + rotateYaw actions whose pose matches the last emitted one within threshold.
+    """Strip redundant gimbalRotate actions whose pose matches the last emitted one within threshold.
 
     Facade sweeps hold gimbal pitch/yaw constant along every row — re-emitting
     a fresh gimbalRotate at every waypoint balloons the XML without changing
-    behaviour. Same for aircraft heading on long parallel passes. Removing the
-    redundant actions cuts action-element count by ~40-60% on typical missions
-    and sidesteps the Pilot 2 renderer stall seen at high WP counts.
+    behaviour, and drives the M4E gimbal motor at a needlessly high duty cycle
+    (see docs/flights/2026-06-12-first-custom-flight/ANALYSIS.md). Removing
+    the redundant actions cuts action-element count and sidesteps the Pilot 2
+    renderer stall seen at high WP counts.
+
+    Aircraft heading is no longer set via a rotateYaw action (see
+    _build_mission's use of WaypointHeadingParam/SMOOTH_TRANSITION instead),
+    so the rotateYaw branch below is inert for anything this module builds —
+    kept only in case a caller feeds in an externally-built KML that still
+    uses the old action-based heading.
     """
     gimbal_thr = config.gimbal_dedup_threshold_deg
     heading_thr = config.heading_dedup_threshold_deg
@@ -568,6 +590,15 @@ def _build_kmz_zip(
     """
     mission = _build_mission(waypoints, config, algo)
     kml = mission.build()
+    # Every waypoint sets its own heading_param (SMOOTH_TRANSITION, see
+    # _build_mission), so this global default is never actually used to aim
+    # the aircraft — it only exists because WaypointHeadingParam requires an
+    # angle whenever mode=SMOOTH_TRANSITION. Match the mission-level mode so
+    # a WPML reader doesn't see a mismatched global/per-waypoint mode.
+    kml.global_waypoint_heading_param = WaypointHeadingParam(
+        waypoint_heading_mode=WaypointHeadingMode.SMOOTH_TRANSITION,
+        waypoint_heading_angle=_heading_to_djikmz(waypoints[0].heading_deg) if waypoints else 0.0,
+    )
     template_xml_str = _rewrite_wpml_version(kml.to_xml())
 
     # Register namespaces so ET doesn't mangle prefixes

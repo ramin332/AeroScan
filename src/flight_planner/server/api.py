@@ -787,7 +787,7 @@ class MissionParams(BaseModel):
     # XML-slimming knobs: skip gimbalRotate / rotateYaw actions whose pose is
     # within threshold of the previously emitted one. Cuts XML ~50% on dense
     # facade sweeps where pose is constant within a row.
-    gimbal_dedup_threshold_deg: float = Field(2.0, ge=0.0, le=45.0)
+    gimbal_dedup_threshold_deg: float = Field(5.0, ge=0.0, le=45.0)
     heading_dedup_threshold_deg: float = Field(5.0, ge=0.0, le=45.0)
     # DJI Pilot 2 safety defaults (operator can adjust before flying)
     rc_lost_action: str = "go_home"

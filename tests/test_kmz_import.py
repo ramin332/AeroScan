@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from flight_planner.kmz_import import (
+    _parse_waylines,
     parse_kmz,
     polygon_to_enu,
     resolve_capture_intrinsics,
@@ -99,3 +100,58 @@ def test_resolve_capture_intrinsics_auto_explore(sample_kmz):
     assert intr["fov_h_deg"] > 0.0
     assert intr["fov_v_deg"] > 0.0
     assert intr["focal_length_mm"] > 0.0
+
+
+def test_parse_waylines_carries_pose_forward_across_deduped_waypoints():
+    """Regression test for the 2026-06-12 flight's HMS "gimbal motor overload".
+
+    kmz_builder._dedupe_pose_actions drops gimbalRotate/rotateYaw actions
+    whose pose repeats the previous waypoint's (within gimbal/heading dedup
+    threshold) — that's the whole point of dedup. If the parser resets
+    heading/gimbal pose to 0 on any waypoint with no explicit action instead
+    of carrying the last-commanded pose forward, every deduped waypoint looks
+    like it's pointing north/forward in the viewer. That bug is what forced
+    cli.py to disable dedup entirely (gimbal_dedup_threshold_deg=-1.0),
+    emitting an explicit action on every single waypoint and driving the M4E
+    gimbal motor at ~4-20 events/sec in flight.
+
+    This builds a real KMZ with default (non-disabled) dedup thresholds,
+    where 3 consecutive waypoints share the same pose so the middle ones get
+    deduped, then parses it back and asserts the deduped waypoints resolve to
+    the carried-forward pose, not 0.
+    """
+    from flight_planner.kmz_builder import build_kmz_bytes
+    from flight_planner.models import ActionType, CameraAction, CameraName, MissionConfig, Waypoint
+    import io
+    import zipfile
+
+    pitch, yaw, heading = -30.0, 90.0, 90.0
+    waypoints = [
+        Waypoint(
+            x=float(i * 3), y=0.0, z=10.0,
+            lat=53.2 + i * 0.0001, lon=5.8 + i * 0.0001, alt=10.0,
+            heading_deg=heading,
+            gimbal_pitch_deg=pitch,
+            gimbal_yaw_deg=yaw,
+            speed_ms=3.0,
+            actions=[CameraAction(action_type=ActionType.TAKE_PHOTO, camera=CameraName.WIDE)],
+            facade_index=0,
+            index=i,
+        )
+        for i in range(4)
+    ]
+
+    # Default MissionConfig — dedup thresholds are 5.0/5.0, NOT disabled.
+    data = build_kmz_bytes(waypoints, MissionConfig())
+    with zipfile.ZipFile(io.BytesIO(data)) as zf:
+        waylines_xml = zf.read("wpmz/waylines.wpml")
+
+    parsed = _parse_waylines(waylines_xml)
+    assert len(parsed) == 4
+
+    # Middle waypoints had their gimbalRotate/rotateYaw actions deduped away
+    # (identical pose to the previous WP) — they must still resolve to the
+    # real commanded pose via carry-forward, not fall back to 0.
+    for wp in parsed:
+        assert wp.gimbal_pitch_deg == pytest.approx(pitch, abs=0.1)
+        assert wp.heading_deg == pytest.approx(heading, abs=0.1)

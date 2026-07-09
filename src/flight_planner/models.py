@@ -464,9 +464,23 @@ class MissionConfig:
     # gimbalRotate actions (~3.9/s sustained) and tripped the M4E HMS "gimbal
     # motor overload". A 5° dedup drops the small per-waypoint re-aims (gimbal
     # holds its pose between actions, so aim stays within tolerance) and cuts
-    # the slew rate. Tunable from the UI; the deeper fix (face-facade heading so
-    # gimbal yaw is ~constant) is tracked in docs/flights/.../ANALYSIS.md.
+    # the slew rate. Tunable from the UI. NOTE: this bump alone did not fix
+    # the 2026-06-12 flight — cli.py separately forced both thresholds to
+    # -1.0 (disabling dedup entirely) to work around a kmz_import.py parser
+    # bug that reset gimbal pose to 0 on any deduped WP. Both are now fixed
+    # (parser carries pose forward; cli.py uses these defaults again) — see
+    # docs/flights/2026-06-12-first-custom-flight/ANALYSIS.md. The aircraft
+    # now also faces the facade it's shooting (see kmz_builder.py /
+    # gimbal_rewrite.py), so gimbal yaw is ~constant within a pass and this
+    # dedup mostly only has to collapse actions at facade-pass transitions.
     gimbal_dedup_threshold_deg: float = 5.0
+    # Aircraft heading is now set via WPML waypointHeadingParam/
+    # SMOOTH_TRANSITION (an inline per-waypoint field), not a rotateYaw
+    # action — kmz_builder no longer emits rotateYaw at all, so this
+    # threshold has no effect on anything this codebase builds. Kept for the
+    # (currently unused) rotateYaw-dedup code path in
+    # kmz_builder._dedupe_pose_actions, in case a caller ever feeds in a
+    # KML built with the old action-based heading mechanism.
     heading_dedup_threshold_deg: float = 5.0
 
     # DJI Pilot 2 safety defaults (pre-populate the operator's UI)

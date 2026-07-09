@@ -308,13 +308,19 @@ def augment_mission(
             "filter dropped everything, or facade-detection thresholds are too tight."
         )
 
-    _log("[6/7] Rewriting gimbals perpendicular to nearest facade…")
+    _log("[6/7] Rewriting gimbals perpendicular to nearest facade (aircraft faces the facade)…")
     new_waypoints = rewrite_gimbals_perpendicular(
         waypoints=waypoints,
         facades=facades,
         max_distance_m=max_facade_distance_m,
         pitch_margin_deg=pitch_margin_deg,
-        preserve_heading=True,
+        # False: face the aircraft nose at the facade (heading_deg = facade
+        # bearing) instead of DJI WaypointV3's default "point toward next
+        # waypoint". Our boustrophedon sweep zig-zags, so the default flipped
+        # aircraft yaw at nearly every waypoint (~1s cadence measured on the
+        # 2026-06-12 flight) — the root cause of that flight's heading
+        # jitter. See docs/flights/2026-06-12-first-custom-flight/ANALYSIS.md.
+        preserve_heading=False,
     )
     # NEN-2767: stop-and-shoot at fixed speed, single TAKE_PHOTO per WP.
     # Matches server.api /versions/{id}/rewrite-gimbals exactly.
@@ -329,19 +335,17 @@ def augment_mission(
     config = MissionConfig(
         flight_speed_ms=inspection_speed_ms,
         mission_name=f"NEN-2767: {intent.name}",
-        # Disable per-WP gimbal-action dedup. The default MissionConfig drops
-        # any gimbalRotate whose pose is within 2° of the previous WP's, which
-        # for inspection missions strips the gimbal action from most adjacent
-        # WPs aiming at the same wall section. The dev viewer's parser then
-        # sees no gimbalRotate for those WPs, falls back to the mission-level
-        # default (yaw_base="aircraft", raw_yaw=0), and renders the gimbal
-        # arrow pointing along the aircraft heading — which is the "gimbal
-        # follows flight direction" artifact users see in the viewer. Setting
-        # the threshold to a negative value forces every WP to emit its own
-        # explicit gimbalRotate with the absolute pose. ~10-30% larger XML;
-        # unambiguous parser/render.
-        gimbal_dedup_threshold_deg=-1.0,
-        heading_dedup_threshold_deg=-1.0,
+        # Use the default dedup thresholds (5°/5°, see MissionConfig
+        # docstring). This USED to be forced to -1.0 (disabled — emit an
+        # explicit gimbalRotate/rotateYaw on every single WP) to work around
+        # a dev-viewer parser bug: kmz_import._parse_waylines reset gimbal
+        # pose to 0 on any WP with no explicit action instead of carrying the
+        # last-commanded pose forward. That workaround is what drove the
+        # measured ~4-20 gimbal actions/sec HMS "gimbal motor overload" on
+        # the 2026-06-12 flight (581 WPs, 581 explicit gimbalRotate + 581
+        # rotateYaw actions — one of each per WP, dedup had zero effect).
+        # The parser now carries pose forward correctly, so normal dedup is
+        # safe again. See docs/flights/2026-06-12-first-custom-flight/ANALYSIS.md.
     )
     output_kmz = Path(output_kmz)
     output_kmz.parent.mkdir(parents=True, exist_ok=True)

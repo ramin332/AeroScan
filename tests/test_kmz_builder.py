@@ -458,17 +458,37 @@ def _count_actions(xml: str, func_name: str) -> int:
     return n
 
 
+def _heading_angles(xml: str) -> list[float]:
+    """Per-waypoint waypointHeadingAngle values, in Placemark order."""
+    root = ET.fromstring(xml)
+    angles = []
+    for placemark in root.iter(f"{{{_KML_NS}}}Placemark"):
+        hp = placemark.find(f"{{{_WPML_NS}}}waypointHeadingParam")
+        if hp is None:
+            continue
+        angle_el = hp.find(f"{{{_WPML_NS}}}waypointHeadingAngle")
+        if angle_el is not None and angle_el.text is not None:
+            angles.append(float(angle_el.text))
+    return angles
+
+
 class TestPoseDedup:
     """Redundant gimbalRotate / rotateYaw actions are elided on dense sweeps."""
 
     def test_identical_pose_across_waypoints_emits_one_gimbalRotate(self):
-        """5 WPs with identical pose → 1 gimbalRotate in template.kml (the first)."""
+        """5 WPs with identical pose → 1 gimbalRotate in template.kml (the first).
+
+        Heading is no longer an action (rotateYaw) subject to dedup — it's an
+        inline per-waypoint waypointHeadingParam field (SMOOTH_TRANSITION), so
+        every waypoint carries one regardless of whether the angle repeats.
+        """
         wps = _make_test_waypoints(5)  # all pitch=0, heading=180
         data = build_kmz_bytes(wps, MissionConfig())
         with zipfile.ZipFile(io.BytesIO(data)) as zf:
             tpl = zf.read("wpmz/template.kml").decode("utf-8")
         assert _count_actions(tpl, "gimbalRotate") == 1
-        assert _count_actions(tpl, "rotateYaw") == 1
+        assert _count_actions(tpl, "rotateYaw") == 0
+        assert _heading_angles(tpl) == [180.0] * 5
 
     def test_per_wp_takePhoto_preserved_in_default_mode(self):
         """Dedup doesn't touch takePhoto — still one per WP in default capture mode."""
@@ -498,16 +518,31 @@ class TestPoseDedup:
             tpl = zf.read("wpmz/template.kml").decode("utf-8")
         assert _count_actions(tpl, "gimbalRotate") == 1
 
-    def test_heading_dedup_respects_threshold(self):
-        """rotateYaw dedup uses heading_dedup_threshold_deg."""
+    def test_heading_uses_smooth_transition_per_waypoint(self):
+        """Aircraft heading is set via WPML waypointHeadingParam/SMOOTH_TRANSITION
+        (interpolated per-waypoint), not a rotateYaw action — so it's immune
+        to gimbal_dedup/heading_dedup and to WaypointV3's default
+        "point toward next waypoint" behaviour that caused the 2026-06-12
+        flight's heading jitter (see
+        docs/flights/2026-06-12-first-custom-flight/ANALYSIS.md).
+        """
         wps = _make_test_waypoints(5)
-        wps[2].heading_deg = 200.0  # 20° jump from default 180° — above 5° threshold
+        wps[2].heading_deg = 200.0
         data = build_kmz_bytes(wps, MissionConfig())
         with zipfile.ZipFile(io.BytesIO(data)) as zf:
             tpl = zf.read("wpmz/template.kml").decode("utf-8")
-        # WP0 emits (180), WP1 dedup, WP2 jumps to 200 emit, WP3 back to 180 emit,
-        # WP4 dedup → 3 total.
-        assert _count_actions(tpl, "rotateYaw") == 3
+            wpml = zf.read("wpmz/waylines.wpml").decode("utf-8")
+        assert _count_actions(tpl, "rotateYaw") == 0
+        assert _heading_angles(tpl) == [180.0, 180.0, -160.0, 180.0, 180.0]
+
+        root = ET.fromstring(tpl)
+        for folder in root.iter(f"{{{_KML_NS}}}Folder"):
+            mode_el = folder.find(f"{{{_WPML_NS}}}globalWaypointHeadingParam/{{{_WPML_NS}}}waypointHeadingMode")
+            assert mode_el is not None and mode_el.text == "smoothTransition"
+
+        for placemark in ET.fromstring(wpml).iter(f"{{{_KML_NS}}}Placemark"):
+            use_global = placemark.find(f"{{{_WPML_NS}}}useGlobalHeadingParam")
+            assert use_global is None  # waylines.wpml strips useGlobal* flags
 
     def test_threshold_is_configurable(self):
         """Raising the threshold elides even large jumps."""
