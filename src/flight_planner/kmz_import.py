@@ -892,6 +892,82 @@ def estimate_facade_detection_defaults(
     }
 
 
+def fit_ground_plane(
+    points_xyz: np.ndarray,
+    *,
+    quantile: float = 0.5,
+    low_quantile: float = 0.05,
+    iterations: int = 6,
+) -> np.ndarray:
+    """Fit ``z = ax + by + c`` to the ground by iteratively trimmed least squares.
+
+    Each pass refits on the points whose residual lies between ``low_quantile``
+    and ``quantile``, so structure standing on the ground and sub-surface noise
+    are both excluded and the plane settles onto the terrain. Returns ``[a, b, c]``.
+
+    ``quantile=0.5`` (not 0.8) matters: at 0.8 the fit still sees enough of a
+    building's mass to float upward. Measured on Mijande, q=0.8 kept only 56% of
+    the cloud above a 0.35 m clearance where the old height cut kept 80% — it was
+    eating the building.
+    """
+    pts = np.asarray(points_xyz, dtype=np.float64).reshape(-1, 3)
+    design = np.c_[pts[:, :2], np.ones(len(pts))]
+    z = pts[:, 2]
+    keep = np.ones(len(pts), dtype=bool)
+    coeffs = np.zeros(3)
+    for _ in range(iterations):
+        coeffs, *_ = np.linalg.lstsq(design[keep], z[keep], rcond=None)
+        residual = z - design @ coeffs
+        # Trim BOTH tails. The upper tail is the structure standing on the ground;
+        # the lower tail is sub-surface reconstruction noise (the 2026-07-10 cloud
+        # has points 3.5 m below grade). Trimming only the top drags the plane
+        # down into that noise -- measured: the van scene tilted to 7.6 deg and
+        # the plane sank 1.2 m.
+        lo = np.quantile(residual, low_quantile)
+        hi = np.quantile(residual, quantile)
+        keep = (residual >= lo) & (residual < hi)
+        if int(keep.sum()) < 50:
+            break
+    return coeffs
+
+
+def height_above_ground(points_xyz: np.ndarray, ground_plane: np.ndarray) -> np.ndarray:
+    """Signed height of each point above the fitted ground plane (negative = below)."""
+    pts = np.asarray(points_xyz, dtype=np.float64).reshape(-1, 3)
+    return pts[:, 2] - np.c_[pts[:, :2], np.ones(len(pts))] @ ground_plane
+
+
+def _reject_ground_facets(
+    facades: list[Facade],
+    ground_plane: np.ndarray,
+    facet_clearance_m: float,
+    roof_normal_z_min: float,
+) -> list[Facade]:
+    """Drop facets that are both near-horizontal and close to the ground plane.
+
+    DJI perception clouds carry ~0.5 m of vertical noise on the ground (measured:
+    Mijande 0.52 m, the 2026-07-10 parking lot 0.54 m, per 2x2 m cell). That noise
+    tail survives any point-level clearance small enough to preserve a short target,
+    and region growing happily fits rectangles to it.
+
+    Testing *orientation as well as height* is what makes this safe: a wall is
+    vertical, so it is never dropped no matter how low it sits, and neither is a
+    lamppost. Only horizontal-and-low facets go, which is what tarmac is.
+    """
+    if not facades:
+        return facades
+    kept: list[Facade] = []
+    for facade in facades:
+        verts = np.asarray(facade.vertices, dtype=np.float64)
+        centroid = verts.mean(axis=0)
+        height = float(height_above_ground(centroid[None, :], ground_plane)[0])
+        horizontal = abs(float(facade.normal[2])) >= roof_normal_z_min
+        if horizontal and height < facet_clearance_m:
+            continue
+        kept.append(facade)
+    return kept
+
+
 @timed("facades_from_pointcloud_cgal")
 def facades_from_pointcloud_cgal(
     points_enu: np.ndarray,
@@ -910,7 +986,8 @@ def facades_from_pointcloud_cgal(
     min_wall_area_m2: float = 0.5,
     min_roof_area_m2: float = 0.5,
     min_tilted_area_m2: float = 0.4,
-    ground_skip_m: float = 1.0,
+    ground_clearance_m: float = 0.4,
+    ground_facet_clearance_m: float = 1.5,
     jet_neighbors: int = 18,
     min_density_per_m2: float = 25.0,
     bbox_percentile: float = 5.0,
@@ -955,7 +1032,7 @@ def facades_from_pointcloud_cgal(
 
     Pipeline:
       1. Clip cloud to ``polygon_enu`` (XY).
-      2. Drop bottom ``ground_skip_m`` of Z range (street/terrain).
+      2. Drop points within ``ground_clearance_m`` of the fitted ground plane.
       3. Insert into ``CGAL::Point_set_3``, estimate normals with
          ``jet_estimate_normals``.
       4. Run region-growing (or efficient-RANSAC).
@@ -977,6 +1054,11 @@ def facades_from_pointcloud_cgal(
     if len(pts_all) < min_points * 2:
         return []
 
+    # Fit the ground BEFORE the polygon clip: the mission polygon is drawn tight
+    # around the target, so inside it the target can outvote the ground and drag
+    # the fit upward. The surrounding cloud is mostly ground and anchors it.
+    ground_plane = fit_ground_plane(pts_all)
+
     if polygon_enu is not None and len(polygon_enu) >= 3:
         poly = np.asarray(polygon_enu, dtype=float)
         if len(poly) > 1 and np.allclose(poly[0, :2], poly[-1, :2]):
@@ -988,7 +1070,7 @@ def facades_from_pointcloud_cgal(
 
     ground_z = float(np.percentile(pts_all[:, 2], 5.0))
     top_z = float(np.percentile(pts_all[:, 2], 98.0))
-    pts_all = pts_all[pts_all[:, 2] >= ground_z + ground_skip_m]
+    pts_all = pts_all[height_above_ground(pts_all, ground_plane) > ground_clearance_m]
     if len(pts_all) < min_points * 2:
         return []
 
@@ -1295,12 +1377,18 @@ def facades_from_pointcloud_cgal(
             index=len(facades),
         ))
 
+    before_gate = len(facades)
+    facades = _reject_ground_facets(
+        facades, ground_plane, ground_facet_clearance_m, roof_normal_z_min
+    )
+
     print(
         f"[cgal facades] {algo_name} detected {len(descriptions)} shapes → "
-        f"{len(regularized)} regularized → {len(facades)} facets "
+        f"{len(regularized)} regularized → {before_gate} facets "
         f"({wall_index} walls + {roof_index} roofs + {tilted_index} tilted; "
         f"{rejected_small} rejected) from {len(pts_all)} pts "
-        f"(ε={epsilon}, cluster_ε={cluster_epsilon}, k={rg_k_neighbors})"
+        f"(ε={epsilon}, cluster_ε={cluster_epsilon}, k={rg_k_neighbors}); "
+        f"ground gate dropped {before_gate - len(facades)} → {len(facades)} facets"
     )
     return facades
 
@@ -1380,7 +1468,7 @@ def facades_from_pointcloud_ransac(
     roof_distance_threshold: float = 0.30,
     roof_min_inliers: int = 500,
     roof_normal_z_min: float = 0.85,
-    ground_skip_m: float = 1.0,
+    ground_clearance_m: float = 0.4,
     min_wall_length_m: float = 2.0,
     min_wall_area_m2: float = 6.0,
     min_roof_area_m2: float = 8.0,
@@ -1396,7 +1484,7 @@ def facades_from_pointcloud_ransac(
     Pipeline:
       1. Clip cloud to ``polygon_enu`` (XY).
       2. Compute ground_z / top_z percentiles; drop points below
-         ``ground_z + ground_skip_m``.
+         ``ground_clearance_m`` of the fitted ground plane.
       3. Wall pass: take points with Z in
          [low_frac, high_frac] × (top_z - ground_z). Project to XY, run
          iterative 2D-line RANSAC. Each line becomes a wall extruded from
@@ -1410,6 +1498,8 @@ def facades_from_pointcloud_ransac(
     if len(pts_all) < wall_min_inliers * 2:
         return []
 
+    ground_plane = fit_ground_plane(pts_all)
+
     if polygon_enu is not None and len(polygon_enu) >= 3:
         poly = np.asarray(polygon_enu, dtype=float)
         if len(poly) > 1 and np.allclose(poly[0, :2], poly[-1, :2]):
@@ -1422,7 +1512,7 @@ def facades_from_pointcloud_ransac(
     ground_z = float(np.percentile(pts_all[:, 2], 5.0))
     top_z = float(np.percentile(pts_all[:, 2], 98.0))
     height_range = max(1.0, top_z - ground_z)
-    pts_all = pts_all[pts_all[:, 2] >= ground_z + ground_skip_m]
+    pts_all = pts_all[height_above_ground(pts_all, ground_plane) > ground_clearance_m]
     if len(pts_all) < wall_min_inliers * 2:
         return []
 

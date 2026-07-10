@@ -241,8 +241,9 @@ def augment_mission(
     #   1. Pass FULL pcd.points to CGAL (no pre-voxel, no pre-Z-floor).
     #   2. Compute a TIGHT polygon = convex hull of mid-height (30–70th
     #      pctile Z) points. Same as dev's _tighten_clip_polygon.
-    #   3. Pass tight polygon to CGAL — CGAL clips internally and
-    #      runs ground_skip_m=1.0 (drops bottom 1m of Z range).
+    #   3. Pass tight polygon to CGAL — CGAL clips internally, fits the
+    #      ground plane on the unclipped cloud, and drops points within
+    #      ground_clearance_m of it plus horizontal facets near it.
     #   4. Post-extraction: drop facades whose centroid is outside the
     #      mission_area polygon expanded by 2m.
     #
@@ -263,7 +264,7 @@ def augment_mission(
     else:
         clip_poly = polygon_enu
         _log("      tight footprint failed; falling back to mission polygon")
-    _log(f"      facade-extraction input: {len(points_xyz):,} pts (raw, no Z-floor; CGAL handles ground_skip internally)")
+    _log(f"      facade-extraction input: {len(points_xyz):,} pts (raw, no Z-floor; CGAL removes the ground internally)")
 
     _log("[5/7] Extracting facades (CGAL region growing)…")
     # Density-aware auto-estimator — same call dev backend uses inside
