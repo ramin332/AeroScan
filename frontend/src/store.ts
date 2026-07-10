@@ -187,11 +187,14 @@ interface AppState {
   kmzFdMinRoofArea: number | null;     // min roof area (m²)
   kmzFdMinDensity: number | null;      // min inlier density (pts/m²)
   kmzFdNormalThreshold: number | null; // normal-agreement (cos θ)
+  kmzFdGroundClearance: number | null;      // point-level clearance above the fitted ground plane (m)
+  kmzFdGroundFacetClearance: number | null; // drop horizontal facets within this of the plane (m)
   setKmzFacadeParams: (p: Partial<{
     kmzFdEpsilon: number | null; kmzFdClusterEpsilon: number | null;
     kmzFdMinPoints: number | null; kmzFdMinWallArea: number | null;
     kmzFdMinRoofArea: number | null; kmzFdMinDensity: number | null;
     kmzFdNormalThreshold: number | null;
+    kmzFdGroundClearance: number | null; kmzFdGroundFacetClearance: number | null;
   }>) => void;
   // Flight-path mode (raw DJI / DJI-with-facade-pinned-gimbals / our own NEN-2767 path).
   kmzMode: KmzMode;
@@ -461,6 +464,8 @@ export const useStore = create<AppState>()(persist((set, get) => ({
   kmzFdMinRoofArea: null,
   kmzFdMinDensity: null,
   kmzFdNormalThreshold: null,
+  kmzFdGroundClearance: null,
+  kmzFdGroundFacetClearance: null,
   setKmzFacadeParams: (p) => set(p),
   kmzMode: 'dji',
   setKmzMode: (v) => set({ kmzMode: v }),
@@ -492,6 +497,8 @@ export const useStore = create<AppState>()(persist((set, get) => ({
       if ('fd_min_wall_area_m2' in settings) patch.kmzFdMinWallArea = settings.fd_min_wall_area_m2 ?? null;
       if ('fd_min_roof_area_m2' in settings) patch.kmzFdMinRoofArea = settings.fd_min_roof_area_m2 ?? null;
       if ('fd_min_density_per_m2' in settings) patch.kmzFdMinDensity = settings.fd_min_density_per_m2 ?? null;
+      if ('fd_ground_clearance_m' in settings) patch.kmzFdGroundClearance = settings.fd_ground_clearance_m ?? null;
+      if ('fd_ground_facet_clearance_m' in settings) patch.kmzFdGroundFacetClearance = settings.fd_ground_facet_clearance_m ?? null;
       if ('fd_normal_threshold' in settings) patch.kmzFdNormalThreshold = settings.fd_normal_threshold ?? null;
       set(patch);
       await get().refreshVersions();
@@ -631,6 +638,8 @@ export const useStore = create<AppState>()(persist((set, get) => ({
         fdMinRoofAreaM2: gte(s.kmzFdMinRoofArea, 0.05),
         fdMinDensityPerM2: gte(s.kmzFdMinDensity, 1.0),
         fdNormalThreshold: gte(s.kmzFdNormalThreshold, 0.5),
+        fdGroundClearanceM: gte(s.kmzFdGroundClearance, 0.05),
+        fdGroundFacetClearanceM: gte(s.kmzFdGroundFacetClearance, 0.0),
       }));
     } catch (e) {
       console.error('Refine request failed:', e);

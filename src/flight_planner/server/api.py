@@ -612,6 +612,8 @@ def _kmz_facade_runtime_key(mesh_key: tuple, fd: dict) -> tuple:
         _r(fd.get("min_roof_area_m2")),
         _r(fd.get("min_density_per_m2")),
         _r(fd.get("normal_threshold")),
+        _r(fd.get("ground_clearance_m")),
+        _r(fd.get("ground_facet_clearance_m")),
     )
 
 
@@ -1735,6 +1737,10 @@ class RefineKmzRequest(BaseModel):
     fd_min_roof_area_m2: float | None = Field(default=None, ge=0.05, le=20.0)
     fd_min_density_per_m2: float | None = Field(default=None, ge=1.0, le=500.0)
     fd_normal_threshold: float | None = Field(default=None, ge=0.5, le=0.999)
+    # Ground removal (2026-07-10). Point-level clearance above the fitted ground
+    # plane, and the facet gate that drops horizontal facets sitting near it.
+    fd_ground_clearance_m: float | None = Field(default=None, ge=0.05, le=3.0)
+    fd_ground_facet_clearance_m: float | None = Field(default=None, ge=0.0, le=5.0)
 
 
 @router.post("/buildings/{building_id}/refine-kmz")
@@ -1846,6 +1852,8 @@ def refine_kmz_building(building_id: str, req: RefineKmzRequest):
                 "min_roof_area_m2": req.fd_min_roof_area_m2,
                 "min_density_per_m2": req.fd_min_density_per_m2,
                 "normal_threshold": req.fd_normal_threshold,
+                "ground_clearance_m": req.fd_ground_clearance_m,
+                "ground_facet_clearance_m": req.fd_ground_facet_clearance_m,
             }
             facade_key = _kmz_facade_runtime_key(mesh_key, fd_overrides_refine)
             cached_facades = _kmz_facade_runtime_cache_get(facade_key)
@@ -2038,6 +2046,8 @@ def refine_kmz_building(building_id: str, req: RefineKmzRequest):
                 "fd_min_roof_area_m2": float(req.fd_min_roof_area_m2) if req.fd_min_roof_area_m2 is not None else None,
                 "fd_min_density_per_m2": float(req.fd_min_density_per_m2) if req.fd_min_density_per_m2 is not None else None,
                 "fd_normal_threshold": float(req.fd_normal_threshold) if req.fd_normal_threshold is not None else None,
+                "fd_ground_clearance_m": float(req.fd_ground_clearance_m) if req.fd_ground_clearance_m is not None else None,
+                "fd_ground_facet_clearance_m": float(req.fd_ground_facet_clearance_m) if req.fd_ground_facet_clearance_m is not None else None,
             }
 
             # Also persist mesh / point-cloud / geometry alongside the snapshot,

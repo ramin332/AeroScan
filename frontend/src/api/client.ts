@@ -112,6 +112,8 @@ export interface LoadedBuildingSettings {
   fd_min_roof_area_m2?: number | null;
   fd_min_density_per_m2?: number | null;
   fd_normal_threshold?: number | null;
+  fd_ground_clearance_m?: number | null;
+  fd_ground_facet_clearance_m?: number | null;
 }
 
 export async function loadBuilding(
@@ -246,6 +248,8 @@ export interface RefineKmzOpts {
   fdMinRoofAreaM2?: number | null;
   fdMinDensityPerM2?: number | null;
   fdNormalThreshold?: number | null;
+  fdGroundClearanceM?: number | null;
+  fdGroundFacetClearanceM?: number | null;
 }
 
 export async function refineKmzBuilding(
@@ -263,6 +267,8 @@ export async function refineKmzBuilding(
   if (opts?.fdMinRoofAreaM2 != null) body.fd_min_roof_area_m2 = opts.fdMinRoofAreaM2;
   if (opts?.fdMinDensityPerM2 != null) body.fd_min_density_per_m2 = opts.fdMinDensityPerM2;
   if (opts?.fdNormalThreshold != null) body.fd_normal_threshold = opts.fdNormalThreshold;
+  if (opts?.fdGroundClearanceM != null) body.fd_ground_clearance_m = opts.fdGroundClearanceM;
+  if (opts?.fdGroundFacetClearanceM != null) body.fd_ground_facet_clearance_m = opts.fdGroundFacetClearanceM;
   return request(`/buildings/${buildingId}/refine-kmz`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },

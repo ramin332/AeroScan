@@ -22,6 +22,8 @@ const FD_DEFAULTS = {
   minWallArea: 0.5,       // m²
   minRoofArea: 0.5,       // m²
   minDensity: 25,         // pts/m²
+  groundClearance: 0.4,        // m — point-level clearance above the fitted ground plane
+  groundFacetClearance: 1.5,   // m — drop horizontal facets within this of the plane
 } as const;
 
 export function Sidebar() {
@@ -36,6 +38,7 @@ export function Sidebar() {
     kmzOptimizeMin, kmzOptimizeMax, kmzOptimizeSteps, kmzAwAlpha, kmzAwOffset, setKmzReconParams,
     kmzFdEpsilon, kmzFdClusterEpsilon, kmzFdMinPoints,
     kmzFdMinWallArea, kmzFdMinRoofArea, kmzFdMinDensity, kmzFdNormalThreshold,
+    kmzFdGroundClearance, kmzFdGroundFacetClearance,
     setKmzFacadeParams,
     kmzMode, switchMode,
     buildings, refreshBuildings, selectBuilding, deleteBuilding,
@@ -430,6 +433,24 @@ export function Sidebar() {
             defaultValue={FD_DEFAULTS.normalThreshold}
             onReset={() => setKmzFacadeParams({ kmzFdNormalThreshold: null })}
             onChange={(v) => setKmzFacadeParams({ kmzFdNormalThreshold: v })}
+            onCommit={triggerRefine} />
+          <SliderField label={`ground clearance${kmzFdGroundClearance == null ? ' (auto)' : ''}`}
+            value={kmzFdGroundClearance ?? FD_DEFAULTS.groundClearance}
+            min={0.05} max={3} step={0.05}
+            format={(v) => `${v.toFixed(2)} m`}
+            tooltip="Drop points within this height of the fitted ground plane. Too high eats a short target's lower body; too low lets ground noise through. Default 0.40 m."
+            defaultValue={FD_DEFAULTS.groundClearance}
+            onReset={() => setKmzFacadeParams({ kmzFdGroundClearance: null })}
+            onChange={(v) => setKmzFacadeParams({ kmzFdGroundClearance: v })}
+            onCommit={triggerRefine} />
+          <SliderField label={`ground facet gate${kmzFdGroundFacetClearance == null ? ' (auto)' : ''}`}
+            value={kmzFdGroundFacetClearance ?? FD_DEFAULTS.groundFacetClearance}
+            min={0} max={5} step={0.1}
+            format={(v) => `${v.toFixed(1)} m`}
+            tooltip="Drop facets that are BOTH near-horizontal AND within this height of the ground plane. Walls and lampposts are vertical, so they survive at any height. 0 disables. Default 1.5 m."
+            defaultValue={FD_DEFAULTS.groundFacetClearance}
+            onReset={() => setKmzFacadeParams({ kmzFdGroundFacetClearance: null })}
+            onChange={(v) => setKmzFacadeParams({ kmzFdGroundFacetClearance: v })}
             onCommit={triggerRefine} />
           <SliderField label={`min wall area${kmzFdMinWallArea == null ? ' (auto)' : ''}`}
             value={kmzFdMinWallArea ?? FD_DEFAULTS.minWallArea}
