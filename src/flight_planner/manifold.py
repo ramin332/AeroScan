@@ -179,6 +179,44 @@ def register_to_kmz_frame(
     return coarse, total_T, stats
 
 
+def resolve_perception_dir(flight_dir: Path) -> Path:
+    """Find the ``dji_perception/<n>/`` subdirectory holding this flight's mesh.
+
+    The index is NOT always 1. Measured on the real ring buffer 2026-07-10:
+    flight0065/flight0070 keep their chunks under ``1``, flight0066/flight0072
+    under ``2``. Hardcoding ``1`` made flight0072's fresh scan invisible, and the
+    resolver silently fell back to a 15-hour-old mesh from another slot — two
+    missions were planned against stale geometry.
+
+    When several subdirectories hold chunks, the one with the newest chunk wins.
+    """
+    flight_dir = Path(flight_dir)
+    root = flight_dir / "dji_perception"
+    if not root.is_dir():
+        raise FileNotFoundError(
+            f"No dji_perception/ under {flight_dir} — "
+            f"is this a Smart3D Auto-Exploration flight?"
+        )
+
+    candidates: list[tuple[float, Path]] = []
+    for sub in sorted(root.iterdir()):
+        if not sub.is_dir():
+            continue
+        chunks = list(sub.glob("mesh_binary_*.ply"))
+        if not chunks:
+            continue
+        candidates.append((max(c.stat().st_mtime for c in chunks), sub))
+
+    if not candidates:
+        raise FileNotFoundError(
+            f"No mesh_binary_*.ply under any {root}/*/ — "
+            f"no Smart3D Auto-Exploration scan ran in this flight slot."
+        )
+
+    candidates.sort(key=lambda t: t[0])
+    return candidates[-1][1]
+
+
 def from_manifold(
     flight_id: str = "the_latest_flight",
     *,
@@ -194,10 +232,5 @@ def from_manifold(
     facade extraction.
     """
     flight_dir = Path(blackbox_dir) / flight_id
-    perception_dir = flight_dir / "dji_perception" / "1"
-    if not perception_dir.exists():
-        raise FileNotFoundError(
-            f"No dji_perception/1 under {flight_dir} — "
-            f"is this a Smart3D Auto-Exploration flight?"
-        )
+    perception_dir = resolve_perception_dir(flight_dir)
     return merge_blackbox_plys(perception_dir, voxel_m=voxel_m)
