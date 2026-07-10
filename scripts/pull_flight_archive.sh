@@ -56,7 +56,10 @@ for d in $(ls -dt /blackbox/flight[0-9]* 2>/dev/null); do
     slot=$(basename "$d")
     mt=$(date -r "$d" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo '?')
     sz=$(du -sh "$d" 2>/dev/null | cut -f1)
-    meshes=$(ls "$d"/dji_perception/1/mesh_binary_*.ply 2>/dev/null | wc -l | tr -d ' ')
+    # Search EVERY dji_perception/*/ subdir. The index is not always 1:
+    # flight0072's fresh scan landed under 2/, and globbing only 1/ made it
+    # invisible -- the same bug that had the augment plan against a stale mesh.
+    meshes=$(find "$d/dji_perception" -name 'mesh_binary_*.ply' 2>/dev/null | wc -l | tr -d ' ')
     note=""
     [ "$slot" = "$resolved" ] && note="<- the_latest_flight"
     [ "$meshes" -gt 0 ] 2>/dev/null && note="$note [MESH]"
