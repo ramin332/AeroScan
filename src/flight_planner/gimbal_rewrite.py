@@ -28,6 +28,75 @@ def _unit(v: np.ndarray) -> np.ndarray:
     return v / n if n > 1e-9 else v
 
 
+def _wrap180(a):
+    return (np.asarray(a, dtype=np.float64) + 180.0) % 360.0 - 180.0
+
+
+def schedule_headings(
+    positions: np.ndarray,
+    bearings: np.ndarray,
+    speeds: np.ndarray,
+    *,
+    max_gimbal_pan_deg: float = 50.0,
+    yaw_rate_deg_per_s: float = 60.0,
+    rate_fraction: float = 0.5,
+    report: bool = False,
+):
+    """Rate-limited aircraft heading whose residual gimbal pan is bounded.
+
+    Returns ``(heading_deg, pan_deg)``, or ``(heading, pan, rate_violations)``
+    when ``report``. ``pan`` is the gimbal yaw required relative to the airframe,
+    i.e. ``bearing - heading``; it is guaranteed within ``max_gimbal_pan_deg``.
+
+    Why this exists. The augment used to set ``heading = bearing`` at every
+    waypoint, so the *commanded* pan was 0 and the gimbal's ±60° travel went
+    unused. But the bearing sequence contains ~179° reversals; DJI's
+    ``smoothTransition`` spreads each across one ~0.58 s leg, and the M4E yaws at
+    ~60°/s, so the airframe arrives ~135° short. The gimbal, commanded in the
+    absolute-north frame, then has to make up the whole difference and saturates.
+    Ground truth from the 2026-07-10 flight's JPEG XMP: actual gimbal pan sat at
+    a median of 51.5° with a p90 of exactly 61.0° — pinned against the stop —
+    while our commanded pose pointed at the target twice as accurately as the
+    gimbal ever managed.
+
+    So: chase the bearing no faster than the airframe can turn, and where that
+    would leave the gimbal needing more than ``max_gimbal_pan_deg``, yaw harder.
+    The cap wins over the rate limit — a gimbal at its mechanical stop is aiming
+    at nothing, whereas an aggressive yaw merely costs time. Violations of the
+    rate limit are counted and returned so the caller can warn at plan time.
+    """
+    positions = np.asarray(positions, dtype=np.float64).reshape(-1, 3)
+    bearings = np.asarray(bearings, dtype=np.float64).reshape(-1)
+    speeds = np.asarray(speeds, dtype=np.float64).reshape(-1)
+    n = len(bearings)
+    if n == 0:
+        return (np.zeros(0), np.zeros(0), 0) if report else (np.zeros(0), np.zeros(0))
+
+    heading = np.zeros(n)
+    heading[0] = bearings[0]
+    violations = 0
+
+    for i in range(1, n):
+        leg = float(np.linalg.norm(positions[i] - positions[i - 1]))
+        speed = float(speeds[i - 1]) if speeds[i - 1] > 0.1 else 0.1
+        budget = yaw_rate_deg_per_s * rate_fraction * (leg / speed)
+
+        want = float(_wrap180(bearings[i] - heading[i - 1]))
+        step = max(-budget, min(budget, want))
+        h = float(_wrap180(heading[i - 1] + step))
+
+        pan = float(_wrap180(bearings[i] - h))
+        if abs(pan) > max_gimbal_pan_deg:
+            # The cap wins. Yaw further than the rate budget allows and say so.
+            h = float(_wrap180(bearings[i] - math.copysign(max_gimbal_pan_deg, pan)))
+            if abs(float(_wrap180(h - heading[i - 1]))) > budget + 1e-9:
+                violations += 1
+        heading[i] = h
+
+    pan = _wrap180(bearings - heading)
+    return (heading, pan, violations) if report else (heading, pan)
+
+
 def _pick_facade_for_waypoint(
     wp_xyz: np.ndarray,
     facades: Sequence[Facade],
@@ -110,6 +179,10 @@ def rewrite_gimbals_perpendicular(
     preserve_heading: bool = True,
     wall_distance_bonus: float = 0.5,
     switch_ratio: float = 0.8,
+    max_gimbal_pan_deg: float = 50.0,
+    yaw_rate_deg_per_s: float = 60.0,
+    heading_rate_fraction: float = 0.5,
+    command_gimbal_yaw: bool = False,
 ) -> list[Waypoint]:
     """Rewrite ``gimbal_pitch_deg`` / ``gimbal_yaw_deg`` so each waypoint
     photographs the nearest facade head-on.
@@ -134,6 +207,35 @@ def rewrite_gimbals_perpendicular(
         aim unless a challenger's weighted distance is below
         ``switch_ratio * previous_weighted``. 1.0 disables hysteresis (the old
         memoryless behaviour). Lower is stickier.
+    max_gimbal_pan_deg
+        Cap on the gimbal yaw required relative to the airframe. Only applies
+        when ``preserve_heading`` is False (we are scheduling the heading). The
+        M4E's mechanical pan limit is ±60°; 50° leaves margin for the airframe
+        overshooting its commanded heading. Measured on 2026-07-10, the old
+        ``heading = bearing`` scheme drove actual pan to a median of 51.5° and
+        pinned it at the 60° stop on 14% of photos.
+    yaw_rate_deg_per_s, heading_rate_fraction
+        The airframe's yaw rate and the fraction of it the heading schedule is
+        allowed to demand per leg. The fraction exists because DJI's
+        ``smoothTransition`` ramps rather than slews at the limit.
+    command_gimbal_yaw
+        False (default): emit NO gimbal yaw command. ``gimbal_yaw_deg=None`` makes
+        kmz_builder leave yaw uncommanded, so the gimbal follows the airframe nose
+        and the required pan is identically zero. Only pitch is commanded.
+
+        Why the default flipped. On 2026-07-10 we commanded absolute-north gimbal
+        yaw equal to the heading, so the *commanded* pan was 0° everywhere. The
+        JPEG XMP shows the *actual* pan sat at a median of 51.5° with a p90 of
+        exactly 61.0° — pinned against the ±60° stop on 14% of photos — while the
+        airframe tracked its commanded heading to within 14° median. The gimbal
+        was 44° away from the yaw we asked for. Our commanded pose pointed at the
+        target twice as accurately (17.6° median bearing error) as the gimbal ever
+        achieved (35.4°). The yaw axis was not obeying, and it is the only axis
+        with a mechanical limit to saturate against. Removing the command removes
+        the failure mode; azimuth then comes from the nose, which does work.
+
+        True restores the old absolute-north yaw command, with the heading
+        scheduled so the required pan stays within ``max_gimbal_pan_deg``.
 
     Returns a new list of Waypoints; input list is not mutated.
     """
@@ -182,7 +284,10 @@ def rewrite_gimbals_perpendicular(
         new_wp = replace(
             wp,
             gimbal_pitch_deg=float(pitch_deg),
-            gimbal_yaw_deg=float(yaw_deg),
+            # None => kmz_builder emits no yaw command; the gimbal follows the nose.
+            gimbal_yaw_deg=float(yaw_deg) if command_gimbal_yaw else None,
+            # Heading is scheduled below once every bearing is known; leaving it
+            # equal to the bearing here would be the bug we are fixing.
             heading_deg=wp.heading_deg if preserve_heading else float(yaw_deg),
             facade_index=idx,
             # Drop the photogrammetry rosette action group — we want a single
@@ -190,5 +295,36 @@ def rewrite_gimbals_perpendicular(
             actions=[a for a in wp.actions if getattr(a, "action_type", None)],
         )
         out.append(new_wp)
+
+    if not preserve_heading and command_gimbal_yaw and out:
+        # The gimbal keeps its exact absolute-north aim (`gimbal_yaw_deg`). The
+        # heading becomes a rate-limited pursuit of that aim, capped so the
+        # residual pan stays inside the gimbal's travel. Waypoints with no facade
+        # keep their original bearing as the schedule's target.
+        positions = np.array([[w.x, w.y, w.z] for w in out], dtype=np.float64)
+        bearings = np.array(
+            [
+                float(w.gimbal_yaw_deg) if w.gimbal_yaw_deg is not None else float(w.heading_deg)
+                for w in out
+            ],
+            dtype=np.float64,
+        )
+        speeds = np.array([float(w.speed_ms or 0.0) for w in out], dtype=np.float64)
+        heading, _pan, violations = schedule_headings(
+            positions,
+            bearings,
+            speeds,
+            max_gimbal_pan_deg=max_gimbal_pan_deg,
+            yaw_rate_deg_per_s=yaw_rate_deg_per_s,
+            rate_fraction=heading_rate_fraction,
+            report=True,
+        )
+        out = [replace(w, heading_deg=float(h)) for w, h in zip(out, heading)]
+        if violations:
+            print(
+                f"[gimbal] heading schedule: {violations} waypoint(s) needed more yaw "
+                f"than {heading_rate_fraction:.0%} of {yaw_rate_deg_per_s:.0f}°/s to keep "
+                f"gimbal pan within ±{max_gimbal_pan_deg:.0f}°. The aircraft will yaw hard there."
+            )
 
     return out
