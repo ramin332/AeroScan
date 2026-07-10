@@ -24,6 +24,19 @@ Deploy `2bf3308` and fly. Then pull the photos and run:
 heading error (~14°).** Today it was pan median 51.5°, p90 exactly 61.0° (pinned at
 the ±60° stop), and the gimbal sat 44° from the yaw we commanded.
 
+⚠️ **"In frame" is not "aimed."** The pilot reported the last flight looked good —
+*"it was looking at the car the entire time"* — and the median bearing error was
+35.4°. Both are true: the WIDE lens has a **35.8° horizontal half-FOV**, so the
+target sits just inside the frame edge, continuously visible and never centred. At
+p90 (91.7°) it is out of frame entirely. **The FPV feed cannot judge aim quality.
+The XMP can.** Same trap as the 399-WP mission reading "99.7% on-target" while
+shooting at 9.23 mm/px.
+
+⚠️ **Photos are the only record of the bug and they are NOT archived.** They live on
+the SD card (`DCIM/DJI_202607101133_009`), not in `/blackbox`. Copy them to
+`flight-archive/2026-07-10/photos-flight0073/` before the card is reused, or "the
+fix worked" becomes unfalsifiable.
+
 ## What 2026-07-10 established (with evidence)
 
 **The gimbal was not honouring our absolute-north yaw command.** From 294 photos'

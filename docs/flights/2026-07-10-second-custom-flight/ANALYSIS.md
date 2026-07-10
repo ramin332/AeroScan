@@ -128,11 +128,89 @@ change, and the heading rewrite all change **where the gimbal looks / where the
 nose points**, never **where the aircraft flies**. Low photo count and slow
 flight are not facade-detection bugs.
 
+## Evening addendum — a fourth flight, and the real bug
+
+A fourth mission flew at 12:36 (`flight0073`, `20260710T103507Z_331`, 398 WPs,
+paused at WP 398). Its photos are folder `DCIM/DJI_202607101133_009` on the SD
+card — **the camera clock runs 1 h behind the PSDK log** (11:33–11:41 on the card
+= 12:33–12:41 local), and DJI writes our waypoint label into the filename
+(`..._V_wp375.JPG`) because `kmz_builder` names each `takePhoto`. Pair photos to
+waypoints by that label, never by order: 294 photos cover waypoints 0–376, so ~80
+shots never fired (0.58 s legs against a 0.5 s minimum shutter interval).
+
+### RESUME is fine — the earlier concern is withdrawn
+
+The FC reported `index: 1` and `index: 396` **61 ms apart**. Those waypoints are
+**46.7 m** apart — 23 s of flying at 2 m/s. The aircraft never went there. It is a
+callback artifact. **PAUSE/RESUME is safe to use.**
+
+### The gimbal was not honouring our yaw command
+
+From the 294 photos' XMP (`drone-dji:GimbalYawDegree`, `FlightYawDegree`):
+
+| | commanded | actual |
+|---|---|---|
+| gimbal pan (\|GimbalYaw − FlightYaw\|) | 0° everywhere | median **51.5°**, p90 **61.0°**, 41/294 at the ±60° stop |
+| bearing error to the target | **17.6°** | **35.4°** |
+| \|heading − commanded heading\| | — | median 14.4° |
+| corr(commanded pitch, actual pitch) | — | **+0.40** (no better than never moving) |
+
+We set `gimbalYawRotateAngle = waypointHeadingAngle` with `gimbalHeadingYawBase=north`,
+so the *commanded* pan was 0° at every waypoint. The airframe tracked its commanded
+heading to within 14° median, so the gimbal should have sat ~14° off the nose. It sat
+at 51°, pinned against its mechanical stop, **44° from the yaw we asked for** — and
+our commanded pose pointed at the target twice as accurately as the gimbal ever
+achieved. The planner was right; the aircraft did not comply. Yaw is the only gimbal
+axis with a travel limit, hence the pilot's "ends up 45° left or right and locks",
+and why lap two looked worse: it was already at the stop.
+
+**Fix (`2bf3308`): emit no gimbal yaw command.** `gimbal_yaw_deg=None` leaves yaw
+uncommanded, the gimbal follows the nose, and required pan is identically zero — it
+cannot saturate. Azimuth comes from the heading, which works. Pitch is still
+commanded. `schedule_headings()` (rate-limited heading pursuit with a pan cap) is
+implemented and tested but only used when `command_gimbal_yaw=True`, the path to
+re-enable if a device test ever shows absolute-north yaw *is* honoured.
+
+### "In frame" is not "aimed" — a wide lens hides bad tracking
+
+The pilot reported this flight looked good: *"it was looking at the car the entire
+time."* Both that and the 35.4° median bearing error are true. The WIDE lens has a
+**35.8° horizontal half-FOV**, so at the median error the car sits just inside the
+frame edge — continuously visible, never centred. At p90 (91.7°) it is out of frame
+entirely. The FPV feed is a poor instrument for aim quality; the XMP is the
+instrument. Same trap as the 399-WP mission reading "99.7% on-target" while shooting
+at 9.23 mm/px.
+
+### Hypotheses tested and killed (do not re-walk these)
+
+- **Gimbal mid-slew at shutter** — `corr(commanded step, error) = −0.03`, and the
+  gimbal demonstrably reaches 96.6°/s. It has time and speed to arrive.
+- **`gimbalRotateTime=10`** — present on 1 of 207 actions, and disabled
+  (`gimbalRotateTimeEnable=0`). Dead config in `kmz_builder.py:406-407`.
+- **Photo↔waypoint pairing offset** — no shift in −6..+30 reduces the error.
+- **Rigid frame rotation (ICP yaw error)** — resultant length R=0.656, not rigid.
+- **"Half the waypoints are blind"** — no. `MissionConfig`'s 5°/5° dedup omits a
+  `gimbalRotate` when the pose barely moved; the gimbal holds its last pose. Every
+  waypoint resolved a facade. That dedup is what cured the 2026-06-12 overload.
+
+### Data provenance
+
+The 294 photos are the only record of this bug and live on the SD card, not in
+`/blackbox` (whose `camera/` directory is empty). Copy them to
+`flight-archive/2026-07-10/photos-flight0073/` before the card is reused; without
+them, "the fix worked" is unfalsifiable.
+
 ## Verdict
 
-- Ground fix: **works**, measured on both bench and flown clouds, gimbal now
-  aims at structure (98.6% on-target).
+- Ground fix: **works**, measured on both bench and flown clouds.
+- Facade-picker hysteresis (`aee6451`): **works**, 45→24 target switches, all
+  >150° aim reversals gone on the close orbit.
 - Gimbal motor overload: **resolved** (zero occurrences).
-- PAUSE/RESUME: **flew**, but RESUME index behaviour needs investigation before
-  it is trusted.
-- Six open items remain (above); none block the ground fix, all are logged.
+- PAUSE/RESUME: **flew, and is safe** — the RESUME index concern is withdrawn.
+- **Gimbal yaw was never being honoured.** Fixed in `2bf3308`; **unflown**. The next
+  flight's photos, through `scripts/read_gimbal_xmp.py`, are the test: success is
+  pan near 0° and bearing error falling toward the airframe's own ~14° heading error.
+- Still open: the C mesh resolver hardcodes `dji_perception/1`; GSD is unvalidated at
+  plan time (this mission: 9.23 mm/px against a 2.0 target); range-adaptive lens.
+- **Low photo count is closed as not-a-bug** — DJI's rosette serves multi-view stereo;
+  NEN-2767 wants one perpendicular frame, and along-path overlap is already ~84%.
