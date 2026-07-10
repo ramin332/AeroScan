@@ -23,3 +23,4 @@ flight-debug/
 # keys). Under docs/flights/ keep only the curated .md reports + lean KMZ.
 docs/flights/**/flight[0-9]*/
 docs/flights/**/*.augmented.kmz
+flight-archive/
