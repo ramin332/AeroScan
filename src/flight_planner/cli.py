@@ -58,6 +58,11 @@ from .models import (
 _NEN_INSPECTION_SPEED_MS = 3.0
 _NEN_MAX_FACADE_DIST_M = 60.0
 _NEN_PITCH_MARGIN_DEG = 2.0
+# Facade-picker hysteresis. 1.0 = memoryless (the pre-2026-07-10 behaviour).
+# Measured on the 2026-07-10 flown missions: 0.8 halves target switching
+# (45->24 on the close orbit) and removes every >150 deg aim reversal, at a
+# cost of 0.1 m in p90 aim range.
+_NEN_SWITCH_RATIO = 0.8
 
 # Anomaly thresholds for preview-side flagging. The 2 m / 1 m fingerprint
 # bench surfaced these as the "edge case" categories that warrant pilot
@@ -205,6 +210,7 @@ def augment_mission(
     max_facade_distance_m: float = _NEN_MAX_FACADE_DIST_M,
     inspection_speed_ms: float = _NEN_INSPECTION_SPEED_MS,
     pitch_margin_deg: float = _NEN_PITCH_MARGIN_DEG,
+    switch_ratio: float = _NEN_SWITCH_RATIO,
     summary_json: Path | None = None,
     log: bool = True,
 ) -> dict:
@@ -315,6 +321,7 @@ def augment_mission(
         facades=facades,
         max_distance_m=max_facade_distance_m,
         pitch_margin_deg=pitch_margin_deg,
+        switch_ratio=switch_ratio,
         # False: face the aircraft nose at the facade (heading_deg = facade
         # bearing) instead of DJI WaypointV3's default "point toward next
         # waypoint". Our boustrophedon sweep zig-zags, so the default flipped
@@ -528,6 +535,7 @@ def _cmd_augment_mission(args: argparse.Namespace) -> int:
             output_kmz=args.output_kmz,
             icp_target_ply=icp_target,
             blackbox_dir=args.blackbox_dir,
+            switch_ratio=args.switch_ratio,
             voxel_m=args.voxel_m,
             max_facade_distance_m=args.max_facade_distance_m,
             inspection_speed_ms=args.inspection_speed_ms,
@@ -600,6 +608,11 @@ def build_parser() -> argparse.ArgumentParser:
                          f"Default {_NEN_MAX_FACADE_DIST_M}.")
     am.add_argument("--inspection-speed-ms", type=float, default=_NEN_INSPECTION_SPEED_MS,
                     help=f"Per-waypoint flight speed (m/s). Default {_NEN_INSPECTION_SPEED_MS}.")
+    am.add_argument("--switch-ratio", type=float, default=_NEN_SWITCH_RATIO,
+                    help="Facade-picker hysteresis: keep the previously-tracked facade "
+                         "unless a challenger's weighted distance is below "
+                         "switch_ratio x previous. 1.0 disables (memoryless, the old "
+                         "behaviour). Lower is stickier. Default 0.8.")
     am.add_argument("--pitch-margin-deg", type=float, default=_NEN_PITCH_MARGIN_DEG,
                     help=f"Margin from gimbal hardware pitch limits (deg). Default {_NEN_PITCH_MARGIN_DEG}.")
     am.add_argument("--summary-json", type=Path, default=None,

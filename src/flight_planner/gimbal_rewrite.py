@@ -33,6 +33,8 @@ def _pick_facade_for_waypoint(
     facades: Sequence[Facade],
     max_distance_m: float,
     wall_distance_bonus: float = 0.5,
+    previous_index: int | None = None,
+    switch_ratio: float = 0.8,
 ) -> tuple[int, float] | None:
     """Find the best outward-facing facade for this waypoint.
 
@@ -62,6 +64,8 @@ def _pick_facade_for_waypoint(
     """
     best: tuple[int, float] | None = None
     best_weighted = float("inf")
+    prev_weighted = float("inf")
+    prev_hit: tuple[int, float] | None = None
 
     for i, f in enumerate(facades):
         n = _unit(np.asarray(f.normal, dtype=np.float64))
@@ -74,9 +78,26 @@ def _pick_facade_for_waypoint(
             continue
         is_wall = (f.label or "").startswith("wall_")
         weighted = dist3d * (wall_distance_bonus if is_wall else 1.0)
+        if i == previous_index:
+            prev_weighted = weighted
+            prev_hit = (i, dist3d)
         if weighted < best_weighted:
             best_weighted = weighted
             best = (i, dist3d)
+
+    # Hysteresis. The previous facade keeps the aim unless a challenger beats it
+    # by a clear margin. Without this the picker re-decides from scratch at every
+    # waypoint, so two near-equal facets trade the aim back and forth; measured on
+    # the 2026-07-10 flights, 32% of adjacent waypoints switched target and four
+    # of the switches were ~175° reversals to a facet on the opposite side. The
+    # aircraft cannot yaw that fast, so the north-referenced gimbal command
+    # saturates against the ±60° pan limit and the gimbal appears to lock.
+    #
+    # A previous facade that is now behind the waypoint or out of range never
+    # reaches `prev_hit`, so it is dropped without argument.
+    if prev_hit is not None and best is not None and best[0] != previous_index:
+        if best_weighted > prev_weighted * switch_ratio:
+            return prev_hit
 
     return best
 
@@ -88,6 +109,7 @@ def rewrite_gimbals_perpendicular(
     pitch_margin_deg: float = 2.0,
     preserve_heading: bool = True,
     wall_distance_bonus: float = 0.5,
+    switch_ratio: float = 0.8,
 ) -> list[Waypoint]:
     """Rewrite ``gimbal_pitch_deg`` / ``gimbal_yaw_deg`` so each waypoint
     photographs the nearest facade head-on.
@@ -107,6 +129,11 @@ def rewrite_gimbals_perpendicular(
         If True (default), only update the gimbal and leave aircraft heading
         alone — safer, since DJI's waypoint heading drives turn smoothing.
         Gimbal yaw is then stored absolutely (relative to north, not aircraft).
+    switch_ratio
+        Hysteresis on facade selection. The previously-tracked facade keeps the
+        aim unless a challenger's weighted distance is below
+        ``switch_ratio * previous_weighted``. 1.0 disables hysteresis (the old
+        memoryless behaviour). Lower is stickier.
 
     Returns a new list of Waypoints; input list is not mutated.
     """
@@ -114,14 +141,23 @@ def rewrite_gimbals_perpendicular(
     pitch_max = GIMBAL_TILT_MAX_DEG - pitch_margin_deg
 
     out: list[Waypoint] = []
+    previous_index: int | None = None
     for wp in waypoints:
         pos = np.array([wp.x, wp.y, wp.z], dtype=np.float64)
-        pick = _pick_facade_for_waypoint(pos, facades, max_distance_m, wall_distance_bonus=wall_distance_bonus)
+        pick = _pick_facade_for_waypoint(
+            pos,
+            facades,
+            max_distance_m,
+            wall_distance_bonus=wall_distance_bonus,
+            previous_index=previous_index,
+            switch_ratio=switch_ratio,
+        )
         if pick is None:
             out.append(replace(wp, facade_index=wp.facade_index))
             continue
 
         idx, _ = pick
+        previous_index = idx
         facade = facades[idx]
         center = np.asarray(facade.center, dtype=np.float64)
 
