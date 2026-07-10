@@ -1,4 +1,4 @@
-# RESUME HERE — AeroScan fly-readiness (last updated 2026-05-25)
+# RESUME HERE — AeroScan fly-readiness (last updated 2026-07-10)
 
 > Single entry point for picking up the on-drone augment→fly work next session.
 > Read this first, then the linked detail docs. Everything below is **merged to
@@ -7,25 +7,28 @@
 
 ## One-line status
 
-**The whole augment→fly software chain is built, wired, and verified at a desk; it
-has NEVER flown.** The only thing between us and a real end-to-end run is a **fresh
-Smart3D scan** (there is no mesh on `/blackbox` right now). Code + docs are done and
-committed on `main`.
+**IT FLIES.** The augment→fly chain has now flown twice: 2026-06-12 (first custom
+WaypointV3 flight) and **2026-07-10 (two missions, one power session, `flight0072`;
+first PAUSE/RESUME in the air)**. The 2026-06-12 gimbal-motor-overload is **resolved**
+(zero occurrences 2026-07-10). The ground-removal bug found on the 2026-07-10 morning
+van scan is **fixed** (commit `d4cd1cb`, plane fit + facet gate, 153 tests pass). The
+work now is closing the open items below, not proving first flight.
 
-## The ONE next action (resolves both remaining blockers at once)
+## The ONE next action — investigate the RESUME index behaviour
 
-1. **Fly a Smart3D Auto-Exploration scan** of a building with the M4E.
-2. **Immediately** (before many reboots — the mesh is on a ~30-slot ring buffer):
-   open the **rc-companion** on the RC → pick the Smart3D `.kmz` → **Augment**.
-   - The readiness banner should now go **green** ("mesh ✓"), and the augment runs
-     to completion instead of failing at `[2/7]` no-mesh.
-3. Review the preview → **Approve & upload** → switch to **Pilot 2** → tap the
-   **AeroScan Fly** widget → `DjiWaypointV3_Action(START)`.
-4. **Watch for the GO/NO-GO:** does the M4E accept the WaypointV3 upload + START and
-   fly it? (Never tested — DJI docs don't explicitly list the M4E for WaypointV3.)
-   Watch the floating window for "Mission: flying — waypoint N", and note whether the
-   FC applies its own safety interlocks (battery/GPS/home) — that's undocumented for
-   WaypointV3 and this is how we find out.
+The 2026-07-10 flight's biggest open question: **RESUME may restart at waypoint 1.**
+After RESUME at WP 396, DJI's own callback emitted `mission state: 80, index: 1` then
+`index: 2` and **actions fired at WP 2 (photos taken)** before continuing at 396.
+Unclear whether the aircraft physically flew there. **Investigate `flight0072` diag
+telemetry before trusting PAUSE mid-mission.** See
+`docs/flights/2026-07-10-second-custom-flight/ANALYSIS.md`.
+
+Other open items from 2026-07-10 (all in that ANALYSIS.md): Fly widget inert while
+paused (`fly tap ignored — state=0`); **mesh staleness gate did NOT fire** (flew a
+~15 h mesh despite the 6 h `AEROSCAN_MESH_MAX_AGE_S` gate); `ground_clearance_m` /
+`ground_facet_clearance_m` still hardcoded (not in the `fd_*` UI chain); low photo
+count (one `takePhoto` per WP collapses the 5-pose rosette); heading/gimbal coupling
+(airframe barely turns, gimbal yaw can exceed pan range).
 
 ## What works (verified this session)
 
@@ -42,9 +45,15 @@ committed on `main`.
 
 | | Item | Owner |
 |---|---|---|
-| 🔴 | **Mesh** — none on `/blackbox`; needed for a successful augment | fly a Smart3D scan |
-| 🔴 | **First M4E WaypointV3 upload+START** — never run on hardware (GO/NO-GO) | the flight above |
-| 🟡 | **WaypointV3 START safety interlocks** (battery/GPS) undocumented — verify on that flight | observe |
+| ✅ | **First M4E WaypointV3 upload+START** — FLEW 2026-06-12 + 2026-07-10 (GO) | done |
+| ✅ | **Gimbal motor overload** (2026-06-12) — zero occurrences 2026-07-10 | resolved |
+| ✅ | **Ground removal on short targets** — plane fit + facet gate, commit `d4cd1cb` | resolved |
+| 🔴 | **RESUME may restart at WP 1** — investigate `flight0072` diag before trusting PAUSE | you |
+| 🔴 | **Mesh staleness gate did NOT fire** — flew a ~15 h mesh past the 6 h gate | you |
+| 🟡 | **Fly widget inert while paused** (`state=0`) — pilot tapped 3× before finding Resume | you |
+| 🟡 | **Ground params hardcoded** — plumb `ground_clearance_m`/`ground_facet_clearance_m` into the `fd_*` UI chain | you |
+| 🟡 | **Low photo count** — one `takePhoto` per WP collapses the 5-pose rosette | you |
+| 🟡 | **WaypointV3 START safety interlocks** (battery/GPS) still undocumented — kept observing | observe |
 | 🟢 | **Build the rc-companion in Android Studio** — banner + fail-fast are committed but UNBUILT | you (no gradle on the laptop) |
 | 📋 | **Mirror these doc updates into the Manifold `/open_app/dev/docs/` + `INDEX.md`** | controller (not yet done) |
 

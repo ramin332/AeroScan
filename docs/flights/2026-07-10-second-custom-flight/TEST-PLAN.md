@@ -206,26 +206,40 @@ this flight:
   rather than only relying on RTH/abort if something looks wrong. This
   itself is unflown — first real test of PAUSE/RESUME on this airframe.
 
-## Post-flight
+## Post-flight — what was actually done (2026-07-10)
 
-- [ ] Archive logs the same way as last time: `scripts/pull_flight_debug.sh`
-  (or manual pull) of `/blackbox/<flight>/psdk/PSDK-*.log` +
-  `dji_perception/1/mesh_binary_*.ply` if a scan ran. Don't power-cycle
-  between landing and archiving if you want the mesh.
-- [ ] Run `scripts/verify_augmented_kmz.py` again on the exact KMZ that flew
-  (should already have it from Stage 4.5) and diff against tonight's
-  baseline numbers above — did the heading-swing numbers hold up under real
-  flight conditions (vs. just looking right on paper)?
-- [ ] If the RC flight-record `.txt` check (pre-flight item) came back
-  positive, pull it and cross-check against the KMZ-derived numbers — this
-  closes the loop FLIGHT-REVIEW.md flagged as open.
-- [ ] Write a new `ANALYSIS.md`-style doc in this directory: what flew, did
-  the jitter/overload recur, any new issues. Update
-  `docs/RESUME-HERE.md` status.
-- [ ] If everything held: consider `enable_facade_heading`-style behavior is
-  now trusted — no code change needed, it's already the unconditional
-  default. If it did NOT hold: the fix needs another pass — re-open the
-  heading-rewrite logic in `gimbal_rewrite.py`/`kmz_builder.py`.
+- [x] **Archived the full flight slot** with `scripts/pull_flight_archive.sh`
+  (not just PSDK logs) into `flight-archive/2026-07-10/` — the whole
+  `flight0072` slot (both missions flew in one power session; `flight0071` is
+  an app boot with no mission). `pull_flight_archive.sh` pulls the entire slot
+  including `dji_perception/1/mesh_binary_*.ply`; `pull_flight_debug.sh` only
+  stages PSDK logs + mission-state and hits a permissions wall on the DPK log
+  (`dji` is not in group `nvidia`, so the sandboxed DPK's log dir is
+  unreadable). Used the archiver. No power-cycle between landing and archiving.
+  Re-pulled after power-down because a live slot is still being written during
+  rsync.
+  - Gotcha hit today: `/blackbox` slot **directory** mtimes lie —
+    `flight0065`/`flight0066` looked recent by `ls -dt` but every file inside
+    was from 2026-06-12. Rank slots by per-file mtime
+    (`find <slot> -type f -newermt <date>`), not `ls -dt`. The
+    `the_latest_flight` symlink was correct.
+- [x] **Ran `scripts/verify_augmented_kmz.py` on BOTH flown KMZs**
+  (`20260710T093952Z_881.augmented.lean.kmz`, 144 WP;
+  `20260710T095651Z_712.augmented.lean.kmz`, 399 WP). Gimbal pitch median
+  −45.5° → −36.5°, horizontal-ish WPs 20.1% → 36.1%, yaw-heavy (>30°) 35.0% →
+  24.5%, aim on-target 98.6%. **Gimbal motor overload: ZERO occurrences**
+  (resolved). Heading Δ median 2.3° on the 399-WP mission (airframe barely
+  turns — see the heading/gimbal-coupling open item in `ANALYSIS.md`).
+- [ ] RC flight-record `.txt` check — still not confirmed (see open item;
+  carry forward).
+- [x] **Wrote `ANALYSIS.md`** in this directory: what flew, the ground fix's
+  measured effect, gimbal-overload resolved, PAUSE/RESUME first flight, and the
+  six open items (RESUME-restarts-at-WP-1, Fly-widget-inert-while-paused, mesh
+  staleness gate didn't fire, ground params hardcoded, low photo count,
+  heading/gimbal coupling). Updated `docs/RESUME-HERE.md`.
+- [~] Facade-heading behaviour flew without HMS overload and aimed on-target
+  98.6%, but PAUSE/RESUME's index behaviour and the heading/gimbal coupling are
+  open — do NOT yet treat the heading rewrite as fully trusted. See `ANALYSIS.md`.
 
 ## Known-open items NOT addressed tonight (not blocking, for awareness)
 
