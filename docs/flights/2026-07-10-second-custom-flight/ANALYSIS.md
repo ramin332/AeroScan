@@ -214,3 +214,138 @@ them, "the fix worked" is unfalsifiable.
   plan time (this mission: 9.23 mm/px against a 2.0 target); range-adaptive lens.
 - **Low photo count is closed as not-a-bug** — DJI's rosette serves multi-view stereo;
   NEN-2767 wants one perpendicular frame, and along-path overlap is already ~84%.
+
+## 2026-09-02 addendum — what the Manifold logs add, and one correction
+
+Source: the plaintext `psdk/PSDK-0073-01.log` for the 12:36 flight (`flight0073`,
+mission `20260710T103507Z_331`), chunk-file mtimes read directly on the Manifold,
+the day's five `*.summary.card.txt` (pulled to
+`flight-archive/2026-09-02-manifold-pull/`), and re-importing the flown KMZ into
+the planner. No photos — the SD card was not available — so nothing here
+re-measures aim; it measures what the aircraft *executed*.
+
+### Correction: the mesh was 2.2 h old, not 15 h. The staleness gate was right.
+
+Open item 3 above ("staleness gate did NOT fire … 15 h old mesh") is wrong, and
+it is wrong for the reason this document already warns about: slot **directory**
+mtimes lie. The chunk **files** do not. Read on the Manifold on 2026-09-02:
+
+| slot / subdir | chunks | chunk files written | slot dir mtime (lies) |
+|---|---|---|---|
+| `flight0070/1` | 10 | **2026-07-10 10:18 – 10:21** | 2026-07-09 20:27 |
+| `flight0066/2` | 5 | 2026-06-12 14:30 | 2026-07-10 10:33 |
+| `flight0072/2` | 13 | **2026-07-10 11:48 – 11:53** | 2026-07-10 11:38 |
+
+Two Smart3D scans ran on 2026-07-10: **10:18** (flight0070, subdir `1`) and
+**11:48** (flight0072, subdir `2`). The gate logged mesh ages of 253 s, 4726 s,
+5745 s, 8041 s across the day's augments — all consistent with a single 10:21
+mesh, all correctly under the 6 h limit. The gate did its job.
+
+The real defect is the `dji_perception/1` hardcode (`kmzrun_status.c:37,95`).
+Every augment after 11:53 — 11:56, 12:35, and 13:18 — should have picked
+flight0072 and picked flight0070 instead, because flight0072's chunks live in
+subdir `2`. What that cost, measured by importing the same 398-WP mission over
+each cloud with identical detection defaults: **9 facades** on flight0070 vs
+**181 facades** on flight0072. Same waypoints, same path, 20× the surface.
+
+### 104 commanded photos did not fire — the count is solid, the mechanism is not proven
+
+The evening addendum estimated "~80 shots never fired" from the filename gaps.
+The action-state callbacks in the PSDK log give the exact number:
+
+| | starts (state 1) | completions (state 5) | missing |
+|---|---|---|---|
+| action id 0 | 399 | 315 | **84** |
+| action id 1 | 315 | 295 | **20** |
+| action id 2 | 123 | 123 | 0 |
+| total | 837 | 733 | **104** |
+
+398 `takePhoto` commanded − 294 photos on the card = **104**. The totals coincide —
+but **do not read that as proof.** Per waypoint, 251 of 398 have an action that
+started with no completion callback, and that share is flat against leg time
+(63% on legs < 0.5 s, 69% on legs ≥ 1.0 s). The completion stream is an
+unreliable record, like the RESUME-index artifact. The photo shortfall is real;
+which waypoints lost their photo can only come from the card's `_wpNNN` names.
+
+Mechanism, from the same log: the aircraft flew at **2.94 m/s** (commanded
+`waypointSpeed=3.0`, the NEN-2767 preset in `frontend/src/store.ts:42`) over a
+**1.74 m** median waypoint spacing, giving **0.58 s** per waypoint. Waypoints
+carrying `gimbalRotate + takePhoto` dwelt only **0.12 s** longer than
+`takePhoto`-only ones (0.70 s vs 0.58 s). The aircraft does not wait for the
+action chain; with `reachPoint` triggers and no hover, whatever hasn't finished
+by the next waypoint is abandoned. This is distinct from the closed "rosette
+collapse" item — those photos were never commanded; these were commanded and
+lost. The dwell mechanism is the leading hypothesis (WPML: pass mode "will not
+stop at the point"), not a measured cause; stop mode is the documented way to
+remove it either way.
+
+### With yaw uncommanded, heading is the only azimuth actuator — and it lags
+
+`2bf3308` stops commanding gimbal yaw, so after it the camera's azimuth is
+exactly the nose's. That makes heading tracking the whole aim story. On this
+flight the commanded heading step per waypoint was **7.5° median, 28° p90,
+82° max**, at 0.6 s per waypoint — 47°/s at p90, in `smoothTransition` mode
+where the nose is always mid-interpolation at the shutter. The measured 14.4°
+median heading error is what that looks like. `schedule_headings()` — the
+rate-limited heading pursuit — exists and is tested, but
+`gimbal_rewrite.py:299` only runs it when `command_gimbal_yaw=True`, i.e. never
+on the path that now flies. The fix that removed the gimbal-yaw failure has made
+heading rate-limiting *more* necessary, and it is currently off.
+
+### GSD: in spec on the fresh mesh, not on the stale one
+
+Re-augmented offline on 2026-09-02 against the flight0072 mesh (221 facets after
+the polygon filter), the per-waypoint median standoff gives **1.97 mm/px** —
+inside the 2.0 target. The 5.01 mm/px figure quoted earlier that day was the
+import's nominal camera distance (18.34 m), not per-waypoint standoff. The
+399-WP mission's 9.23 mm/px at 33.8 m stands. MEDIUM_TELE at 18.34 m would be
+1.15 mm/px — in spec, zero extra flight time. Nothing at plan time flagged
+either. `validate.py` has 19 checks; none is GSD-vs-target.
+
+### `Aim 100%` on every summary card
+
+All five cards for the day read `Aim 100%`. The measured bearing error was
+35.4° median. The metric tests "facet inside the frame", which the WIDE lens's
+35.8° half-FOV makes nearly unfalsifiable. It is the FPV-feed trap, as a number.
+
+### We record no gimbal telemetry — this is why the SD card was the only evidence
+
+`kmz_runner.c:1180` subscribes to exactly one FC topic: `STATUS_FLIGHT`.
+`DJI_FC_SUBSCRIPTION_TOPIC_GIMBAL_ANGLES` and the aircraft attitude quaternion
+are available from the same API at 10–50 Hz and were never subscribed. Had they
+been logged alongside the waypoint-index callbacks, every question in the
+evening addendum would have been answerable from `/blackbox` the same day,
+without the card. The photos remain unarchived as of 2026-09-02.
+
+### Verdict changes
+
+- Open item 3 (staleness gate) → **withdrawn**; the gate was correct. The C
+  subdir hardcode is the sole cause and is still unfixed.
+- "~80 shots never fired" → **104, confirmed by FC callbacks; cause is 3 m/s
+  over 1.7 m spacing with no dwell.** A real bug, separate from the closed
+  rosette item.
+- New: heading rate-limiting is off on the flying path; with yaw uncommanded
+  that is the aim-quality lever.
+- New: no gimbal telemetry is logged. Highest-value instrumentation gap.
+
+### Picker redesign — measured offline the same day
+
+The greedy picker (nearest facet, wall bonus, one-step hysteresis, 60 m reach)
+on the fresh flight0072 mesh: 76 target switches, 23 reversals >90°, 79 picks
+disagreeing with their ±3 neighbours, standoff up to 31.4 m — waypoints over
+empty tarmac aiming across the lot. Replaced by whole-sequence assignment
+(Viterbi, switch cost scaled by the turn, coplanar slices = one target) with the
+reach capped at the standoff where GSD would be 2× target (14.6 m WIDE); out of
+reach → keep DJI's Smart3D pose. Switch-cost sweep on busboom:
+
+| config | target switches | flips >90° | blips | far | unaimed |
+|---|---|---|---|---|---|
+| greedy @60 m (shipped) | 76 | 23 | 1 | 39 | 0 |
+| viterbi @14.6 m, cost 4 (new default) | 54 | 14 | 0 | 0 | 7 |
+| viterbi @14.6 m, cost 16 | 36 | 14 | 0 | 0 | 16 |
+
+12 of the 14 residual reversals are handovers between the van and parked cars
+in the middle of the lot (van 13–14 m, car roof 9–12 m; the van wall stops
+facing the aircraft so a switch is forced). That is the venue, not the picker.
+`scripts/render_aim_audit.py` reproduces the pictures; `aim_audit()` numbers
+ship in the summary JSON and the Pilot 2 card (`flips N  far N`). Unflown.
