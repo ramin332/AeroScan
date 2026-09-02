@@ -558,6 +558,15 @@ def _cmd_kmz_to_json(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_slice_kmz(args: argparse.Namespace) -> int:
+    from .kmz_slice import slice_kmz
+    r = slice_kmz(args.kmz, args.out, from_wp=args.from_wp)
+    print(f"{args.out}: kept {r.kept} waypoints (dropped {r.dropped}), first was wp{r.first_original_index}, "
+          f"first pitch {r.first_pitch_deg} ({'injected' if r.first_pitch_injected else 'own'}), "
+          f"path {r.distance_m:.0f} m" if r.distance_m is not None else "")
+    return 0
+
+
 def _cmd_augment_mission(args: argparse.Namespace) -> int:
     intent_json: Optional[Path] = args.mission_json
     source_kmz: Optional[Path] = args.source_kmz
@@ -650,6 +659,17 @@ def build_parser() -> argparse.ArgumentParser:
     k.set_defaults(func=_cmd_kmz_to_json)
 
     # augment-mission
+    sk = sub.add_parser(
+        "slice-kmz",
+        help="Resume after a battery swap: write a copy of an augmented KMZ that starts at waypoint N "
+             "(0-based WPML index; the FC's currentWaypointIndex is 1-based, pass fc_index-1 to redo it). "
+             "Photo names keep their original wpNNN numbers.",
+    )
+    sk.add_argument("--kmz", type=Path, required=True, help="augmented KMZ (lean or full)")
+    sk.add_argument("--from-wp", type=int, required=True)
+    sk.add_argument("--out", type=Path, required=True)
+    sk.set_defaults(func=_cmd_slice_kmz)
+
     am = sub.add_parser(
         "augment-mission",
         help="Take a mission-intent JSON + Manifold flight; produce an NEN-2767 augmented KMZ.",

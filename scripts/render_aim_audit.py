@@ -24,7 +24,7 @@ import numpy as np
 
 from flight_planner import cli
 from flight_planner.camera import compute_distance_for_gsd, get_camera
-from flight_planner.gimbal_rewrite import aim_audit, rewrite_gimbals_perpendicular
+from flight_planner.gimbal_rewrite import aim_audit, plane_groups, rewrite_gimbals_perpendicular
 from flight_planner.kmz_import import facades_from_pointcloud_cgal, filter_facades_by_polygon, polygon_to_enu
 from flight_planner.manifold import from_manifold, register_to_kmz_frame
 from flight_planner.mission_intent import read_intent_json
@@ -73,15 +73,19 @@ def main() -> int:
     NZ = np.array([abs(float(f.normal[2])) for f in fac])
     kind = lambda i: "wall" if NZ[i] <= .35 else ("roof" if NZ[i] >= .7 else "tilted")
     KC = {"wall": "#2a78d6", "roof": "#d03b3b", "tilted": "#eda100"}
+    # Flags are target-aware: two slices of one wall are one target (plane
+    # group), so hopping between them is neither a dispute nor a reversal.
+    grp = plane_groups(fac)
+    g = np.array([grp[p] if p >= 0 else -1 for p in pick])
     k = 3; disputed = set()
     for i in range(n):
-        win = [pick[j] for j in range(max(0, i - k), min(n, i + k + 1)) if j != i and pick[j] >= 0]
-        if pick[i] >= 0 and win:
+        win = [g[j] for j in range(max(0, i - k), min(n, i + k + 1)) if j != i and g[j] >= 0]
+        if g[i] >= 0 and win:
             m, c = Counter(win).most_common(1)[0]
-            if c >= k and pick[i] != m:
+            if c >= k and g[i] != m:
                 disputed.add(i)
     hd = np.array([w.heading_deg for w in out]); dh = np.abs((np.diff(hd) + 180) % 360 - 180)
-    rev = set(np.where(dh > 90)[0] + 1)
+    rev = {i for i in np.where(dh > 90)[0] + 1 if g[i] != g[i - 1]}
     used = Counter(int(p) for p in pick if p >= 0)
 
     rng = np.random.default_rng(0)
