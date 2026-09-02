@@ -69,10 +69,16 @@ data class ImportedKmz(
     /** mission area polygon as [lon, lat, alt] triples, WGS84. */
     val missionAreaWgs84: List<DoubleArray>,
 ) {
-    fun toJsonString(pretty: Boolean = false): String {
+    /**
+     * [allowStaleMesh]: the pilot chose to augment against a scan older than the
+     * Manifold's age limit (6 h). The C runner greps this key and bypasses its
+     * gate; the Python side ignores unknown keys.
+     */
+    fun toJsonString(pretty: Boolean = false, allowStaleMesh: Boolean = false): String {
         val obj = JSONObject().apply {
             put("schema_version", MissionIntent.SCHEMA_VERSION)
             put("name", name)
+            if (allowStaleMesh) put("allow_stale_mesh", true)
             val ref = JSONObject().apply {
                 put("lat", refLat); put("lon", refLon); put("alt", refAlt)
             }

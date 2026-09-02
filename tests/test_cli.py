@@ -289,3 +289,12 @@ def test_parser_augment_defaults_to_stop_at_waypoint():
     assert args.fly_through is False
     args = p.parse_args(["augment-mission", "--mission-json", "m.json", "--output-kmz", "o.kmz", "--fly-through"])
     assert args.fly_through is True
+
+
+def test_intent_ignores_unknown_keys_such_as_allow_stale_mesh():
+    """rc-companion adds "allow_stale_mesh": true for the Manifold's C gate;
+    the Python side must simply ignore keys it does not know."""
+    d = imported_kmz_to_intent_dict(_sample_imported_kmz())
+    d["allow_stale_mesh"] = True
+    k = intent_dict_to_imported_kmz(d)
+    assert k.name == "TestSite" and len(k.waypoints) == 2

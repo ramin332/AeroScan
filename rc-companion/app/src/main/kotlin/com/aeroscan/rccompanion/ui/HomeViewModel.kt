@@ -102,6 +102,15 @@ fun missionSuffix(s: AugmentFraming.ManifoldStatus): String = when (s.missionSta
     else -> ""
 }
 
+/** "8 w", "3 d", "5 h", "20 min" — how old the newest scan is. */
+fun ageText(seconds: Long): String = when {
+    seconds < 0 -> "?"
+    seconds < 3600 -> "${seconds / 60} min"
+    seconds < 2 * 86400 -> "${seconds / 3600} h"
+    seconds < 14 * 86400 -> "${seconds / 86400} d"
+    else -> "${seconds / (7 * 86400)} w"
+}
+
 fun bannerFor(result: StatusSession.Result): BannerState = when (result) {
     is StatusSession.Result.Unreachable ->
         BannerState.Unreachable(
@@ -115,7 +124,12 @@ fun bannerFor(result: StatusSession.Result): BannerState = when (result) {
         val mission = missionSuffix(s)
         when {
             !s.envOk -> BannerState.EnvError("env error: ${s.envDetail}$mission")
-            !s.meshPresent -> BannerState.NoMesh("Not ready — run auto-explore first ${s.latestFlight}$mission")
+            !s.meshPresent -> BannerState.NoMesh(
+                if (s.meshStale)
+                    "Newest scan ${s.meshFlight} is ${ageText(s.meshAgeS)} old (limit 6 h) — fly a new Smart3D scan, " +
+                        "or switch on 'Use old scan' to augment against it anyway$mission"
+                else "No scan on the drone — fly a Smart3D scan, then augment$mission",
+            )
             else -> {
                 val pts = if (s.nPoints >= 1_000_000) "%.1fM pts".format(s.nPoints / 1e6)
                     else "${s.nPoints} pts"
@@ -214,6 +228,15 @@ class HomeViewModel(app: Application) : AndroidViewModel(app) {
 
     /** Last parsed STAT, for the "replace interrupted mission?" confirmation. */
     private var lastStatus: AugmentFraming.ManifoldStatus? = null
+
+    /** Pilot's choice to augment against a scan older than the Manifold's limit. */
+    private val _allowStaleMesh = MutableStateFlow(false)
+    val allowStaleMesh: StateFlow<Boolean> = _allowStaleMesh.asStateFlow()
+    fun setAllowStaleMesh(v: Boolean) { _allowStaleMesh.value = v }
+
+    /** True when the Manifold has a scan but it is past the age limit — shows the toggle. */
+    private val _staleMeshAvailable = MutableStateFlow(false)
+    val staleMeshAvailable: StateFlow<Boolean> = _staleMeshAvailable.asStateFlow()
     /** Mission id the pilot has already agreed to replace (two-tap confirm). */
     private var replaceAcknowledgedFor: String? = null
 
@@ -255,8 +278,10 @@ class HomeViewModel(app: Application) : AndroidViewModel(app) {
         // Fail fast on a known-bad readiness state (from the PING/STAT banner) —
         // don't upload a KMZ and run a doomed ~2-min augment when the Manifold has
         // already told us it can't succeed (no mesh / bad env / unreachable).
+        val useStaleMesh = _allowStaleMesh.value && (lastStatus?.meshStale == true)
         val blockReason: String? = when (val b = banner.value) {
-            is BannerState.NoMesh -> "No mesh on the latest flight — fly a Smart3D scan, then augment."
+            is BannerState.NoMesh -> if (useStaleMesh) null
+                else "No fresh scan on the drone — fly a Smart3D scan, or switch on 'Use old scan' in the banner."
             is BannerState.EnvError -> "Manifold env not ready (${b.label}). Augment can't run."
             is BannerState.Unreachable -> "AeroScan app not running on the drone — enable it in DJI Pilot 2 (camera view → payload panel) and wait for the banner to turn green."
             else -> null  // Idle / Checking / Ready — proceed
@@ -386,7 +411,7 @@ class HomeViewModel(app: Application) : AndroidViewModel(app) {
                 }
             }
 
-            sess.sendAndAwaitPreview(intent, fingerprintBytes)
+            sess.sendAndAwaitPreview(intent, fingerprintBytes, allowStaleMesh = useStaleMesh)
         }
     }
 
@@ -429,6 +454,7 @@ class HomeViewModel(app: Application) : AndroidViewModel(app) {
             while (true) {
                 val q = StatusSession().query()
                 lastStatus = (q as? StatusSession.Result.Ok)?.status
+                _staleMeshAvailable.value = lastStatus?.meshStale == true
                 val result = bannerFor(q)
                 _banner.value = result
                 val wait = nextPollDelayMs(result) ?: break

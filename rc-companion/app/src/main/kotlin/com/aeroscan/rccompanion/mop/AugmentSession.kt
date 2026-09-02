@@ -72,6 +72,7 @@ class AugmentSession(
     suspend fun sendAndAwaitPreview(
         intent: ImportedKmz,
         cloudFingerprintPly: ByteArray,
+        allowStaleMesh: Boolean = false,
     ): Event = withContext(Dispatchers.IO) {
         try {
             _events.emit(Event.Connecting)
@@ -90,7 +91,7 @@ class AugmentSession(
             pipeline = pl
 
             // ---- AUGM uplink -----------------------------------------------------
-            val intentJson = intent.toJsonString().toByteArray(Charsets.UTF_8)
+            val intentJson = intent.toJsonString(allowStaleMesh = allowStaleMesh).toByteArray(Charsets.UTF_8)
             val body = AugmentFraming.buildAugmBody(intentJson, cloudFingerprintPly)
             val frame = AugmentFraming.frame(MopConstants.MAGIC_AUGM, body)
             writeAll(pl, frame) { sent -> _events.tryEmit(Event.Sending(sent, frame.size.toLong())) }

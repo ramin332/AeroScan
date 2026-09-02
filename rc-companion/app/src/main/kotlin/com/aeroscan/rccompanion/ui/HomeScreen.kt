@@ -3,6 +3,7 @@ package com.aeroscan.rccompanion.ui
 import android.content.Intent
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -17,11 +18,13 @@ import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
@@ -36,6 +39,8 @@ fun HomeScreen(viewModel: HomeViewModel = viewModel()) {
     val ui by viewModel.ui.collectAsStateWithLifecycle()
     val conn by viewModel.connection.collectAsStateWithLifecycle()
     val banner by viewModel.banner.collectAsStateWithLifecycle()
+    val allowStale by viewModel.allowStaleMesh.collectAsStateWithLifecycle()
+    val staleAvailable by viewModel.staleMeshAvailable.collectAsStateWithLifecycle()
     val ctx = LocalContext.current
 
     val pick = rememberKmzPicker { viewModel.onFilePicked(it) }
@@ -62,7 +67,11 @@ fun HomeScreen(viewModel: HomeViewModel = viewModel()) {
         ) {
             Text("AeroScan RC", style = MaterialTheme.typography.headlineMedium)
             ConnectionBanner(conn)
-            ReadinessBanner(state = banner, onRefresh = viewModel::checkStatus)
+            ReadinessBanner(
+                state = banner, onRefresh = viewModel::checkStatus,
+                showStaleToggle = staleAvailable, allowStale = allowStale,
+                onAllowStale = viewModel::setAllowStaleMesh,
+            )
 
             when (val s = ui) {
                 is HomeViewModel.UiState.Idle -> IdleCard(onPick = pick)
@@ -134,7 +143,13 @@ private fun ConnectionBanner(state: Connection.State) {
 }
 
 @Composable
-private fun ReadinessBanner(state: BannerState, onRefresh: () -> Unit) {
+private fun ReadinessBanner(
+    state: BannerState,
+    onRefresh: () -> Unit,
+    showStaleToggle: Boolean = false,
+    allowStale: Boolean = false,
+    onAllowStale: (Boolean) -> Unit = {},
+) {
     // Colour + glyph encode the readiness verdict at a glance. Greens/reds are
     // explicit hex (not theme roles) so the verdict reads the same regardless
     // of the active Material colour scheme.
@@ -159,6 +174,16 @@ private fun ReadinessBanner(state: BannerState, onRefresh: () -> Unit) {
                 color = Color.White,
                 style = MaterialTheme.typography.bodyMedium,
             )
+            if (showStaleToggle) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Switch(checked = allowStale, onCheckedChange = onAllowStale)
+                    Text(
+                        "  Use old scan anyway (you accept a possibly outdated building model)",
+                        color = Color.White,
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                }
+            }
             TextButton(
                 onClick = onRefresh,
                 enabled = state !is BannerState.Checking,

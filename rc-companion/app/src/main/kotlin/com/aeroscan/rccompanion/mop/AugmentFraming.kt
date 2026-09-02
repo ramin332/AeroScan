@@ -119,7 +119,14 @@ object AugmentFraming {
         val missionLastIndex: Int = 0,
         val missionTotal: Int = 0,
         val missionResumeFrom: Int = -1,    // 0-based waypoint a Continue would slice at; -1 = none
+        // Newest mesh on disk regardless of the age gate (2026-09-02). mesh_present
+        // stays "exists AND fresh"; these let the pilot knowingly use an old scan.
+        val meshExists: Boolean = false,
+        val meshAgeS: Long = -1,
+        val meshFlight: String = "",
     ) {
+        /** A scan exists but is past the Manifold's age limit. */
+        val meshStale: Boolean get() = meshExists && !meshPresent
         val interrupted: Boolean get() = missionState == "interrupted" && missionResumeFrom >= 0
     }
 
@@ -149,6 +156,9 @@ object AugmentFraming {
             missionLastIndex = o.optInt("mission_last_index", 0),
             missionTotal = o.optInt("mission_total", 0),
             missionResumeFrom = o.optInt("mission_resume_from", -1),
+            meshExists = o.optBoolean("mesh_exists", false),
+            meshAgeS = o.optLong("mesh_age_s", -1L),
+            meshFlight = o.optString("mesh_flight", ""),
         )
     }
 
