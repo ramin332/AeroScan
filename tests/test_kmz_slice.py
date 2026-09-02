@@ -96,7 +96,7 @@ def test_distance_and_duration_are_recomputed_and_polygon_kept(tmp_path):
     td = float(re.search(r"<wpml:duration>([\d.]+)<", fd["wpmz/waylines.wpml"]).group(1))
     # 4 kept waypoints = 3 legs of the fixture's 1e-4° lat/lon steps (~12.97 m each, geodesic)
     assert abs(dd - 3 * 12.97) < 0.5
-    assert abs(td / ts - dd / ds) < 1e-6      # duration scaled with distance
+    assert abs(td / ts - dd / ds) < 1e-3      # duration scaled with distance (file rounds to 3 decimals)
     # bundled resources (cloud, geo desc) and non-waypoint placemarks survive untouched
     assert set(fs) == set(fd)
 
