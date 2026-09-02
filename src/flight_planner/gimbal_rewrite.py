@@ -171,6 +171,177 @@ def _pick_facade_for_waypoint(
     return best
 
 
+def plane_groups(
+    facades: Sequence[Facade],
+    *,
+    parallel_tol_deg: float = 5.0,
+    coplanar_tol_m: float = 0.5,
+) -> list[int]:
+    """Group index per facet: facets that lie in (nearly) the same plane share a
+    group. Two stacked slices of one wall are one target for the switch cost —
+    hopping between them changes pitch, not where the aircraft looks — while a
+    perpendicular wall round the corner is a different target.
+
+    Why: CGAL region growing is tuned for many small facets (NEN-2767 wants the
+    gimbal to square up on sills and panels), so a 7 m wall arrives as ~7 slices
+    1–2 m² each. On busboom the greedy picker hopped between those slices and
+    that alone accounted for a large share of its 76 target switches.
+    """
+    n = len(facades)
+    parent = list(range(n))
+
+    def find(a):
+        while parent[a] != a:
+            parent[a] = parent[parent[a]]
+            a = parent[a]
+        return a
+
+    N = np.array([_unit(np.asarray(f.normal, float)) for f in facades]).reshape(n, 3)
+    C = np.array([np.asarray(f.center, float) for f in facades]).reshape(n, 3)
+    cos_tol = math.cos(math.radians(parallel_tol_deg))
+    for i in range(n):
+        for j in range(i + 1, n):
+            if abs(float(N[i] @ N[j])) < cos_tol:
+                continue
+            if abs(float((C[j] - C[i]) @ N[i])) > coplanar_tol_m:
+                continue
+            ra, rb = find(i), find(j)
+            if ra != rb:
+                parent[rb] = ra
+    roots = [find(i) for i in range(n)]
+    remap = {r: k for k, r in enumerate(dict.fromkeys(roots))}
+    return [remap[r] for r in roots]
+
+
+def assign_facades_viterbi(
+    waypoints: Sequence[Waypoint],
+    facades: Sequence[Facade],
+    *,
+    max_distance_m: float,
+    wall_distance_bonus: float = 0.5,
+    switch_cost: float = 4.0,
+    pitch_soft_deg: float = 45.0,
+    groups: Sequence[int] | None = None,
+) -> list[int]:
+    """Choose a facet (or -1 = keep DJI's pose) for every waypoint by minimising
+    the cost of the whole sequence — Viterbi over waypoints.
+
+    Per-waypoint cost is the greedy picker's metric (3D distance, walls at
+    ``wall_distance_bonus``) plus a soft penalty once the required pitch passes
+    ``pitch_soft_deg``. "No target" costs ``max_distance_m``, so any reachable
+    facet inside the cap beats it and nothing outside the cap is ever chosen.
+
+    Changing target costs ``switch_cost × (1 + turn/90°)`` where ``turn`` is the
+    bearing change the nose would have to make at that waypoint; facets in the
+    same plane group cost nothing to switch between. That is what "look ahead and
+    behind" means here: a one-waypoint decoy can never win because entering and
+    leaving it costs more than it saves, and a corner is crossed once, where the
+    accumulated gain finally exceeds the turn.
+
+    Complexity O(N·F²) vectorised; 398 × 201 facets runs in well under a second.
+    """
+    N = len(waypoints)
+    F = len(facades)
+    if N == 0:
+        return []
+    if F == 0:
+        return [-1] * N
+    C = np.array([np.asarray(f.center, float) for f in facades]).reshape(F, 3)
+    Nn = np.array([_unit(np.asarray(f.normal, float)) for f in facades]).reshape(F, 3)
+    is_wall = np.array([(f.label or "").startswith("wall_") for f in facades])
+    weight = np.where(is_wall, wall_distance_bonus, 1.0)
+    grp = np.asarray(groups if groups is not None else plane_groups(facades))
+    # state F == "none"; give it its own group so none↔facet counts as a switch
+    G = np.append(grp, -1)
+    same_group = G[:, None] == G[None, :]
+
+    INF = float("inf")
+    P = np.array([[w.x, w.y, w.z] for w in waypoints], float)
+    node = np.full((N, F + 1), INF)
+    bearing = np.full((N, F + 1), np.nan)
+    for i in range(N):
+        d3 = P[i] - C
+        dist = np.linalg.norm(d3, axis=1)
+        signed = np.einsum("ij,ij->i", d3, Nn)
+        valid = (signed > 0) & (dist <= max_distance_m) & (dist > 1e-6)
+        horiz = np.hypot(d3[:, 0], d3[:, 1])
+        pitch = np.degrees(np.arctan2(-d3[:, 2], horiz))  # camera pitch to look at the centre
+        pen = np.maximum(0.0, np.abs(pitch) - pitch_soft_deg) / pitch_soft_deg
+        cost = dist * weight * (1.0 + pen)
+        node[i, :F] = np.where(valid, cost, INF)
+        node[i, F] = max_distance_m
+        b = np.degrees(np.arctan2(-d3[:, 0], -d3[:, 1]))     # bearing WP → facet, from north
+        bearing[i, :F] = np.where(valid, b, np.nan)
+
+    total = node[0].copy()
+    back = np.zeros((N, F + 1), dtype=np.int32)
+    for i in range(1, N):
+        b = bearing[i]
+        turn = np.abs(_wrap180(b[:, None] - b[None, :]))
+        turn = np.where(np.isnan(turn), 90.0, turn)           # none↔facet: a middling turn
+        T = np.where(same_group, 0.0, switch_cost * (1.0 + turn / 90.0))
+        cand = total[:, None] + T                              # [from, to]
+        back[i] = np.argmin(cand, axis=0)
+        total = node[i] + cand[back[i], np.arange(F + 1)]
+    picks = [0] * N
+    s = int(np.argmin(total))
+    for i in range(N - 1, -1, -1):
+        picks[i] = -1 if s == F else s
+        s = int(back[i, s])
+    return picks
+
+
+def aim_audit(
+    waypoints: Sequence[Waypoint],
+    facades: Sequence[Facade],
+    *,
+    far_standoff_m: float,
+) -> dict:
+    """Plan-time numbers for "is the gimbal about to point at the wrong thing":
+    picks further than ``far_standoff_m``, aim reversals >90° between adjacent
+    waypoints, target switches, single-waypoint blips (A→B→A), and unaimed
+    waypoints. These are the four things the 2026-07-10 picture showed."""
+    picks = [w.facade_index for w in waypoints]
+    n = len(picks)
+    standoff = []
+    far = 0
+    for w in waypoints:
+        if w.facade_index is None or w.facade_index < 0 or w.facade_index >= len(facades):
+            continue
+        c = np.asarray(facades[w.facade_index].center, float)
+        d = float(np.linalg.norm(np.array([w.x, w.y, w.z]) - c))
+        standoff.append(d)
+        if d > far_standoff_m:
+            far += 1
+    hd = np.array([w.heading_deg for w in waypoints], float)
+    dh = np.abs(_wrap180(np.diff(hd))) if n > 1 else np.zeros(0)
+    rev = int(np.sum(dh > 90.0))
+    switches = sum(1 for a, b in zip(picks, picks[1:]) if a != b)
+    blips = sum(1 for i in range(1, n - 1) if picks[i - 1] == picks[i + 1] != picks[i])
+    # Target-aware versions: slices of one plane are one target, so a hop between
+    # them is not a switch; and a >90° heading change while tracking the same
+    # target is the trajectory (orbiting close), not the picker.
+    grp = plane_groups(facades) if len(facades) else []
+    g = [grp[p] if (p is not None and 0 <= p < len(grp)) else -1 for p in picks]
+    group_switches = sum(1 for a, b in zip(g, g[1:]) if a != b)
+    rev_with_change = int(sum(1 for i in range(1, n) if dh[i - 1] > 90.0 and g[i] != g[i - 1]))
+    group_blips = sum(1 for i in range(1, n - 1) if g[i - 1] == g[i + 1] != g[i])
+    return {
+        "far_picks": far,
+        "far_standoff_m": far_standoff_m,
+        "reversals_gt90": rev,
+        "reversals_with_target_change": rev_with_change,
+        "switches": switches,
+        "target_switches": group_switches,
+        "single_blips": blips,
+        "target_blips": group_blips,
+        "unaimed": sum(1 for p in picks if p is None or p < 0),
+        "distinct_targets": len({p for p in picks if p is not None and p >= 0}),
+        "standoff_p90_m": float(np.percentile(standoff, 90)) if standoff else None,
+        "standoff_max_m": float(max(standoff)) if standoff else None,
+    }
+
+
 def rewrite_gimbals_perpendicular(
     waypoints: list[Waypoint],
     facades: list[Facade],
@@ -183,6 +354,8 @@ def rewrite_gimbals_perpendicular(
     yaw_rate_deg_per_s: float = 60.0,
     heading_rate_fraction: float = 0.5,
     command_gimbal_yaw: bool = False,
+    assign_mode: str = "viterbi",
+    switch_cost: float = 4.0,
 ) -> list[Waypoint]:
     """Rewrite ``gimbal_pitch_deg`` / ``gimbal_yaw_deg`` so each waypoint
     photographs the nearest facade head-on.
@@ -236,24 +409,53 @@ def rewrite_gimbals_perpendicular(
 
         True restores the old absolute-north yaw command, with the heading
         scheduled so the required pan stays within ``max_gimbal_pan_deg``.
+    assign_mode
+        ``"viterbi"`` (default): choose targets for the whole sequence at once
+        (``assign_facades_viterbi``) — looks ahead and behind, so one-waypoint
+        blips and corner ping-pong cannot happen. ``"greedy"``: the previous
+        per-waypoint nearest-facet picker with ``switch_ratio`` hysteresis.
+    switch_cost
+        Viterbi only. Cost of changing target, scaled by the turn it demands.
+        Measured on busboom (2026-09-02): greedy produced 76 switches and 23
+        reversals >90° on 398 waypoints; 4.0 (in weighted metres) is the value
+        that removes the blips without pinning the aim to a wall it has passed.
+
+    Waypoints with no facet inside ``max_distance_m`` keep DJI's own gimbal pose
+    and heading — Smart3D already pointed them at the target — rather than
+    grabbing whatever is furthest away that still qualifies. On busboom the old
+    60 m cap let waypoints over empty tarmac aim 20–31 m across the lot.
 
     Returns a new list of Waypoints; input list is not mutated.
     """
+    if assign_mode not in ("viterbi", "greedy"):
+        raise ValueError(f"assign_mode must be 'viterbi' or 'greedy', got {assign_mode!r}")
+    seq_picks: list[int] | None = None
+    if assign_mode == "viterbi":
+        seq_picks = assign_facades_viterbi(
+            waypoints, facades,
+            max_distance_m=max_distance_m,
+            wall_distance_bonus=wall_distance_bonus,
+            switch_cost=switch_cost,
+        )
     pitch_min = GIMBAL_TILT_MIN_DEG + pitch_margin_deg
     pitch_max = GIMBAL_TILT_MAX_DEG - pitch_margin_deg
 
     out: list[Waypoint] = []
     previous_index: int | None = None
-    for wp in waypoints:
+    for wi, wp in enumerate(waypoints):
         pos = np.array([wp.x, wp.y, wp.z], dtype=np.float64)
-        pick = _pick_facade_for_waypoint(
-            pos,
-            facades,
-            max_distance_m,
-            wall_distance_bonus=wall_distance_bonus,
-            previous_index=previous_index,
-            switch_ratio=switch_ratio,
-        )
+        if seq_picks is not None:
+            si = seq_picks[wi]
+            pick = None if si < 0 else (si, float(np.linalg.norm(np.asarray(facades[si].center, float) - pos)))
+        else:
+            pick = _pick_facade_for_waypoint(
+                pos,
+                facades,
+                max_distance_m,
+                wall_distance_bonus=wall_distance_bonus,
+                previous_index=previous_index,
+                switch_ratio=switch_ratio,
+            )
         if pick is None:
             out.append(replace(wp, facade_index=wp.facade_index))
             continue

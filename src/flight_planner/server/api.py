@@ -786,6 +786,8 @@ class MissionParams(BaseModel):
     yaw_rate_deg_per_s: float = Field(60.0, ge=30.0, le=120.0)
     # Flight mode
     stop_at_waypoint: bool = False  # False = fly-through (faster, M4E mech shutter)
+    # Fly-through only: min leg time for gimbalRotate+takePhoto to finish.
+    min_action_dwell_s: float = Field(1.0, ge=0.0, le=5.0)
     # XML-slimming knobs: skip gimbalRotate / rotateYaw actions whose pose is
     # within threshold of the previously emitted one. Cuts XML ~50% on dense
     # facade sweeps where pose is constant within a row.
@@ -2591,6 +2593,7 @@ def generate(request: GenerateRequest):
         min_photo_distance_m=request.mission.min_photo_distance_m,
         yaw_rate_deg_per_s=request.mission.yaw_rate_deg_per_s,
         stop_at_waypoint=request.mission.stop_at_waypoint,
+        min_action_dwell_s=request.mission.min_action_dwell_s,
         gimbal_dedup_threshold_deg=request.mission.gimbal_dedup_threshold_deg,
         heading_dedup_threshold_deg=request.mission.heading_dedup_threshold_deg,
         rc_lost_action=request.mission.rc_lost_action,
@@ -2959,12 +2962,19 @@ def download_kmz(version_id: str):
 
 # NEN-2767 flight post-processing hardcoded constants (see /rewrite-gimbals).
 _DJI_PINNED_SPEED_MS = 3.0
-_DJI_PINNED_MAX_FACADE_DIST_M = 60.0
+# Reach derived from the GSD target (see cli._NEN_MAX_STANDOFF_GSD_FACTOR); the
+# old flat 60 m let waypoints aim 20–31 m across empty space on busboom.
+_DJI_PINNED_MAX_STANDOFF_GSD_FACTOR = 2.0
 _DJI_PINNED_PITCH_MARGIN_DEG = 2.0
 
 
 @router.post("/versions/{version_id}/rewrite-gimbals")
-def rewrite_gimbals(version_id: str):
+def rewrite_gimbals(
+    version_id: str,
+    assign_mode: Literal["viterbi", "greedy"] = "viterbi",
+    switch_cost: float = 4.0,
+    max_facade_distance_m: float | None = None,
+):
     """Produce the ``dji_pinned`` snapshot from a DJI-imported version:
     keep DJI's trajectory, re-aim every gimbal perpendicular to the nearest
     outward-facing facade, strip the 5-pose SmartOblique rosette to one
@@ -2985,12 +2995,19 @@ def rewrite_gimbals(version_id: str):
             detail="Source version has no facades. Run facade extraction first.",
         )
 
+    if max_facade_distance_m is None:
+        from ..camera import compute_distance_for_gsd, get_camera
+        from ..models import CameraName as _Cam, MissionConfig as _MC
+        max_facade_distance_m = float(compute_distance_for_gsd(
+            get_camera(_Cam.WIDE), _MC().target_gsd_mm_per_px * _DJI_PINNED_MAX_STANDOFF_GSD_FACTOR))
     new_waypoints = rewrite_gimbals_perpendicular(
         waypoints=version.waypoints,
         facades=version.building.facades,
-        max_distance_m=_DJI_PINNED_MAX_FACADE_DIST_M,
+        max_distance_m=max_facade_distance_m,
         pitch_margin_deg=_DJI_PINNED_PITCH_MARGIN_DEG,
         preserve_heading=True,
+        assign_mode=assign_mode,
+        switch_cost=switch_cost,
     )
 
     from ..models import ActionType as _ActionType, CameraAction as _CameraAction, CameraName as _CameraName

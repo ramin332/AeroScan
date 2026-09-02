@@ -10,8 +10,11 @@ from dataclasses import dataclass, field
 from enum import Enum
 
 from .models import (
+    CAMERAS,
     AlgorithmConfig,
+    CameraName,
     ExclusionZone,
+    Facade,
     GIMBAL_PAN_MAX_DEG,
     GIMBAL_PAN_MIN_DEG,
     GIMBAL_TILT_MAX_DEG,
@@ -25,6 +28,37 @@ from .models import (
     MissionConfig,
     Waypoint,
 )
+
+
+def _aimed_standoffs_m(waypoints: list[Waypoint], facades: list[Facade]) -> list[float]:
+    """3D distance from each aimed inspection waypoint to its facade's centroid."""
+    out: list[float] = []
+    for wp in waypoints:
+        if wp.is_transition or wp.facade_index is None or wp.facade_index < 0:
+            continue
+        if wp.facade_index >= len(facades):
+            continue
+        c = facades[wp.facade_index].center
+        out.append(math.sqrt((wp.x - c[0]) ** 2 + (wp.y - c[1]) ** 2 + (wp.z - c[2]) ** 2))
+    return out
+
+
+def median_gsd_mm_per_px(
+    waypoints: list[Waypoint],
+    facades: list[Facade],
+    camera: CameraName,
+) -> float | None:
+    """Median GSD the mission will actually shoot at, from each aimed waypoint's
+    standoff to its facade. None when no waypoint is aimed at a facade.
+
+    This is the number the 2026-07-10 cards never showed: 18.34 m on the WIDE
+    lens is 5.01 mm/px against a 2.0 target, and 33.8 m is 9.23 mm/px."""
+    from .camera import compute_gsd, get_camera
+    d = _aimed_standoffs_m(waypoints, facades)
+    if not d:
+        return None
+    d.sort()
+    return float(compute_gsd(get_camera(camera), d[len(d) // 2]))
 
 
 class Severity(str, Enum):
@@ -160,6 +194,87 @@ def validate_mission(
             message=f"{len(too_close_wps)} photo waypoints are too close for camera interval ({min_interval}s at {config.flight_speed_ms}m/s)",
             waypoint_indices=too_close_wps[:5],
         ))
+
+    # --- Fly-through execution gates ---
+    #
+    # In fly-through mode (WPML toPointAndPassWithContinuityCurvature, "the
+    # aircraft will not stop at the point") each waypoint's action chain and
+    # heading turn have only the leg time to complete. Measured 2026-07-10:
+    # 0.58 s legs lost 104/398 photos and left the nose 14° behind its command.
+    # In stop mode (toPointAndStop*) the aircraft stops, so both always finish.
+    if not config.stop_at_waypoint:
+        short_dwell: list[int] = []
+        unreachable: list[int] = []
+        worst_step = 0.0
+        for i in range(1, len(waypoints)):
+            a, b = waypoints[i - 1], waypoints[i]
+            leg_m = math.sqrt((b.x - a.x) ** 2 + (b.y - a.y) ** 2 + (b.z - a.z) ** 2)
+            speed = b.speed_ms if b.speed_ms and b.speed_ms > 0 else config.flight_speed_ms
+            leg_s = leg_m / speed if speed > 0 else float("inf")
+            if not b.is_transition and b.actions and leg_s < config.min_action_dwell_s:
+                short_dwell.append(b.index)
+            step = abs(b.heading_deg - a.heading_deg) % 360.0
+            if step > 180.0:
+                step = 360.0 - step
+            if config.yaw_rate_deg_per_s > 0 and step / config.yaw_rate_deg_per_s > leg_s:
+                unreachable.append(b.index)
+                worst_step = max(worst_step, step)
+        if short_dwell:
+            issues.append(ValidationIssue(
+                severity=Severity.WARNING,
+                code="action_dwell_too_short",
+                message=(
+                    f"{len(short_dwell)} waypoint(s) give the camera less than "
+                    f"{config.min_action_dwell_s:.1f}s to rotate + shoot before the next waypoint "
+                    f"— photos will be skipped (2026-07-10: 104 of 398 lost at 0.58s). "
+                    f"Enable stop-at-waypoint or fly slower."
+                ),
+                waypoint_indices=short_dwell,
+            ))
+        if unreachable:
+            issues.append(ValidationIssue(
+                severity=Severity.WARNING,
+                code="heading_step_unreachable",
+                message=(
+                    f"{len(unreachable)} waypoint(s) demand a heading change the airframe cannot "
+                    f"finish within the leg at {config.yaw_rate_deg_per_s:.0f}°/s (worst step "
+                    f"{worst_step:.0f}°) — the nose, and with it the camera, arrives late. "
+                    f"Enable stop-at-waypoint or fly slower."
+                ),
+                waypoint_indices=unreachable,
+            ))
+
+    # --- GSD vs target ---
+    # The planner sets standoff from the target GSD, but KMZ-imported and
+    # augmented missions fly DJI's trajectory at whatever standoff it has.
+    # Nothing flagged 9.23 mm/px (33.8 m) or 5.01 mm/px (18.34 m) against a
+    # 2.0 target on 2026-07-10. Warn at 25% over target and name the lens that
+    # would meet it at the same standoff — zero flight-time cost.
+    if building is not None and building.facades:
+        from .camera import compute_gsd, get_camera
+        standoffs = _aimed_standoffs_m(inspection_wps, building.facades)
+        if standoffs:
+            standoffs.sort()
+            median_d = standoffs[len(standoffs) // 2]
+            gsd = compute_gsd(get_camera(config.camera), median_d)
+            if gsd > config.target_gsd_mm_per_px * 1.25:
+                better = next(
+                    (name.value for name, spec in CAMERAS.items()
+                     if compute_gsd(spec, median_d) <= config.target_gsd_mm_per_px),
+                    None,
+                )
+                hint = (
+                    f"; {better} would give {compute_gsd(CAMERAS[CameraName(better)], median_d):.2f} mm/px at the same standoff"
+                    if better else "; no M4E lens meets the target at this standoff — fly closer"
+                )
+                issues.append(ValidationIssue(
+                    severity=Severity.WARNING,
+                    code="gsd_out_of_spec",
+                    message=(
+                        f"Median standoff {median_d:.1f}m on {config.camera.value} shoots "
+                        f"{gsd:.1f} mm/px against a {config.target_gsd_mm_per_px:.1f} mm/px target{hint}"
+                    ),
+                ))
 
     # Flight time estimate (including yaw time at heading changes)
     total_dist = sum(

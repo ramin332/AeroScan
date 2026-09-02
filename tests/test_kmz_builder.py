@@ -570,3 +570,17 @@ class TestActionIdRenumbering:
                 for a in ag.findall(f"{{{_WPML_NS}}}action")
             ]
             assert ids == list(range(len(ids))), f"non-sequential IDs in group: {ids}"
+
+
+class TestTurnMode:
+    """WPML `waypointTurnMode` — the documented lever for letting the action
+    chain and the heading turn complete before the aircraft moves on."""
+
+    def test_stop_at_waypoint_emits_stop_turn_mode(self):
+        xml = _extract_wpml_xml(MissionConfig(stop_at_waypoint=True))
+        assert "toPointAndStopWithContinuityCurvature" in xml
+        assert "toPointAndPassWithContinuityCurvature" not in xml
+
+    def test_fly_through_emits_pass_turn_mode(self):
+        xml = _extract_wpml_xml(MissionConfig(stop_at_waypoint=False))
+        assert "toPointAndPassWithContinuityCurvature" in xml

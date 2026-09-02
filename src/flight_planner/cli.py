@@ -47,16 +47,28 @@ from .mission_intent import (
 )
 from .models import (
     ActionType,
+    Building,
     CameraAction,
     CameraName,
     MissionConfig,
     Waypoint,
 )
+from .validate import median_gsd_mm_per_px, validate_mission
+from .camera import compute_distance_for_gsd, get_camera
+from .gimbal_rewrite import aim_audit
 
 
 # NEN-2767 post-processing — matches server endpoint /versions/{id}/rewrite-gimbals
 _NEN_INSPECTION_SPEED_MS = 3.0
-_NEN_MAX_FACADE_DIST_M = 60.0
+# Facet reach. Was a flat 60 m; on busboom (2026-09-02) that let waypoints over
+# empty tarmac aim 20–31 m across the lot at the nearest thing that qualified.
+# Now derived from the GSD target: the standoff at which GSD would be
+# _NEN_MAX_STANDOFF_GSD_FACTOR × target (WIDE, 2.0 mm/px → 14.6 m). Beyond it a
+# photo is out of spec anyway, so the waypoint keeps DJI's own Smart3D pose.
+_NEN_MAX_FACADE_DIST_M: float | None = None
+_NEN_MAX_STANDOFF_GSD_FACTOR = 2.0
+_NEN_ASSIGN_MODE = "viterbi"
+_NEN_SWITCH_COST = 4.0
 _NEN_PITCH_MARGIN_DEG = 2.0
 # Facade-picker hysteresis. 1.0 = memoryless (the pre-2026-07-10 behaviour).
 # Measured on the 2026-07-10 flown missions: 0.8 halves target switching
@@ -145,7 +157,16 @@ def _format_pilot2_card(summary: dict) -> str:
     total = int(gs.get("waypoint_count") or summary.get("waypoints_total") or 0)
     aimed = int(gs.get("waypoints_aimed_at_facade") or summary.get("waypoints_aimed") or 0)
     facets = int(summary.get("facades") or 0)
-    aim_pct = (100.0 * aimed / total) if total else 0.0
+    # "Aim %" is gone: it counted waypoints with *a* facade assigned, which
+    # was 100% on every 2026-07-10 card while the measured bearing error was
+    # 35°. GSD and the plan-time warning count are numbers the pilot can act on.
+    gsd = (summary.get("gsd") or {}).get("median_mm_per_px")
+    gsd_txt = f"GSD {gsd:.1f}mm/px" if gsd is not None else "GSD n/a"
+    warns = sum(1 for v in (summary.get("validation") or []) if v.get("severity") in ("warning", "error"))
+    stop_txt = "on" if summary.get("stop_at_waypoint", True) else "OFF"
+    aim = summary.get("aim") or {}
+    aim_txt = f"  flips {int(aim.get('reversals_gt90') or 0)}  far {int(aim.get('far_picks') or 0)}" if aim else ""
+    _ = aimed
     pitch = gs.get("pitch_deg") or {}
     p_med = float(pitch.get("median") or 0.0)
     p_min = float(pitch.get("min") or 0.0)
@@ -154,18 +175,18 @@ def _format_pilot2_card(summary: dict) -> str:
         "AeroScan ready",
         f"{name} -> {flight_id}",
         f"Align drift {drift_m * 100:.0f}cm  RMSE {rmse:.2f}m  yaw {yaw_total:+.0f}",
-        f"WPs {total}  Facets {facets}  Aim {aim_pct:.0f}%",
+        f"WPs {total}  Facets {facets}  {gsd_txt}",
         f"Pitch med {p_med:+.0f}  range {p_min:+.0f}..{p_max:+.0f}",
-        "Custom gimbal: ENABLED",
+        f"Stop@WP {stop_txt}  warn {warns}{aim_txt}",
         "Tap [AeroScan Fly] when ready",
     ]
     card = "\n".join(lines)
     if len(card.encode("utf-8")) > _PILOT2_CARD_MAX_BYTES:
-        # Drop pitch range first (least critical), then fall back to a 3-line card.
+        # Drop pitch range first (least critical), then fall back to a 4-line card.
         lines = [
             "AeroScan ready",
             f"{name} -> {flight_id}",
-            f"WPs {total}  Aim {aim_pct:.0f}%  Custom gimbal ON",
+            f"WPs {total}  {gsd_txt}  Stop@WP {stop_txt}  warn {warns}",
             "Tap [AeroScan Fly] when ready",
         ]
         card = "\n".join(lines)
@@ -207,14 +228,24 @@ def augment_mission(
     *,
     blackbox_dir: Path = Path("/blackbox"),
     voxel_m: float = 0.10,
-    max_facade_distance_m: float = _NEN_MAX_FACADE_DIST_M,
+    max_facade_distance_m: float | None = _NEN_MAX_FACADE_DIST_M,
     inspection_speed_ms: float = _NEN_INSPECTION_SPEED_MS,
     pitch_margin_deg: float = _NEN_PITCH_MARGIN_DEG,
     switch_ratio: float = _NEN_SWITCH_RATIO,
+    stop_at_waypoint: bool = True,
+    assign_mode: str = _NEN_ASSIGN_MODE,
+    switch_cost: float = _NEN_SWITCH_COST,
     summary_json: Path | None = None,
     log: bool = True,
 ) -> dict:
     """Run the full intent-JSON → augmented-KMZ pipeline.
+
+    ``stop_at_waypoint`` selects WPML ``toPointAndStopWithContinuityCurvature``
+    ("the aircraft will stop at the point") for every inspection waypoint. It
+    defaults ON for the augment path: on 2026-07-10 this path flew pass-through
+    at 3 m/s over 1.74 m legs and lost 104 of 398 commanded photos, with the
+    nose 14° behind its commanded heading. Stopping lets the action chain and
+    the turn complete; the cost is flight time.
 
     Returns a stats dict; the output KMZ is written to ``output_kmz``.
     """
@@ -224,12 +255,17 @@ def augment_mission(
 
     t0 = time.monotonic()
 
+    target_gsd = MissionConfig().target_gsd_mm_per_px
+    if max_facade_distance_m is None:
+        max_facade_distance_m = float(compute_distance_for_gsd(
+            get_camera(CameraName.WIDE), target_gsd * _NEN_MAX_STANDOFF_GSD_FACTOR))
+
     _log(f"[1/7] Mission intent: name={intent.name!r}  waypoints={len(intent.waypoints):,}  polygon vertices={len(intent.mission_area_wgs84)}")
 
     waypoints = _waypoints_from_intent(intent)
     polygon_enu = polygon_to_enu(intent.mission_area_wgs84, intent.ref_lat, intent.ref_lon, intent.ref_alt)
 
-    _log(f"[2/7] Loading Manifold cloud from {blackbox_dir / flight_id}/dji_perception/1/")
+    _log(f"[2/7] Loading Manifold cloud from {blackbox_dir / flight_id}/dji_perception/*/ (newest subdir)")
     manifold_pc = from_manifold(flight_id, blackbox_dir=blackbox_dir, voxel_m=voxel_m)
     _log(f"      manifold cloud: {len(manifold_pc.points):,} pts (after {voxel_m*100:.0f} cm voxel)")
 
@@ -329,7 +365,13 @@ def augment_mission(
         # 2026-06-12 flight) — the root cause of that flight's heading
         # jitter. See docs/flights/2026-06-12-first-custom-flight/ANALYSIS.md.
         preserve_heading=False,
+        assign_mode=assign_mode,
+        switch_cost=switch_cost,
     )
+    audit = aim_audit(new_waypoints, facades, far_standoff_m=max_facade_distance_m)
+    _log(f"      aim audit: reach {max_facade_distance_m:.1f} m  mode {assign_mode}  "
+         f"switches {audit['switches']}  flips>90° {audit['reversals_gt90']}  blips {audit['single_blips']}  "
+         f"far {audit['far_picks']}  unaimed {audit['unaimed']}")
     # NEN-2767: stop-and-shoot at fixed speed, single TAKE_PHOTO per WP.
     # Matches server.api /versions/{id}/rewrite-gimbals exactly.
     for w in new_waypoints:
@@ -343,6 +385,7 @@ def augment_mission(
     config = MissionConfig(
         flight_speed_ms=inspection_speed_ms,
         mission_name=f"NEN-2767: {intent.name}",
+        stop_at_waypoint=stop_at_waypoint,
         # Use the default dedup thresholds (5°/5°, see MissionConfig
         # docstring). This USED to be forced to -1.0 (disabled — emit an
         # explicit gimbalRotate/rotateYaw on every single WP) to work around
@@ -419,6 +462,14 @@ def augment_mission(
     lean_size = lean_path.stat().st_size
     _log(f"      lean (no cloud) → {lean_path.name} ({lean_size:,} bytes)")
 
+    # Plan-time gates. The same checks the dev backend runs on /generate; the
+    # augment path never ran them, which is how 2026-07-10 flew 5.01 mm/px
+    # against a 2.0 target with 26% of photos abandoned and no warning.
+    issues = validate_mission(new_waypoints, config, building=Building(facades=facades))
+    for issue in issues:
+        _log(f"      [{issue.severity.value}] {issue.code}: {issue.message}")
+    gsd_median = median_gsd_mm_per_px(new_waypoints, facades, config.camera)
+
     elapsed = time.monotonic() - t0
     _log(f"Total: {elapsed:.1f} s")
 
@@ -434,6 +485,22 @@ def augment_mission(
         "waypoints_aimed": aimed,
         "facades": len(facades),
         "gimbal_stats": _gimbal_summary(new_waypoints),
+        "stop_at_waypoint": stop_at_waypoint,
+        "aim": {"mode": assign_mode, "switch_cost": switch_cost, "reach_m": max_facade_distance_m, **audit},
+        "gsd": {
+            "median_mm_per_px": gsd_median,
+            "target_mm_per_px": config.target_gsd_mm_per_px,
+            "camera": config.camera.value,
+        },
+        "validation": [
+            {
+                "severity": i.severity.value,
+                "code": i.code,
+                "message": i.message,
+                "waypoint_indices": i.waypoint_indices[:10],
+            }
+            for i in issues
+        ],
         "icp": {
             "coarse_yaw_deg": icp_stats["coarse_yaw_deg"],
             "icp_rmse_m": icp_stats["icp_rmse_m"],
@@ -530,6 +597,9 @@ def _cmd_augment_mission(args: argparse.Namespace) -> int:
 
     try:
         stats = augment_mission(
+            stop_at_waypoint=not args.fly_through,
+            assign_mode=args.assign_mode,
+            switch_cost=args.switch_cost,
             intent=intent,
             flight_id=args.flight_id,
             output_kmz=args.output_kmz,
@@ -602,6 +672,10 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Manifold blackbox root (default: /blackbox).")
     am.add_argument("--voxel-m", type=float, default=0.10,
                     help="Voxel-downsample size for the Manifold cloud (m). Default 0.10.")
+    am.add_argument("--assign-mode", choices=("viterbi", "greedy"), default=_NEN_ASSIGN_MODE,
+                    help="viterbi: choose targets for the whole sequence (default). greedy: per-waypoint nearest with hysteresis.")
+    am.add_argument("--switch-cost", type=float, default=_NEN_SWITCH_COST,
+                    help="viterbi: cost of changing target, scaled by the turn it demands (weighted metres).")
     am.add_argument("--max-facade-distance-m", type=float, default=_NEN_MAX_FACADE_DIST_M,
                     help=f"Max waypoint→facade distance for re-aiming (m). "
                          f"Waypoints further away keep their original gimbal. "
@@ -615,6 +689,10 @@ def build_parser() -> argparse.ArgumentParser:
                          "behaviour). Lower is stickier. Default 0.8.")
     am.add_argument("--pitch-margin-deg", type=float, default=_NEN_PITCH_MARGIN_DEG,
                     help=f"Margin from gimbal hardware pitch limits (deg). Default {_NEN_PITCH_MARGIN_DEG}.")
+    am.add_argument("--fly-through", action="store_true",
+                    help="Do NOT stop at each waypoint (WPML toPointAndPass). Default stops "
+                         "(toPointAndStopWithContinuityCurvature) so the gimbal+photo chain "
+                         "and the heading turn complete — 2026-07-10 lost 104/398 photos flying through.")
     am.add_argument("--summary-json", type=Path, default=None,
                     help="Optional: write a structured summary JSON alongside the output KMZ. "
                          "kmz_runner.c reads this and ships it back to rc-companion in the "

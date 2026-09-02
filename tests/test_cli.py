@@ -225,3 +225,67 @@ def test_manifold_module_reexport_from_building_import():
     from flight_planner.building_import import from_manifold as bi
     from flight_planner.manifold import from_manifold as mf
     assert bi is mf
+
+
+# ---------------------------------------------------------------------------
+# Pilot 2 card: honest plan-time numbers, not "Aim 100%"
+# ---------------------------------------------------------------------------
+
+
+def _card_summary(**over) -> dict:
+    s = {
+        "name": "busboom10-7",
+        "flight_id": "flight0070",
+        "facades": 53,
+        "gimbal_stats": {
+            "waypoint_count": 398,
+            "waypoints_aimed_at_facade": 398,
+            "pitch_deg": {"median": -16.0, "min": -85.0, "max": -4.0},
+        },
+        "icp": {"icp_rmse_m": 0.15, "total_translation_m": [2.25, 0.0, 0.0], "total_yaw_deg": 89.0},
+        "gsd": {"median_mm_per_px": 5.01, "target_mm_per_px": 2.0, "camera": "wide"},
+        "stop_at_waypoint": True,
+        "aim": {"mode": "viterbi", "reversals_gt90": 2, "far_picks": 0, "switches": 20},
+        "validation": [
+            {"severity": "warning", "code": "gsd_out_of_spec", "message": "x"},
+            {"severity": "warning", "code": "facades_uncovered", "message": "y"},
+        ],
+    }
+    s.update(over)
+    return s
+
+
+def test_pilot2_card_reports_gsd_and_warning_count_not_aim():
+    from flight_planner.cli import _format_pilot2_card
+
+    card = _format_pilot2_card(_card_summary())
+    assert "Aim" not in card
+    assert "GSD 5.0" in card
+    assert "warn 2" in card
+    assert "Stop@WP on" in card
+    assert "flips 2" in card and "far 0" in card
+    assert len(card.encode("utf-8")) <= 255
+
+
+def test_parser_augment_aim_defaults():
+    p = build_parser()
+    args = p.parse_args(["augment-mission", "--mission-json", "m.json", "--output-kmz", "o.kmz"])
+    assert args.assign_mode == "viterbi" and args.switch_cost == 4.0 and args.max_facade_distance_m is None
+    args = p.parse_args(["augment-mission", "--mission-json", "m.json", "--output-kmz", "o.kmz", "--assign-mode", "greedy", "--max-facade-distance-m", "60"])
+    assert args.assign_mode == "greedy" and args.max_facade_distance_m == 60.0
+
+
+def test_pilot2_card_fly_through_is_visible():
+    from flight_planner.cli import _format_pilot2_card
+
+    card = _format_pilot2_card(_card_summary(stop_at_waypoint=False, validation=[]))
+    assert "Stop@WP OFF" in card
+    assert "warn 0" in card
+
+
+def test_parser_augment_defaults_to_stop_at_waypoint():
+    p = build_parser()
+    args = p.parse_args(["augment-mission", "--mission-json", "m.json", "--output-kmz", "o.kmz"])
+    assert args.fly_through is False
+    args = p.parse_args(["augment-mission", "--mission-json", "m.json", "--output-kmz", "o.kmz", "--fly-through"])
+    assert args.fly_through is True

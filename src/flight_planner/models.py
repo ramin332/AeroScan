@@ -454,6 +454,19 @@ class MissionConfig:
     # True = stop at each waypoint (curve_and_stop, slower but guaranteed sharp)
     stop_at_waypoint: bool = False
 
+    # Minimum time the aircraft must spend on a leg in fly-through mode for the
+    # waypoint's action chain (gimbalRotate + takePhoto) to complete before the
+    # next `reachPoint` trigger abandons it. Only checked when
+    # ``stop_at_waypoint`` is False — WPML's toPointAndStop* turn modes stop the
+    # aircraft, so the chain always completes. DJI does not document action
+    # execution time; this floor is measured: on 2026-07-10 the augmented
+    # mission flew 1.74 m legs at 2.94 m/s (0.58 s per waypoint, 0.70 s on
+    # waypoints that also rotated the gimbal) and the FC reported 104 of 398
+    # takePhoto actions started-but-never-finished — exactly the photo shortfall
+    # on the card. 1.0 s is a floor with margin, not a calibrated constant; it
+    # is a UI knob so the next flight can tighten it from evidence.
+    min_action_dwell_s: float = 1.0
+
     # XML-slimming knobs. On dense facade sweeps, consecutive WPs share the same
     # gimbal pose and heading — re-emitting gimbalRotate/rotateYaw at every WP
     # bloats the KMZ and can stall DJI Pilot 2's mission renderer. Skip the

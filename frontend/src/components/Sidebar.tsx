@@ -540,6 +540,13 @@ export function Sidebar() {
           value={mission.stop_at_waypoint}
           tooltip="Off = fly-through (faster, M4E mech shutter prevents blur). On = stop at each waypoint (slower but guaranteed sharp)."
           onChange={(v) => { setMission({ stop_at_waypoint: v }); autoGen(); }} />
+        {!mission.stop_at_waypoint && (
+          <SliderField label="Min dwell / WP" value={mission.min_action_dwell_s}
+            min={0.3} max={3} step={0.1}
+            format={(v) => `${v.toFixed(1)} s`}
+            tooltip="Fly-through only: legs shorter than this leave no time for gimbal + shutter and the photo is skipped (2026-07-10: 104 of 398 lost at 0.58 s)."
+            onChange={(v) => setMission({ min_action_dwell_s: v })} onCommit={autoGen} />
+        )}
         <SliderField label="Clearance" value={mission.obstacle_clearance_m}
           min={1} max={10} step={0.5}
           format={(v) => `${v} m`}
