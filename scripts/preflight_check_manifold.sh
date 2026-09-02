@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
 # Read-only pre-flight verification of the Manifold. Safe: no installs, no kills, no writes.
-# Run from the laptop on the same LAN as the drone:  bash scripts/preflight_check_manifold.sh
+# Run from the laptop on the same LAN as the drone:
+#   bash scripts/preflight_check_manifold.sh [--host=192.168.1.118]
+# The Manifold is on DHCP (seen at .55 and .118); find it with `arp -a | grep tegra`.
 set -u
-HOST="dji@192.168.1.55"
+HOST="dji@${AEROSCAN_MANIFOLD_HOST:-192.168.1.118}"
+for arg in "$@"; do case "$arg" in --host=*) HOST="dji@${arg#--host=}";; esac; done
 
 ssh -o ConnectTimeout=8 "$HOST" 'bash -s' <<"REMOTE"
 echo "===== HOST / TIME / UPTIME ====="
@@ -10,13 +13,15 @@ hostname; date; uptime
 
 echo; echo "===== MESH on latest flight (THE blocker) ====="
 LF=$(readlink -f /blackbox/the_latest_flight 2>/dev/null); echo "the_latest_flight -> ${LF:-?}"
-ls -la /blackbox/the_latest_flight/dji_perception/1/mesh_binary_*.ply 2>/dev/null || echo "NO MESH on latest flight"
+# subdir is <n>, not always 1 (2026-07-10: the fresh scan sat in /2/ and a /1/ glob missed it)
+ls -la /blackbox/the_latest_flight/dji_perception/*/mesh_binary_*.ply 2>/dev/null || echo "NO MESH on latest flight (normal right after a power-on; scan first, then augment)"
 
 echo; echo "===== ANY mesh anywhere in /blackbox ====="
-ls /blackbox/flight*/dji_perception/1/mesh_binary_*.ply 2>/dev/null | head || echo "NONE anywhere"
+for d in /blackbox/flight*/dji_perception/*/; do n=$(ls "$d"mesh_binary_*.ply 2>/dev/null | wc -l); [ "$n" -gt 0 ] && echo "  $d  chunks=$n  newest=$(stat -c %y $(ls -t "$d"mesh_binary_*.ply | head -1) | cut -c1-16)"; done
+echo "(the augment refuses a mesh older than AEROSCAN_MESH_MAX_AGE_S, default 6 h — chunk mtime, not slot-dir mtime)"
 
-echo; echo "===== /blackbox slots (newest mtime first) ====="
-ls -dt /blackbox/flight* 2>/dev/null | head -6
+echo; echo "===== /blackbox slots (slot DIR mtimes lie — latest symlink + per-file mtime are the truth) ====="
+echo "the_latest_flight -> $(readlink -f /blackbox/the_latest_flight)"; ls -dt /blackbox/flight* 2>/dev/null | head -4
 
 echo; echo "===== DISK (need headroom for ~1GB scan) ====="
 df -h /blackbox /open_app 2>/dev/null
@@ -31,7 +36,10 @@ echo; echo "===== built artifacts present ====="
 ls -la /open_app/dev/Payload-SDK-3.16.0/build/dji_sdk_demo_on_manifold3 2>/dev/null
 ls -la /open_app/dev/Payload-SDK-3.16.0/build/dpk/*.dpk 2>/dev/null || echo "no .dpk built"
 
-echo; echo "===== git HEAD on Manifold (/open_app/dev) ====="
+echo; echo "===== SSH key auth survives reboot? (cron re-applies chmod 700; see 2026-09-02) ====="
+crontab -l 2>/dev/null | grep -c aeroscan-sshperm | sed "s/^/  cron entries: /"; ls -ld /home/dji
+
+echo "===== git HEAD on Manifold (/open_app/dev) ====="
 ( cd /open_app/dev 2>/dev/null && git log --oneline -3 && git status --short | head ) || echo "no /open_app/dev git"
 
 echo; echo "===== dev log tail (if dev binary was last run) ====="
@@ -40,7 +48,9 @@ tail -12 /open_app/dev/Payload-SDK-3.16.0/build/data/logs/latest.log 2>/dev/null
 echo; echo "===== AUGMENT engine: Python deps (open3d + CGAL) — augment HARD-FAILS without these ====="
 ENGINE=/open_app/dev/aero-scan
 # find the interpreter the augment would run under (engine venv if present, else system python3)
-PY=$( ls "$ENGINE"/.venv*/bin/python 2>/dev/null | head -1 )
+# the C runner spawns the augment via the miniforge env "aero-scan" (see runbooks/aero-scan-engine-install.md)
+PY=$( ls /open_app/dev/miniforge3/envs/aero-scan/bin/python 2>/dev/null | head -1 )
+[ -z "$PY" ] && PY=$( ls "$ENGINE"/.venv*/bin/python 2>/dev/null | head -1 )
 [ -z "$PY" ] && PY=$(command -v python3 2>/dev/null)
 echo "interpreter: ${PY:-NONE FOUND}"
 if [ -n "$PY" ]; then
