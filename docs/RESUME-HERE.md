@@ -12,6 +12,15 @@ lesson: we spent it tuning what we *ask* the aircraft for, and only at the end r
 the JPEG XMP to see what the aircraft *does*. The commands were already better than
 the execution. **Instrument before optimising.**
 
+## Next time the aircraft is powered on (2026-09-02 leftovers, 2 minutes)
+
+1. `git -C ~/git/aeroscan-psdk fetch manifold main && git merge --ff-only manifold/main && git push` —
+   Manifold commit `b844692` (stale-mesh override, widget packaging fix) is not on GitHub yet.
+2. **Clear the staged ground-test scenario** before any real flight:
+   `ssh dji@192.168.1.118 rm /open_app/dev/data/received/mission_progress.json` — otherwise the
+   app offers "Continue from WP 217/398" of the July mission. (Augmenting a new mission also clears it.)
+3. Smart3DExplore was left `failed` after the 14:23 app switch; a power-cycle restores it (boot app).
+
 ## The ONE next action — reflight and re-measure the gimbal
 
 **First** install the DPK rebuilt on 2026-09-02 (`dji_app_ctl install -i /open_app/dev/Payload-SDK-3.16.0/build/dpk/psdk-demo_v01.00.00.00.dpk`) and `git commit` on the Manifold — it carries the mesh-subdir fix and the telemetry recorder — and deploy the laptop repo's augment changes (`scripts/deploy_to_manifold.sh`). Then fly `2bf3308`. Then pull the photos and run:
