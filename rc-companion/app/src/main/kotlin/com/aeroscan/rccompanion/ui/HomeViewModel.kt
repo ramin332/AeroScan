@@ -8,6 +8,7 @@ import com.aeroscan.rccompanion.cloud.PlyParser
 import com.aeroscan.rccompanion.cloud.PlyVoxelDownsample
 import com.aeroscan.rccompanion.filepick.PickedFile
 import com.aeroscan.rccompanion.mop.AugmentSession
+import com.aeroscan.rccompanion.mop.AugmentFraming
 import com.aeroscan.rccompanion.mop.StatusSession
 import com.aeroscan.rccompanion.wpml.WpmlParser
 import kotlinx.coroutines.Dispatchers
@@ -90,6 +91,17 @@ fun nextPollDelayMs(state: BannerState): Long? = when (state) {
     is BannerState.Ready, BannerState.Checking, BannerState.Idle -> null
 }
 
+/** One line about the recorded mission, appended to any STAT-derived banner. */
+fun missionSuffix(s: AugmentFraming.ManifoldStatus): String = when (s.missionState) {
+    "interrupted" -> if (s.missionResumeFrom >= 0)
+        " · ⏸ ${s.missionId} interrupted at WP ${s.missionLastIndex}/${s.missionTotal} — Continue on Pilot 2 after the swap"
+    else " · ⏸ ${s.missionId} stopped at WP ${s.missionLastIndex} — Fly restarts it"
+    "flying", "paused" -> " · ✈ ${s.missionId} ${s.missionState} at WP ${s.missionLastIndex}/${s.missionTotal}"
+    "completed" -> " · ✅ ${s.missionId} completed ${s.missionLastIndex}/${s.missionTotal}"
+    "ready" -> " · ▶ ${s.missionId} uploaded — tap Fly on Pilot 2"
+    else -> ""
+}
+
 fun bannerFor(result: StatusSession.Result): BannerState = when (result) {
     is StatusSession.Result.Unreachable ->
         BannerState.Unreachable(
@@ -100,15 +112,16 @@ fun bannerFor(result: StatusSession.Result): BannerState = when (result) {
 
     is StatusSession.Result.Ok -> {
         val s = result.status
+        val mission = missionSuffix(s)
         when {
-            !s.envOk -> BannerState.EnvError("env error: ${s.envDetail}")
-            !s.meshPresent -> BannerState.NoMesh("Not ready — run auto-explore first ${s.latestFlight}")
+            !s.envOk -> BannerState.EnvError("env error: ${s.envDetail}$mission")
+            !s.meshPresent -> BannerState.NoMesh("Not ready — run auto-explore first ${s.latestFlight}$mission")
             else -> {
                 val pts = if (s.nPoints >= 1_000_000) "%.1fM pts".format(s.nPoints / 1e6)
                     else "${s.nPoints} pts"
                 BannerState.Ready(
                     "Ready · ${s.latestFlight} · mesh ✓ (${s.meshChunks} chunks, $pts) · env ✓ · %.1f GB free"
-                        .format(s.blackboxFreeGb),
+                        .format(s.blackboxFreeGb) + mission,
                 )
             }
         }
@@ -199,6 +212,11 @@ class HomeViewModel(app: Application) : AndroidViewModel(app) {
     private val _banner = MutableStateFlow<BannerState>(BannerState.Idle)
     val banner: StateFlow<BannerState> = _banner.asStateFlow()
 
+    /** Last parsed STAT, for the "replace interrupted mission?" confirmation. */
+    private var lastStatus: AugmentFraming.ManifoldStatus? = null
+    /** Mission id the pilot has already agreed to replace (two-tap confirm). */
+    private var replaceAcknowledgedFor: String? = null
+
     val connection: StateFlow<Connection.State> = Connection.state
 
     private var augmentJob: Job? = null
@@ -245,6 +263,19 @@ class HomeViewModel(app: Application) : AndroidViewModel(app) {
         }
         if (blockReason != null) {
             _ui.value = UiState.Error(picked, blockReason)
+            return
+        }
+        // A new augment always replaces the recorded mission on the Manifold.
+        // If that mission is interrupted (battery swap), make the pilot say so
+        // twice: the first tap explains, the second proceeds.
+        val st = lastStatus
+        if (st != null && st.interrupted && replaceAcknowledgedFor != st.missionId) {
+            replaceAcknowledgedFor = st.missionId
+            _ui.value = UiState.Error(
+                picked,
+                "Mission ${st.missionId} is interrupted at WP ${st.missionLastIndex}/${st.missionTotal}. " +
+                    "To finish it, tap Continue then Fly on Pilot 2. To replace it with this new mission, tap Augment again.",
+            )
             return
         }
 
@@ -396,7 +427,9 @@ class HomeViewModel(app: Application) : AndroidViewModel(app) {
             // last result on screen (no flicker) and stop as soon as Ready.
             _banner.value = BannerState.Checking
             while (true) {
-                val result = bannerFor(StatusSession().query())
+                val q = StatusSession().query()
+                lastStatus = (q as? StatusSession.Result.Ok)?.status
+                val result = bannerFor(q)
                 _banner.value = result
                 val wait = nextPollDelayMs(result) ?: break
                 delay(wait)

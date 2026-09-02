@@ -65,6 +65,28 @@
   - `"Mission: flying — waypoint N"` → **GO.** Let it fly; watch camera aim per waypoint.
   - **Refusal** → **NO-GO.** Do not force. **Write down the FC validity error code** (no internet to look it up — record verbatim for next session). A clean refusal is still a successful test result.
 
+## Battery swap mid-mission — "Continue" (added 2026-09-02, unflown)
+
+The FC cannot resume a WaypointV3 mission across a power-off (PSDK has only
+START/STOP/PAUSE/RESUME in-session; DJI's breakpoint resume is a Dock feature).
+AeroScan handles it as a **new mission that starts at the last waypoint reached**:
+
+1. Battery low → **Pause** (Pilot 2 widget) → **RTH** (Pilot) → land → swap → power on.
+2. In Pilot 2: camera view → payload panel → enable **AeroScan** (boot app is Smart3D). Wait ~30 s.
+3. The floating window says `Mission <id> interrupted at WP N/total — tap Continue`. The RC app
+   banner shows the same line (`mission_state=interrupted`).
+4. Tap **AeroScan Continue** → the Manifold slices the original KMZ at WP N−1 (redoes the
+   waypoint in progress; one duplicate photo at worst), uploads it, and reports
+   `Continue ready: WP N..total uploaded — tap Fly`.
+5. Tap **AeroScan Fly**. The aircraft flies to WP N (`flyToWaylineMode=safely`) and continues.
+   Photo names keep their original `wpNNN` numbers, so the sorties merge into one set.
+
+Rules: a **new augment from the RC always replaces** the recorded mission (the RC app asks
+twice); **Fly** always flies the whole mission from WP 1; **Continue** only works when a mission
+was interrupted after at least WP 2. Progress lives in `data/received/mission_progress.json` on
+the Manifold; the `ready_to_fly.marker` records the slice point so an app restart re-uploads the
+slice. No scan is needed between sorties (the mesh stays; the 6 h staleness gate still applies).
+
 ## If something breaks (no internet — these are your only moves)
 | Symptom | Move |
 |---|---|

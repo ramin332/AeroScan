@@ -113,7 +113,15 @@ object AugmentFraming {
         val blackboxFreeGb: Double,
         val envOk: Boolean,
         val envDetail: String,
-    )
+        // Mission lifecycle from kmzrun_progress (2026-09-02); absent on older Manifolds.
+        val missionId: String = "",
+        val missionState: String = "",      // ready | flying | paused | interrupted | completed | ""
+        val missionLastIndex: Int = 0,
+        val missionTotal: Int = 0,
+        val missionResumeFrom: Int = -1,    // 0-based waypoint a Continue would slice at; -1 = none
+    ) {
+        val interrupted: Boolean get() = missionState == "interrupted" && missionResumeFrom >= 0
+    }
 
     /**
      * Parse a STAT body's UTF-8 JSON into [ManifoldStatus]. Defensive: missing
@@ -136,6 +144,11 @@ object AugmentFraming {
             blackboxFreeGb = o.optDouble("blackbox_free_gb", -1.0),
             envOk = o.optBoolean("env_ok", false),
             envDetail = o.optString("env_detail", ""),
+            missionId = o.optString("mission_id", ""),
+            missionState = o.optString("mission_state", ""),
+            missionLastIndex = o.optInt("mission_last_index", 0),
+            missionTotal = o.optInt("mission_total", 0),
+            missionResumeFrom = o.optInt("mission_resume_from", -1),
         )
     }
 
