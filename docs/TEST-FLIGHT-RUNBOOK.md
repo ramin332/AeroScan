@@ -28,8 +28,7 @@
 
 ## Tonight at the depot (LAN + internet — your only chance to verify with tools)
 - [ ] Run `bash scripts/preflight_check_manifold.sh` — confirm: disk headroom on `/blackbox` (>~2 GB free), DPK `psdk-demo` installed, app process reachable.
-- [ ] Confirm **which APK is on the RC**. Want the **May 25 11:44** build (`rc-companion/app/build/outputs/apk/debug/app-debug.apk`) — it has the readiness banner. The May 1 `lastgood` does NOT. Sideload if wrong.
-  - Known gap: installed APK lacks the `a37fce1` fail-fast hard-block (can't rebuild — no gradle/java on laptop). Banner still shows red/green; you just won't be hard-blocked from tapping Augment with no mesh. Acceptable.
+- [ ] Confirm **which APK is on the RC**: `adb shell dumpsys package com.aeroscan.rccompanion | grep lastUpdateTime` should read **2026-09-02 or later** (readiness polling + Pilot 2 instructions). Install/refresh with `adb install -r output/rc-companion/rc-companion-debug-<date>.apk`; rebuild with Android Studio's JDK + the cached gradle 8.9 (`JAVA_HOME="/Applications/Android Studio.app/Contents/jbr/Contents/Home" ~/.gradle/wrapper/dists/gradle-8.9-bin/*/gradle-8.9/bin/gradle :app:testDebugUnitTest :app:assembleDebug` in `rc-companion/`).
 - [ ] Charge: aircraft batteries (≥2), RC, laptop. SD card in aircraft (Smart3D writes there + fallback).
 - [ ] Laptop fallback ready: AeroScan webapp runs offline (`./run.sh`, backend :8111 / frontend :3847). USB-MTP cable to pull the Smart3D KMZ off the RC. SD card to sideload a fallback KMZ into Pilot 2.
 
