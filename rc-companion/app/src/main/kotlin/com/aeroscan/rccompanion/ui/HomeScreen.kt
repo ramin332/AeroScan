@@ -122,7 +122,7 @@ private fun ConnectionBanner(state: Connection.State) {
         is Connection.State.Initializing -> "Initializing App..." to MaterialTheme.colorScheme.surfaceVariant
         is Connection.State.Registered -> "App registered, waiting for aircraft" to MaterialTheme.colorScheme.surfaceVariant
         is Connection.State.RegisterFailed -> "App registration failed: ${state.reason}" to MaterialTheme.colorScheme.errorContainer
-        is Connection.State.AircraftConnected -> "Your drone has connected!)" to MaterialTheme.colorScheme.primaryContainer
+        is Connection.State.AircraftConnected -> "Your drone is connected!" to MaterialTheme.colorScheme.primaryContainer
         is Connection.State.AircraftDisconnected -> "Aircraft disconnected" to MaterialTheme.colorScheme.errorContainer
     }
     Card(
