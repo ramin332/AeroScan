@@ -37,8 +37,18 @@
 **Stage 1 — Scan** (proven, low risk)
 - Power on → boot app `Smart3DExplore` → fly Smart Auto-Exploration over the building → land → **KEEP POWERED.**
 
-**Stage 2 — Switch to AeroScan**
-- Pilot → Application Management → switch active app to **psdk-demo (AeroScan)**.
+**Stage 2 — Switch to AeroScan** (the app-switch seam — read this once)
+- Pilot 2 → **camera view → payload (PSDK) panel → enable psdk-demo (AeroScan)**. This is what
+  *starts* our app on the Manifold; until then there is no server for the RC app to reach and its
+  banner is correctly grey ("Unreachable"). Nothing else needs to be sent — the "send a message
+  first" step was only ever the time it takes the app to come up.
+- Wait **10–30 s** (measured on every 2026-07-10 session: MOP bound → RC connected 13–36 s later).
+  The RC app now re-checks every 5 s by itself (rc-companion ≥ 2026-09-02); no Retry tap needed.
+- The switch **kills Smart3DExplore hard** (2026-09-02: `SEGV`, unit left `failed` despite
+  `Restart=always`). A new Smart3D scan afterwards needs Smart3D restarted from Pilot's app
+  management (or a power-cycle, which creates a new `/blackbox` slot; the mesh survives until the
+  ring buffer churns). Plan the day as scan → augment → fly, not scan/augment/scan.
+- Our app is never up after a power-on: Smart3DExplore is the boot app by design.
 - Expect: **Fly widget appears** + readiness **banner goes GREEN ("mesh ✓")**. Green here = mesh blocker resolved on live data.
 
 **Stage 3 — Augment** (proven on bench)
@@ -59,6 +69,7 @@
 ## If something breaks (no internet — these are your only moves)
 | Symptom | Move |
 |---|---|
+| Banner stays GREY / "AeroScan app not running" > 60 s after enabling | The app did not start or crashed. On the Manifold: `systemctl is-active psdk-demo.service`; `dji_app_ctl list`. Re-enable in Pilot. |
 | Banner stays RED / "no mesh" after switch | Mesh didn't land or got churned. Confirm you did NOT power-cycle. Re-fly a short Smart3D scan, switch, retry. |
 | Augment fails at `[2/7]` | Same as above — no mesh. |
 | PRVW never returns | MOP transport stalled. Re-open rc-companion, retry Augment. If persists → **laptop cable fallback** (below). |

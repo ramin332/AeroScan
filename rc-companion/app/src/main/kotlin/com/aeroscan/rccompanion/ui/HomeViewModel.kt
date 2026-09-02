@@ -12,6 +12,7 @@ import com.aeroscan.rccompanion.mop.StatusSession
 import com.aeroscan.rccompanion.wpml.WpmlParser
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -70,9 +71,32 @@ sealed class BannerState {
  * EnvError > NoMesh > Ready so the most blocking problem wins the banner.
  * Kept top-level + side-effect-free so it's unit-testable without the MSDK.
  */
+/** Re-check period while the Manifold is not reachable / not ready. */
+const val READINESS_POLL_MS = 5_000L
+
+/**
+ * How long to wait before the next automatic readiness check, or null to stop.
+ *
+ * Why polling: the AeroScan app on the Manifold is started by the pilot from
+ * DJI Pilot 2 (camera view → payload panel → enable), and it takes 10–30 s
+ * after that to bind its MOP channel (measured on every 2026-07-10 session).
+ * A single check at aircraft-connect time lands inside that window, so the
+ * banner stayed "Unreachable" until someone tapped Retry — the "have to send a
+ * message first" folklore. NoMesh and EnvError also change on their own (a
+ * scan lands, the env comes up), so they keep polling too. Ready stops.
+ */
+fun nextPollDelayMs(state: BannerState): Long? = when (state) {
+    is BannerState.Unreachable, is BannerState.NoMesh, is BannerState.EnvError -> READINESS_POLL_MS
+    is BannerState.Ready, BannerState.Checking, BannerState.Idle -> null
+}
+
 fun bannerFor(result: StatusSession.Result): BannerState = when (result) {
     is StatusSession.Result.Unreachable ->
-        BannerState.Unreachable("Manifold not reachable — is the app running? (${result.reason})")
+        BannerState.Unreachable(
+            "AeroScan app not running on the drone. In DJI Pilot 2: camera view → payload panel → " +
+                "enable AeroScan (psdk-demo). It needs ~30 s to come up; this banner re-checks every 5 s. " +
+                "(${result.reason})",
+        )
 
     is StatusSession.Result.Ok -> {
         val s = result.status
@@ -216,7 +240,7 @@ class HomeViewModel(app: Application) : AndroidViewModel(app) {
         val blockReason: String? = when (val b = banner.value) {
             is BannerState.NoMesh -> "No mesh on the latest flight — fly a Smart3D scan, then augment."
             is BannerState.EnvError -> "Manifold env not ready (${b.label}). Augment can't run."
-            is BannerState.Unreachable -> "Manifold not reachable — start the AeroScan app on the drone, then retry."
+            is BannerState.Unreachable -> "AeroScan app not running on the drone — enable it in DJI Pilot 2 (camera view → payload panel) and wait for the banner to turn green."
             else -> null  // Idle / Checking / Ready — proceed
         }
         if (blockReason != null) {
@@ -368,8 +392,17 @@ class HomeViewModel(app: Application) : AndroidViewModel(app) {
         }
 
         statusJob = viewModelScope.launch {
+            // First check shows "Checking…"; the automatic re-checks keep the
+            // last result on screen (no flicker) and stop as soon as Ready.
             _banner.value = BannerState.Checking
-            _banner.value = bannerFor(StatusSession().query())
+            while (true) {
+                val result = bannerFor(StatusSession().query())
+                _banner.value = result
+                val wait = nextPollDelayMs(result) ?: break
+                delay(wait)
+                if (session != null || augmentJob?.isActive == true) break
+                if (connection.value !is Connection.State.AircraftConnected) break
+            }
         }
     }
 
