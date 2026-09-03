@@ -12,18 +12,24 @@ lesson: we spent it tuning what we *ask* the aircraft for, and only at the end r
 the JPEG XMP to see what the aircraft *does*. The commands were already better than
 the execution. **Instrument before optimising.**
 
-## Next time the aircraft is powered on (2026-09-02 leftovers, 2 minutes)
+## 2026-09-03 power-on sync — DONE (aircraft is flight-ready on the software side)
 
-1. `git -C ~/git/aeroscan-psdk fetch manifold main && git merge --ff-only manifold/main && git push` —
-   Manifold commit `b844692` (stale-mesh override, widget packaging fix) is not on GitHub yet.
-2. **Clear the staged ground-test scenario** before any real flight:
-   `ssh dji@192.168.1.118 rm /open_app/dev/data/received/mission_progress.json` — otherwise the
-   app offers "Continue from WP 217/398" of the July mission. (Augmenting a new mission also clears it.)
-3. Smart3DExplore was left `failed` after the 14:23 app switch; a power-cycle restores it (boot app).
+- `b844692` (stale-mesh override) and the follow-up docs commit are on GitHub (`aeroscan-psdk`).
+- Staged ground-test `mission_progress.json` ("interrupted at WP 217/398") **removed** from the Manifold.
+- DPK **rebuilt and reinstalled** 09:33: the 2026-09-02 build shipped `widget_file` as a *symlink*
+  into `/open_app/dev/src/...` (fragile — depends on the sandboxed app user being able to read the dev
+  tree). Now real files: Fly, Pause/Resume, Continue, Send-to-Manifold. `psdk-demo.service` active.
+  Lesson recorded in Manifold `docs/psdk/build.md`. **Widget rendering in Pilot 2 still unverified.**
+- Preflight script green: `the_latest_flight -> flight0077` (no mesh, expected after power-on; newest
+  meshes are the 2026-07-10 ones in flight0070/0072), 42 GB free on `/blackbox`, engine deps import,
+  cron ssh-perm fix present (but `@reboot` ran *before* DJI's perm reset — needed a manual `chmod 700`
+  once; the `*/5` entry covers it within 5 min).
+- Still unflown: everything from 2026-09-02 (stop-at-WP, no gimbal-yaw, Viterbi picker, telemetry CSV,
+  Continue). First flight is a measurement flight.
 
 ## The ONE next action — reflight and re-measure the gimbal
 
-**First** install the DPK rebuilt on 2026-09-02 (`dji_app_ctl install -i /open_app/dev/Payload-SDK-3.16.0/build/dpk/psdk-demo_v01.00.00.00.dpk`) and `git commit` on the Manifold — it carries the mesh-subdir fix and the telemetry recorder — and deploy the laptop repo's augment changes (`scripts/deploy_to_manifold.sh`). Then fly `2bf3308`. Then pull the photos and run:
+DPK, Manifold commits and laptop augment changes are all deployed (2026-09-03). Fly `2bf3308`+. Then pull the photos and run:
 
 ```bash
 .venv/bin/python scripts/read_gimbal_xmp.py <photo-dir> --kmz <the-flown>.augmented.lean.kmz
