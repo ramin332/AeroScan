@@ -109,7 +109,56 @@ def intent_dict_to_imported_kmz(d: dict[str, Any]) -> ImportedKmz:
         mission_area_wgs84=[tuple(p) for p in d.get("mission_area_wgs84", [])],
         mission_config_raw={},
         point_cloud_ply=None,
+        settings=coerce_settings(d.get("settings")),
     )
+
+
+
+# Planner knobs the RC may set per mission. They ride in the mission-intent JSON
+# rather than the augment CLI's argv because the Manifold's C runner builds that
+# argv from a fixed list — a new knob would otherwise need a PSDK rebuild and a
+# DPK reinstall for every change. Unknown keys are ignored so an older engine
+# never chokes on a newer RC, and out-of-range values are clamped rather than
+# rejected: a mission that flies with a sane speed beats one that refuses.
+SETTING_KEYS: dict[str, tuple[type, float, float]] = {
+    # key: (type, min, max)
+    "inspection_speed_ms": (float, 0.3, 6.0),
+    "target_gsd_mm_per_px": (float, 0.5, 20.0),
+    "switch_cost": (float, 0.0, 50.0),
+    "max_facade_distance_m": (float, 1.0, 100.0),
+    "min_action_dwell_s": (float, 0.0, 10.0),
+}
+
+#: Free-form settings that are not numeric ranges.
+SETTING_CHOICES: dict[str, tuple[str, ...]] = {
+    "assign_mode": ("viterbi", "greedy"),
+}
+
+#: Settings that are simple booleans.
+SETTING_FLAGS: tuple[str, ...] = ("stop_at_waypoint",)
+
+
+def coerce_settings(raw: Any) -> dict[str, Any]:
+    """Validate and clamp the RC's planner knobs. Unknown keys are dropped."""
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, Any] = {}
+    for key, (kind, lo, hi) in SETTING_KEYS.items():
+        if key not in raw or raw[key] is None:
+            continue
+        try:
+            value = kind(raw[key])
+        except (TypeError, ValueError):
+            continue
+        out[key] = min(max(value, lo), hi)
+    for key, choices in SETTING_CHOICES.items():
+        value = raw.get(key)
+        if isinstance(value, str) and value in choices:
+            out[key] = value
+    for key in SETTING_FLAGS:
+        if key in raw and raw[key] is not None:
+            out[key] = bool(raw[key])
+    return out
 
 
 def write_intent_json(parsed: ImportedKmz, out_path: Path, *, indent: int | None = None) -> Path:

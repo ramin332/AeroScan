@@ -10,6 +10,7 @@ import com.aeroscan.rccompanion.filepick.PickedFile
 import com.aeroscan.rccompanion.mop.AugmentSession
 import com.aeroscan.rccompanion.mop.AugmentFraming
 import com.aeroscan.rccompanion.mop.StatusSession
+import com.aeroscan.rccompanion.wpml.PlannerSettings
 import com.aeroscan.rccompanion.wpml.WpmlParser
 import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.async
@@ -316,6 +317,12 @@ class HomeViewModel(app: Application) : AndroidViewModel(app) {
     val linkDrops: StateFlow<List<Long>> = Connection.drops
     val linkUpSince: StateFlow<Long?> = Connection.upSince
 
+    /** Planner knobs the pilot sets before augmenting; sent inside the intent. */
+    private val _settings = MutableStateFlow(PlannerSettings())
+    val settings: StateFlow<PlannerSettings> = _settings.asStateFlow()
+    fun setInspectionSpeed(ms: Double) { _settings.value = _settings.value.copy(inspectionSpeedMs = ms) }
+    fun setStopAtWaypoint(v: Boolean) { _settings.value = _settings.value.copy(stopAtWaypoint = v) }
+
     private var augmentJob: Job? = null
     private var session: AugmentSession? = null
     private var statusJob: Job? = null
@@ -521,7 +528,9 @@ class HomeViewModel(app: Application) : AndroidViewModel(app) {
             }
 
             // Always allow an older scan: the strip shows its age, the pilot decides by tapping Augment.
-            sess.sendAndAwaitPreview(intent, fingerprintBytes, allowStaleMesh = true)
+            sess.sendAndAwaitPreview(
+                intent, fingerprintBytes, allowStaleMesh = true, settings = _settings.value,
+            )
         }
     }
 

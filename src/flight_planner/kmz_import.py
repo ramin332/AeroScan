@@ -84,6 +84,9 @@ class ImportedKmz:
     mission_area_wgs84: list[tuple[float, float, float]]   # (lon, lat, alt)
     mission_config_raw: dict
     point_cloud_ply: Optional[bytes]                   # raw PLY bytes, or None
+    # Planner knobs chosen on the RC and carried in the mission-intent JSON.
+    # Empty for a KMZ parsed straight off disk; see mission_intent.SETTING_KEYS.
+    settings: dict = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------

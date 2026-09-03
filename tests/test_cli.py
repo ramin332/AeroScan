@@ -335,3 +335,50 @@ def test_facade_geometry_skips_degenerate_facets():
     from flight_planner.models import Facade
 
     assert _facade_geometry([Facade(vertices=np.zeros((2, 3)), normal=np.array([0.0, 0.0, 1.0]))]) == []
+
+
+def test_intent_settings_are_clamped_and_unknown_keys_dropped():
+    """The RC's knobs ride in the intent JSON; a bad value must not fail a mission."""
+    from flight_planner.mission_intent import coerce_settings
+
+    s = coerce_settings({
+        "inspection_speed_ms": 99.0,      # above the 6 m/s ceiling
+        "target_gsd_mm_per_px": 0.01,     # below the floor
+        "assign_mode": "viterbi",
+        "stop_at_waypoint": 0,
+        "switch_cost": "4.5",
+        "nonsense": 1,
+        "max_facade_distance_m": None,
+    })
+    assert s["inspection_speed_ms"] == 6.0
+    assert s["target_gsd_mm_per_px"] == 0.5
+    assert s["assign_mode"] == "viterbi"
+    assert s["stop_at_waypoint"] is False
+    assert s["switch_cost"] == 4.5
+    assert "nonsense" not in s
+    assert "max_facade_distance_m" not in s
+    assert coerce_settings(None) == {}
+    assert coerce_settings({"assign_mode": "made-up"}) == {}
+
+
+def test_intent_json_round_trips_settings():
+    import json
+    from pathlib import Path
+    from tempfile import TemporaryDirectory
+
+    from flight_planner.mission_intent import SCHEMA_VERSION, read_intent_json
+
+    doc = {
+        "schema_version": SCHEMA_VERSION,
+        "name": "m",
+        "ref": {"lat": 52.0, "lon": 5.0, "alt": 30.0},
+        "mission_area_wgs84": [],
+        "waypoints": [],
+        "settings": {"inspection_speed_ms": 1.0, "assign_mode": "greedy"},
+    }
+    with TemporaryDirectory() as d:
+        p = Path(d) / "intent.json"
+        p.write_text(json.dumps(doc))
+        intent = read_intent_json(p)
+    assert intent.settings["inspection_speed_ms"] == 1.0
+    assert intent.settings["assign_mode"] == "greedy"

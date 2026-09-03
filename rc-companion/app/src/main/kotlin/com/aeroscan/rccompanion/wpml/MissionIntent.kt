@@ -74,11 +74,16 @@ data class ImportedKmz(
      * Manifold's age limit (6 h). The C runner greps this key and bypasses its
      * gate; the Python side ignores unknown keys.
      */
-    fun toJsonString(pretty: Boolean = false, allowStaleMesh: Boolean = false): String {
+    fun toJsonString(
+        pretty: Boolean = false,
+        allowStaleMesh: Boolean = false,
+        settings: PlannerSettings? = null,
+    ): String {
         val obj = JSONObject().apply {
             put("schema_version", MissionIntent.SCHEMA_VERSION)
             put("name", name)
             if (allowStaleMesh) put("allow_stale_mesh", true)
+            settings?.let { put("settings", it.toJson()) }
             val ref = JSONObject().apply {
                 put("lat", refLat); put("lon", refLon); put("alt", refAlt)
             }
@@ -94,5 +99,30 @@ data class ImportedKmz(
             put("waypoints", wps)
         }
         return if (pretty) obj.toString(2) else obj.toString()
+    }
+}
+
+
+/**
+ * Planner knobs the pilot chooses on the RC. They travel inside the mission
+ * intent rather than the augment command line because the Manifold's C runner
+ * builds a fixed argv — a new knob would otherwise need a PSDK rebuild and a
+ * DPK reinstall. The engine clamps every value (mission_intent.SETTING_KEYS)
+ * and ignores keys it does not know, so an older Manifold still flies.
+ */
+data class PlannerSettings(
+    /** Transit speed between waypoints. In stop mode the aircraft halts to shoot
+     *  regardless, so this trades mission time against nothing but time. */
+    val inspectionSpeedMs: Double = 3.0,
+    /** Stop at every waypoint to rotate and shoot (DJI toPointAndStop*). */
+    val stopAtWaypoint: Boolean = true,
+) {
+    fun toJson(): JSONObject = JSONObject().apply {
+        put("inspection_speed_ms", inspectionSpeedMs)
+        put("stop_at_waypoint", stopAtWaypoint)
+    }
+
+    companion object {
+        val SPEED_CHOICES = listOf(1.0, 2.0, 3.0)
     }
 }

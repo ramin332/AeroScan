@@ -2,6 +2,7 @@ package com.aeroscan.rccompanion.mop
 
 import android.util.Log
 import com.aeroscan.rccompanion.wpml.ImportedKmz
+import com.aeroscan.rccompanion.wpml.PlannerSettings
 import dji.sdk.keyvalue.value.common.ComponentIndexType
 import dji.sdk.keyvalue.value.mop.PipelineDeviceType
 import dji.sdk.keyvalue.value.mop.TransmissionControlType
@@ -73,6 +74,7 @@ class AugmentSession(
         intent: ImportedKmz,
         cloudFingerprintPly: ByteArray,
         allowStaleMesh: Boolean = false,
+        settings: PlannerSettings? = null,
     ): Event = withContext(Dispatchers.IO) {
         try {
             _events.emit(Event.Connecting)
@@ -91,7 +93,8 @@ class AugmentSession(
             pipeline = pl
 
             // ---- AUGM uplink -----------------------------------------------------
-            val intentJson = intent.toJsonString(allowStaleMesh = allowStaleMesh).toByteArray(Charsets.UTF_8)
+            val intentJson = intent.toJsonString(allowStaleMesh = allowStaleMesh, settings = settings)
+                .toByteArray(Charsets.UTF_8)
             val body = AugmentFraming.buildAugmBody(intentJson, cloudFingerprintPly)
             val frame = AugmentFraming.frame(MopConstants.MAGIC_AUGM, body)
             writeAll(pl, frame) { sent -> _events.tryEmit(Event.Sending(sent, frame.size.toLong())) }

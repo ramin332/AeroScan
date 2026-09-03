@@ -270,6 +270,8 @@ def augment_mission(
     max_facade_distance_m: float | None = _NEN_MAX_FACADE_DIST_M,
     inspection_speed_ms: float = _NEN_INSPECTION_SPEED_MS,
     pitch_margin_deg: float = _NEN_PITCH_MARGIN_DEG,
+    target_gsd_mm_per_px: float | None = None,
+    min_action_dwell_s: float | None = None,
     switch_ratio: float = _NEN_SWITCH_RATIO,
     stop_at_waypoint: bool = True,
     assign_mode: str = _NEN_ASSIGN_MODE,
@@ -294,7 +296,7 @@ def augment_mission(
 
     t0 = time.monotonic()
 
-    target_gsd = MissionConfig().target_gsd_mm_per_px
+    target_gsd = target_gsd_mm_per_px if target_gsd_mm_per_px is not None else MissionConfig().target_gsd_mm_per_px
     if max_facade_distance_m is None:
         max_facade_distance_m = float(compute_distance_for_gsd(
             get_camera(CameraName.WIDE), target_gsd * _NEN_MAX_STANDOFF_GSD_FACTOR))
@@ -425,6 +427,8 @@ def augment_mission(
         flight_speed_ms=inspection_speed_ms,
         mission_name=f"NEN-2767: {intent.name}",
         stop_at_waypoint=stop_at_waypoint,
+        target_gsd_mm_per_px=target_gsd,
+        **({"min_action_dwell_s": min_action_dwell_s} if min_action_dwell_s is not None else {}),
         # Use the default dedup thresholds (5°/5°, see MissionConfig
         # docstring). This USED to be forced to -1.0 (disabled — emit an
         # explicit gimbalRotate/rotateYaw on every single WP) to work around
@@ -651,10 +655,14 @@ def _cmd_augment_mission(args: argparse.Namespace) -> int:
             cleanup_target = None
 
     try:
+        # The RC's per-mission knobs (mission-intent "settings") win over the
+        # CLI defaults. They travel in the JSON because the Manifold's C runner
+        # builds a fixed argv — see mission_intent.SETTING_KEYS.
+        st = getattr(intent, "settings", None) or {}
         stats = augment_mission(
-            stop_at_waypoint=not args.fly_through,
-            assign_mode=args.assign_mode,
-            switch_cost=args.switch_cost,
+            stop_at_waypoint=bool(st.get("stop_at_waypoint", not args.fly_through)),
+            assign_mode=str(st.get("assign_mode", args.assign_mode)),
+            switch_cost=float(st.get("switch_cost", args.switch_cost)),
             intent=intent,
             flight_id=args.flight_id,
             output_kmz=args.output_kmz,
@@ -662,8 +670,10 @@ def _cmd_augment_mission(args: argparse.Namespace) -> int:
             blackbox_dir=args.blackbox_dir,
             switch_ratio=args.switch_ratio,
             voxel_m=args.voxel_m,
-            max_facade_distance_m=args.max_facade_distance_m,
-            inspection_speed_ms=args.inspection_speed_ms,
+            max_facade_distance_m=st.get("max_facade_distance_m", args.max_facade_distance_m),
+            inspection_speed_ms=float(st.get("inspection_speed_ms", args.inspection_speed_ms)),
+            target_gsd_mm_per_px=st.get("target_gsd_mm_per_px"),
+            min_action_dwell_s=st.get("min_action_dwell_s"),
             pitch_margin_deg=args.pitch_margin_deg,
             summary_json=args.summary_json,
             log=not args.json,

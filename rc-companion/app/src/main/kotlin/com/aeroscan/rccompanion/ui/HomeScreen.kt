@@ -40,6 +40,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.aeroscan.rccompanion.Connection
 import com.aeroscan.rccompanion.filepick.rememberKmzPicker
+import com.aeroscan.rccompanion.wpml.PlannerSettings
 
 /**
  * Control panel, top to bottom: status strip (4 chips), stepper, then a row
@@ -55,6 +56,7 @@ fun HomeScreen(viewModel: HomeViewModel = viewModel()) {
     val status by viewModel.status.collectAsStateWithLifecycle()
     val drops by viewModel.linkDrops.collectAsStateWithLifecycle()
     val upSince by viewModel.linkUpSince.collectAsStateWithLifecycle()
+    val settings by viewModel.settings.collectAsStateWithLifecycle()
     val map by viewModel.map.collectAsStateWithLifecycle()
     val ctx = LocalContext.current
     val pick = rememberKmzPicker { viewModel.onFilePicked(it) }
@@ -123,6 +125,12 @@ fun HomeScreen(viewModel: HomeViewModel = viewModel()) {
                     verticalArrangement = Arrangement.spacedBy(8.dp),
                 ) {
                     StatTiles(ui = ui, map = map)
+                    PlannerControls(
+                        settings = settings,
+                        enabled = stepOf(ui) == 0,
+                        onSpeed = viewModel::setInspectionSpeed,
+                        onStop = viewModel::setStopAtWaypoint,
+                    )
                     ActionPanel(
                         ui = ui,
                         blockReason = blockReason,
@@ -270,6 +278,39 @@ private fun StatTile(t: Tile, modifier: Modifier = Modifier) {
             style = MaterialTheme.typography.titleLarge,
             color = t.tone?.let { toneColor(it) } ?: cs.onSurface,
             fontWeight = FontWeight.SemiBold,
+        )
+    }
+}
+
+@Composable
+private fun PlannerControls(
+    settings: PlannerSettings,
+    enabled: Boolean,
+    onSpeed: (Double) -> Unit,
+    onStop: (Boolean) -> Unit,
+) {
+    val cs = MaterialTheme.colorScheme
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(8.dp))
+            .background(cs.surfaceVariant.copy(alpha = 0.6f))
+            .padding(horizontal = 10.dp, vertical = 8.dp),
+        verticalArrangement = Arrangement.spacedBy(4.dp),
+    ) {
+        SegToggle(
+            label = "Speed",
+            options = PlannerSettings.SPEED_CHOICES.map { it to "${it.toInt()} m/s" },
+            selected = settings.inspectionSpeedMs,
+            enabled = enabled,
+            onChange = onSpeed,
+        )
+        SegToggle(
+            label = "At WP",
+            options = listOf(true to "Stop & shoot", false to "Fly through"),
+            selected = settings.stopAtWaypoint,
+            enabled = enabled,
+            onChange = onStop,
         )
     }
 }
