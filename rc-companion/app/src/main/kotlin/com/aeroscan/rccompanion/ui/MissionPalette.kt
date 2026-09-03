@@ -20,6 +20,18 @@ object MissionPalette {
     val start = Color(0xFF1F6FEB)
 
     /**
+     * A stable colour per facade for the recognised-point overlay. Identity, not
+     * magnitude, so the hues only have to be distinguishable from each other —
+     * they cycle, because a site has more facets than anyone can label by colour.
+     */
+    private val facadeHues = listOf(
+        Color(0xFF1F6FEB), Color(0xFF00897B), Color(0xFF8E24AA), Color(0xFFEF6C00),
+        Color(0xFF3949AB), Color(0xFF00838F), Color(0xFFC2185B), Color(0xFF558B2F),
+    )
+
+    fun facadeColor(index: Int): Color = facadeHues[((index % facadeHues.size) + facadeHues.size) % facadeHues.size]
+
+    /**
      * Colour for a gimbal pitch. [pitchDeg] runs 0 (level, at a wall) to −90
      * (straight down, at the ground); positive is looking up. The ramp is
      * lightness only — one hue — so a glance separates wall shots from ground

@@ -232,7 +232,13 @@ class HomeViewModel(app: Application) : AndroidViewModel(app) {
                     val ns = g.optJSONArray("n")
                     val nv = DoubleArray(3)
                     if (ns != null) for (k in 0 until minOf(3, ns.length())) nv[k] = ns.getDouble(k)
-                    quads.add(FacadeQuad(v, nv, 0))
+                    val ss = g.optJSONArray("s")
+                    val sample = DoubleArray((ss?.length() ?: 0) * 3)
+                    if (ss != null) for (c in 0 until ss.length()) {
+                        val pt = ss.getJSONArray(c)
+                        sample[3 * c] = pt.getDouble(0); sample[3 * c + 1] = pt.getDouble(1); sample[3 * c + 2] = pt.getDouble(2)
+                    }
+                    quads.add(FacadeQuad(v, nv, 0, g.optInt("pts", 0), sample))
                 }
                 val tgt = obj.optJSONArray("wp_target")
                 val targets = IntArray(tgt?.length() ?: 0) { tgt!!.getInt(it) }
@@ -322,6 +328,27 @@ class HomeViewModel(app: Application) : AndroidViewModel(app) {
     val settings: StateFlow<PlannerSettings> = _settings.asStateFlow()
     fun setInspectionSpeed(ms: Double) { _settings.value = _settings.value.copy(inspectionSpeedMs = ms) }
     fun setStopAtWaypoint(v: Boolean) { _settings.value = _settings.value.copy(stopAtWaypoint = v) }
+    fun setDetail(d: PlannerSettings.Detail) { _settings.value = _settings.value.copy(detail = d) }
+
+    /**
+     * Run the augment again on the mission already picked, with whatever the
+     * planner controls now say. The Manifold caches the registration, so a
+     * re-run skips the mesh load and the ICP and comes back in seconds.
+     */
+    fun reaugment() {
+        val file = when (val u = _ui.value) {
+            is UiState.ReviewReady -> u.file
+            is UiState.ReadyToFly -> u.file
+            is UiState.Error -> u.file
+            else -> null
+        } ?: return
+        viewModelScope.launch {
+            session?.closeAndRelease()
+            session = null
+            _ui.value = UiState.Picked(file)
+            augment()
+        }
+    }
 
     private var augmentJob: Job? = null
     private var session: AugmentSession? = null

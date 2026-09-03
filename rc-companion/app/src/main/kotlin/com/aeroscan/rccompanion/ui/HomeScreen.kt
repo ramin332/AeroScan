@@ -74,6 +74,7 @@ fun HomeScreen(viewModel: HomeViewModel = viewModel()) {
     val blockReason = augmentBlockReason(conn, banner, status, drops, upSince, now)
     var layer by remember { mutableStateOf(MapLayer.Both) }
     var view by remember { mutableStateOf(MapView.Top) }
+    var showPoints by remember { mutableStateOf(true) }
 
     Scaffold { padding ->
         Column(
@@ -96,6 +97,16 @@ fun HomeScreen(viewModel: HomeViewModel = viewModel()) {
                     options = listOf(MapView.Top to "Top", MapView.Orbit to "3D"),
                     selected = view, enabled = true, onChange = { view = it },
                 )
+                if (view == MapView.Orbit) {
+                    Spacer(Modifier.width(12.dp))
+                    SegToggle(
+                        label = "Points",
+                        options = listOf(true to "Recognised", false to "Off"),
+                        selected = showPoints,
+                        enabled = map?.facades?.isNotEmpty() == true,
+                        onChange = { showPoints = it },
+                    )
+                }
                 Spacer(Modifier.width(12.dp))
                 SegToggle(
                     label = "Aim",
@@ -114,7 +125,7 @@ fun HomeScreen(viewModel: HomeViewModel = viewModel()) {
             ) {
                 Column(modifier = Modifier.weight(1.45f), verticalArrangement = Arrangement.spacedBy(6.dp)) {
                     if (view == MapView.Top) MissionMap(data = map, heightDp = 268, layer = layer)
-                    else MissionScene3D(data = map, heightDp = 268, layer = layer)
+                    else MissionScene3D(data = map, heightDp = 268, layer = layer, showRecognised = showPoints)
                     MissionLegend(map)
                 }
                 Column(
@@ -127,9 +138,10 @@ fun HomeScreen(viewModel: HomeViewModel = viewModel()) {
                     StatTiles(ui = ui, map = map)
                     PlannerControls(
                         settings = settings,
-                        enabled = stepOf(ui) == 0,
+                        enabled = stepOf(ui) != 1,
                         onSpeed = viewModel::setInspectionSpeed,
                         onStop = viewModel::setStopAtWaypoint,
+                        onDetail = viewModel::setDetail,
                     )
                     ActionPanel(
                         ui = ui,
@@ -139,6 +151,7 @@ fun HomeScreen(viewModel: HomeViewModel = viewModel()) {
                         onCancel = viewModel::cancel,
                         onApprove = viewModel::approve,
                         onReject = viewModel::reject,
+                        onReaugment = viewModel::reaugment,
                         onOpenPilot2 = { openPilot2(ctx) },
                         onReset = viewModel::reset,
                     )
@@ -288,6 +301,7 @@ private fun PlannerControls(
     enabled: Boolean,
     onSpeed: (Double) -> Unit,
     onStop: (Boolean) -> Unit,
+    onDetail: (PlannerSettings.Detail) -> Unit,
 ) {
     val cs = MaterialTheme.colorScheme
     Column(
@@ -312,6 +326,13 @@ private fun PlannerControls(
             enabled = enabled,
             onChange = onStop,
         )
+        SegToggle(
+            label = "Detail",
+            options = PlannerSettings.Detail.entries.map { it to it.label },
+            selected = settings.detail,
+            enabled = enabled,
+            onChange = onDetail,
+        )
     }
 }
 
@@ -326,6 +347,7 @@ private fun ActionPanel(
     onCancel: () -> Unit,
     onApprove: () -> Unit,
     onReject: () -> Unit,
+    onReaugment: () -> Unit,
     onOpenPilot2: () -> Unit,
     onReset: () -> Unit,
 ) {
@@ -381,6 +403,7 @@ private fun ActionPanel(
                 if (notes.isEmpty()) Hint("No issues. Red rings on the map = none.")
                 else notes.forEach { Hint("• $it", warn = true) }
                 Hint("ICP %.2f m · pitch %.0f…%.0f° · %.0f s".format(s.icpRmseM, s.pitchMin, s.pitchMax, s.elapsedSec))
+                Secondary("Re-augment with these settings", onReaugment)
                 Secondary("Reject", onReject)
             }
             is HomeViewModel.UiState.Approving -> {

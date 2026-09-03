@@ -183,6 +183,14 @@ class Facade:
     # Facade index in the building
     index: int = 0
 
+    # How many cloud points the extractor assigned to this facet, and a small
+    # deterministic sample of them. The count is the honest confidence signal
+    # (a facet backed by 40 points is a guess; one backed by 4000 is a wall);
+    # the sample is what the RC draws so the pilot can see WHICH points were
+    # recognised. Both are empty for facades that did not come from a cloud.
+    inlier_count: int = 0
+    inlier_sample: np.ndarray | None = None  # shape (M, 3) or None
+
     @property
     def center(self) -> np.ndarray:
         """Centroid of the facade polygon."""

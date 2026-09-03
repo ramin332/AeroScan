@@ -127,7 +127,40 @@ SETTING_KEYS: dict[str, tuple[type, float, float]] = {
     "switch_cost": (float, 0.0, 50.0),
     "max_facade_distance_m": (float, 1.0, 100.0),
     "min_action_dwell_s": (float, 0.0, 10.0),
+    # Facade detection. These are the knobs a pilot turns on site when the
+    # extractor missed a wall or invented one; ranges match what the CGAL
+    # region-growing extractor tolerates before it stops producing anything.
+    "fd_min_points": (int, 8, 2000),
+    "fd_epsilon_m": (float, 0.01, 0.50),
+    "fd_cluster_epsilon_m": (float, 0.05, 2.00),
+    "fd_min_wall_area_m2": (float, 0.1, 50.0),
+    "fd_min_density_per_m2": (float, 1.0, 400.0),
 }
+
+#: Detection settings, mapped onto facades_from_pointcloud_cgal keyword names.
+FACADE_DETECT_MAP: dict[str, str] = {
+    "fd_min_points": "min_points",
+    "fd_epsilon_m": "epsilon",
+    "fd_cluster_epsilon_m": "cluster_epsilon",
+    "fd_min_wall_area_m2": "min_wall_area_m2",
+    "fd_min_density_per_m2": "min_density_per_m2",
+}
+
+
+def facade_detect_kwargs(settings: dict[str, Any] | None) -> dict[str, Any]:
+    """Translate the RC's fd_* settings into extractor keyword arguments."""
+    if not settings:
+        return {}
+    out: dict[str, Any] = {}
+    for key, kw in FACADE_DETECT_MAP.items():
+        if key in settings:
+            out[kw] = settings[key]
+    # Roof and tilted facets share the wall's area floor unless someone asks
+    # for something else — one number is what a pilot can reason about on site.
+    if "min_wall_area_m2" in out:
+        out["min_roof_area_m2"] = out["min_wall_area_m2"]
+        out["min_tilted_area_m2"] = out["min_wall_area_m2"] * 0.8
+    return out
 
 #: Free-form settings that are not numeric ranges.
 SETTING_CHOICES: dict[str, tuple[str, ...]] = {

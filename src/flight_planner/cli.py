@@ -17,6 +17,7 @@ DJI's flight-tested trajectory and waypoint spacing are preserved verbatim.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import sys
 import tempfile
@@ -42,6 +43,7 @@ from .kmz_import import (
 )
 from .manifold import from_manifold, register_to_kmz_frame
 from .mission_intent import (
+    facade_detect_kwargs,
     read_intent_json,
     write_intent_json,
 )
@@ -87,6 +89,59 @@ _ANOMALY_PITCH_DOWN_DEG = -85.0
 
 
 
+
+class _RegistrationCache:
+    """Disk cache for the registered Manifold cloud, keyed by what it depends on.
+
+    The key is the flight id, the ICP target's content hash and the voxel size.
+    Change any of those and the cache misses; change only a planner knob and it
+    hits, which is the whole point — re-augmenting to try different facade
+    detection must not re-run a two-minute ICP.
+
+    A corrupt or unreadable entry is a miss, never an error: the slow path
+    always works.
+    """
+
+    def __init__(self, root: Path, flight_id: str, icp_target_ply: Path, voxel_m: float) -> None:
+        self.root = Path(root)
+        digest = hashlib.sha256()
+        digest.update(str(flight_id).encode())
+        digest.update(f"{voxel_m:.4f}".encode())
+        try:
+            digest.update(Path(icp_target_ply).read_bytes())
+        except OSError:
+            digest.update(b"unreadable")
+        self.key = digest.hexdigest()[:16]
+
+    @property
+    def _ply(self) -> Path:
+        return self.root / f"{self.key}.ply"
+
+    @property
+    def _meta(self) -> Path:
+        return self.root / f"{self.key}.json"
+
+    def load(self) -> tuple[o3d.geometry.PointCloud, dict] | None:
+        if not (self._ply.exists() and self._meta.exists()):
+            return None
+        try:
+            pc = o3d.io.read_point_cloud(str(self._ply))
+            if len(pc.points) == 0:
+                return None
+            return pc, json.loads(self._meta.read_text())
+        except Exception:
+            return None
+
+    def save(self, registered: o3d.geometry.PointCloud, icp_stats: dict) -> None:
+        try:
+            self.root.mkdir(parents=True, exist_ok=True)
+            o3d.io.write_point_cloud(str(self._ply), registered)
+            self._meta.write_text(json.dumps(icp_stats, default=float))
+        except Exception:
+            # A cache that cannot be written must not fail the mission.
+            pass
+
+
 def _facade_geometry(facades) -> list[dict]:
     """Facade rectangles for the RC mission view.
 
@@ -118,10 +173,15 @@ def _facade_geometry(facades) -> list[dict]:
                 c + u * su.max() + w * sw.max(),
                 c + u * su.min() + w * sw.max(),
             ])
-        out.append({
+        entry = {
             "v": [[round(float(a), 2) for a in p] for p in v],
             "n": [round(float(a), 3) for a in np.asarray(f.normal, dtype=float)],
-        })
+            "pts": int(getattr(f, "inlier_count", 0) or 0),
+        }
+        sample = getattr(f, "inlier_sample", None)
+        if sample is not None and len(sample):
+            entry["s"] = [[round(float(a), 2) for a in p] for p in np.asarray(sample, dtype=float)]
+        out.append(entry)
     return out
 
 
@@ -272,6 +332,8 @@ def augment_mission(
     pitch_margin_deg: float = _NEN_PITCH_MARGIN_DEG,
     target_gsd_mm_per_px: float | None = None,
     min_action_dwell_s: float | None = None,
+    facade_detect: dict | None = None,
+    reuse_registration: bool = True,
     switch_ratio: float = _NEN_SWITCH_RATIO,
     stop_at_waypoint: bool = True,
     assign_mode: str = _NEN_ASSIGN_MODE,
@@ -306,19 +368,35 @@ def augment_mission(
     waypoints = _waypoints_from_intent(intent)
     polygon_enu = polygon_to_enu(intent.mission_area_wgs84, intent.ref_lat, intent.ref_lon, intent.ref_alt)
 
-    _log(f"[2/7] Loading Manifold cloud from {blackbox_dir / flight_id}/dji_perception/*/ (newest subdir)")
-    manifold_pc = from_manifold(flight_id, blackbox_dir=blackbox_dir, voxel_m=voxel_m)
-    _log(f"      manifold cloud: {len(manifold_pc.points):,} pts (after {voxel_m*100:.0f} cm voxel)")
+    # Steps 2–4 (mesh load + ICP) dominate the runtime and depend only on the
+    # flight and the ICP target — not on any planner knob. Caching them is what
+    # makes "change a detection setting and look again" a seconds-long loop on
+    # the RC instead of a multi-minute one.
+    cache = _RegistrationCache(
+        Path(output_kmz).parent / ".regcache", flight_id, icp_target_ply, voxel_m,
+    ) if reuse_registration else None
+    cached = cache.load() if cache else None
 
-    _log(f"[3/7] Loading ICP target cloud: {icp_target_ply}")
-    kmz_pc = _load_icp_target(icp_target_ply)
-    _log(f"      icp target: {len(kmz_pc.points):,} pts")
+    if cached is not None:
+        registered, icp_stats = cached
+        _log(f"[2-4/7] Reusing cached registration ({len(registered.points):,} pts, "
+             f"RMSE {icp_stats['icp_rmse_m']:.3f} m) — mesh load + ICP skipped")
+    else:
+        _log(f"[2/7] Loading Manifold cloud from {blackbox_dir / flight_id}/dji_perception/*/ (newest subdir)")
+        manifold_pc = from_manifold(flight_id, blackbox_dir=blackbox_dir, voxel_m=voxel_m)
+        _log(f"      manifold cloud: {len(manifold_pc.points):,} pts (after {voxel_m*100:.0f} cm voxel)")
 
-    _log("[4/7] Registering Manifold → KMZ frame (multi-scale point-to-point ICP)…")
-    registered, _T, icp_stats = register_to_kmz_frame(manifold_pc, kmz_pc)
-    for s in icp_stats["icp_per_scale"]:
-        _log(f"        {s['voxel_m']*100:.0f} cm   fitness {s['fitness']:.3f}   RMSE {s['rmse_m']:.3f} m")
-    _log(f"      coarse yaw: {icp_stats['coarse_yaw_deg']:.0f}°   final RMSE: {icp_stats['icp_rmse_m']:.3f} m")
+        _log(f"[3/7] Loading ICP target cloud: {icp_target_ply}")
+        kmz_pc = _load_icp_target(icp_target_ply)
+        _log(f"      icp target: {len(kmz_pc.points):,} pts")
+
+        _log("[4/7] Registering Manifold → KMZ frame (multi-scale point-to-point ICP)…")
+        registered, _T, icp_stats = register_to_kmz_frame(manifold_pc, kmz_pc)
+        for s in icp_stats["icp_per_scale"]:
+            _log(f"        {s['voxel_m']*100:.0f} cm   fitness {s['fitness']:.3f}   RMSE {s['rmse_m']:.3f} m")
+        _log(f"      coarse yaw: {icp_stats['coarse_yaw_deg']:.0f}°   final RMSE: {icp_stats['icp_rmse_m']:.3f} m")
+        if cache is not None:
+            cache.save(registered, icp_stats)
 
     # Mirror the dev backend's KMZ-import preprocessing exactly:
     #   1. Pass FULL pcd.points to CGAL (no pre-voxel, no pre-Z-floor).
@@ -360,6 +438,11 @@ def augment_mission(
     # different thresholds.
     fd_kwargs = estimate_facade_detection_defaults(points_xyz)
     fd_kwargs.pop("_estimator", None)
+    # The pilot's on-site overrides beat the cloud-derived estimate. This is the
+    # tune-and-look loop: change a knob on the RC, re-augment, see the facets.
+    if facade_detect:
+        fd_kwargs.update(facade_detect)
+        _log(f"      pilot overrides: {', '.join(f'{k}={v}' for k, v in sorted(facade_detect.items()))}")
     if fd_kwargs:
         _log("      auto-estimated CGAL knobs: "
              + ", ".join(f"{k}={v}" for k, v in fd_kwargs.items()))
@@ -674,6 +757,7 @@ def _cmd_augment_mission(args: argparse.Namespace) -> int:
             inspection_speed_ms=float(st.get("inspection_speed_ms", args.inspection_speed_ms)),
             target_gsd_mm_per_px=st.get("target_gsd_mm_per_px"),
             min_action_dwell_s=st.get("min_action_dwell_s"),
+            facade_detect=facade_detect_kwargs(st),
             pitch_margin_deg=args.pitch_margin_deg,
             summary_json=args.summary_json,
             log=not args.json,

@@ -51,7 +51,12 @@ data class FacadeQuad(
     val n: DoubleArray,
     /** How many waypoints are aimed at this facade. */
     val waypoints: Int,
+    /** How many cloud points the extractor assigned to this facet. */
+    val inlierCount: Int = 0,
+    /** A sample of those points, 3 doubles each — what the 3D view draws. */
+    val sample: DoubleArray = DoubleArray(0),
 ) {
+    val sampleCount: Int get() = sample.size / 3
     val cornerCount: Int get() = v.size / 3
     val covered: Boolean get() = waypoints > 0
     fun cx(): Double { var s = 0.0; for (i in 0 until cornerCount) s += v[3 * i]; return s / cornerCount }
@@ -92,6 +97,8 @@ data class MissionMapData(
     val heightM: Double get() = maxN - minN
     val cloudPointCount: Int get() = cloudXYZ.size / 3
     val uncoveredFacades: Int get() = facades.count { !it.covered }
+    /** Points the extractor recognised as belonging to some facade. */
+    val recognisedPoints: Int get() = facades.sumOf { it.inlierCount }
 
     fun wpE(i: Int) = pathXYZ[3 * i]
     fun wpN(i: Int) = pathXYZ[3 * i + 1]

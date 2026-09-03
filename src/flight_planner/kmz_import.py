@@ -971,6 +971,10 @@ def _reject_ground_facets(
     return kept
 
 
+#: Points kept per facet for the RC's "what was recognised" overlay.
+_FACADE_INLIER_SAMPLE = 24
+
+
 @timed("facades_from_pointcloud_cgal")
 def facades_from_pointcloud_cgal(
     points_enu: np.ndarray,
@@ -1372,12 +1376,18 @@ def facades_from_pointcloud_cgal(
             base + width * u_dir + height * v_dir,
             base + height * v_dir,
         ])
+        # Keep the evidence: how many points backed this facet, plus an evenly
+        # spaced sample of them for the RC's 3D view. Stride sampling (not
+        # random) so the same cloud always yields the same picture.
+        sample_stride = max(1, len(inl_pts) // _FACADE_INLIER_SAMPLE)
         facades.append(Facade(
             vertices=corners,
             normal=normal,
             component_tag=tag,
             label=label_pref,
             index=len(facades),
+            inlier_count=int(len(inl_pts)),
+            inlier_sample=np.ascontiguousarray(inl_pts[::sample_stride][:_FACADE_INLIER_SAMPLE]),
         ))
 
     before_gate = len(facades)

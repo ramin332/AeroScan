@@ -382,3 +382,99 @@ def test_intent_json_round_trips_settings():
         intent = read_intent_json(p)
     assert intent.settings["inspection_speed_ms"] == 1.0
     assert intent.settings["assign_mode"] == "greedy"
+
+
+def test_facade_detect_kwargs_maps_pilot_knobs_to_the_extractor():
+    from flight_planner.mission_intent import coerce_settings, facade_detect_kwargs
+
+    st = coerce_settings({
+        "fd_min_points": 12,
+        "fd_epsilon_m": 0.08,
+        "fd_cluster_epsilon_m": 0.4,
+        "fd_min_wall_area_m2": 1.0,
+        "fd_min_density_per_m2": 10.0,
+        "inspection_speed_ms": 2.0,
+    })
+    kw = facade_detect_kwargs(st)
+    assert kw["min_points"] == 12
+    assert kw["epsilon"] == 0.08
+    assert kw["cluster_epsilon"] == 0.4
+    assert kw["min_wall_area_m2"] == 1.0
+    assert kw["min_roof_area_m2"] == 1.0
+    assert kw["min_tilted_area_m2"] == 0.8
+    assert kw["min_density_per_m2"] == 10.0
+    # Non-detection settings never leak into the extractor's kwargs.
+    assert "inspection_speed_ms" not in kw
+    assert facade_detect_kwargs({}) == {}
+    assert facade_detect_kwargs(None) == {}
+
+
+def test_facade_detect_knobs_are_clamped_to_workable_ranges():
+    from flight_planner.mission_intent import coerce_settings
+
+    st = coerce_settings({"fd_min_points": 1, "fd_epsilon_m": 99.0, "fd_min_density_per_m2": 0.0})
+    assert st["fd_min_points"] == 8
+    assert st["fd_epsilon_m"] == 0.5
+    assert st["fd_min_density_per_m2"] == 1.0
+
+
+def test_facade_geometry_carries_the_recognised_points():
+    import numpy as np
+
+    from flight_planner.cli import _facade_geometry
+    from flight_planner.models import Facade
+
+    f = Facade(
+        vertices=np.array([[0.0, 0.0, 0.0], [4.0, 0.0, 0.0], [4.0, 0.0, 3.0], [0.0, 0.0, 3.0]]),
+        normal=np.array([0.0, -1.0, 0.0]),
+        inlier_count=812,
+        inlier_sample=np.array([[1.0, 0.01, 1.0], [2.0, -0.02, 2.0]]),
+    )
+    out = _facade_geometry([f])[0]
+    assert out["pts"] == 812
+    assert out["s"] == [[1.0, 0.01, 1.0], [2.0, -0.02, 2.0]]
+    # A facade with no cloud evidence omits the sample rather than sending [].
+    bare = _facade_geometry([Facade(vertices=f.vertices, normal=f.normal)])[0]
+    assert bare["pts"] == 0
+    assert "s" not in bare
+
+
+def test_registration_cache_keys_on_flight_target_and_voxel(tmp_path):
+    import numpy as np
+    import open3d as o3d
+
+    from flight_planner.cli import _RegistrationCache
+
+    target = tmp_path / "cloud.ply"
+    target.write_bytes(b"ply-bytes-a")
+    root = tmp_path / "regcache"
+
+    a = _RegistrationCache(root, "flight0080", target, 0.1)
+    assert a.load() is None  # cold
+
+    pc = o3d.geometry.PointCloud()
+    pc.points = o3d.utility.Vector3dVector(np.array([[0.0, 0.0, 0.0], [1.0, 1.0, 1.0]]))
+    a.save(pc, {"icp_rmse_m": 0.42})
+
+    hit = _RegistrationCache(root, "flight0080", target, 0.1).load()
+    assert hit is not None and len(hit[0].points) == 2
+    assert hit[1]["icp_rmse_m"] == 0.42
+
+    # A different flight, a different target, or a different voxel all miss.
+    assert _RegistrationCache(root, "flight0081", target, 0.1).load() is None
+    assert _RegistrationCache(root, "flight0080", target, 0.2).load() is None
+    other = tmp_path / "other.ply"
+    other.write_bytes(b"ply-bytes-b")
+    assert _RegistrationCache(root, "flight0080", other, 0.1).load() is None
+
+
+def test_registration_cache_survives_a_corrupt_entry(tmp_path):
+    from flight_planner.cli import _RegistrationCache
+
+    target = tmp_path / "cloud.ply"
+    target.write_bytes(b"x")
+    c = _RegistrationCache(tmp_path / "regcache", "f", target, 0.1)
+    c.root.mkdir(parents=True, exist_ok=True)
+    c._ply.write_bytes(b"not a ply")
+    c._meta.write_text("{not json")
+    assert c.load() is None

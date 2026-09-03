@@ -39,6 +39,7 @@ fun MissionScene3D(
     modifier: Modifier = Modifier,
     heightDp: Int = 280,
     layer: MapLayer = MapLayer.Both,
+    showRecognised: Boolean = true,
 ) {
     val cs = MaterialTheme.colorScheme
     var camera by remember { mutableStateOf(OrbitCamera()) }
@@ -74,7 +75,7 @@ fun MissionScene3D(
 
             // 1. Cloud — the scanned surface, drawn first so everything sits on it.
             if (data.cloudPointCount > 0) {
-                val dot = 1.6.dp.toPx()
+                val dot = 1.4.dp.toPx()
                 for (i in 0 until data.cloudPointCount) {
                     val q = p.project(
                         data.cloudXYZ[3 * i].toDouble(),
@@ -85,7 +86,22 @@ fun MissionScene3D(
                 }
             }
 
-            // 2. Facades, painter's algorithm (far first) so near walls occlude.
+            // 2. The points the extractor actually recognised, coloured by the
+            //    facet that claimed them. This is what "recognised" means: the
+            //    grey cloud is everything scanned, these are the parts that
+            //    became facades.
+            if (showRecognised) {
+                val dot = 2.2.dp.toPx()
+                data.facades.forEachIndexed { fi, f ->
+                    val col = MissionPalette.facadeColor(fi)
+                    for (i in 0 until f.sampleCount) {
+                        val q = p.project(f.sample[3 * i], f.sample[3 * i + 1], f.sample[3 * i + 2])
+                        if (q.depth > 0.1) drawCircle(col, dot, Offset(q.x, q.y))
+                    }
+                }
+            }
+
+            // 3. Facades, painter's algorithm (far first) so near walls occlude.
             if (data.facades.isNotEmpty()) {
                 val order = data.facades.indices.sortedByDescending { i ->
                     p.project(data.facades[i].cx(), data.facades[i].cy(), data.facades[i].cz()).depth
@@ -107,7 +123,7 @@ fun MissionScene3D(
                 }
             }
 
-            // 3. Flight path.
+            // 4. Flight path.
             val line = Path()
             var started = false
             for (i in 0 until data.waypointCount) {
@@ -117,7 +133,7 @@ fun MissionScene3D(
             }
             drawPath(line, MissionPalette.path.copy(alpha = 0.75f), style = Stroke(width = 1.dp.toPx()))
 
-            // 4. Camera rays — the point of this view.
+            // 5. Camera rays — the point of this view.
             for (i in 0 until data.waypointCount) {
                 val a = p.project(data.wpE(i), data.wpN(i), data.wpU(i))
                 if (a.depth <= 0.1) continue
@@ -148,7 +164,7 @@ fun MissionScene3D(
                 }
             }
 
-            // 5. Waypoints, flags, start.
+            // 6. Waypoints, flags, start.
             for (i in 0 until data.waypointCount) {
                 val q = p.project(data.wpE(i), data.wpN(i), data.wpU(i))
                 if (q.depth <= 0.1) continue
@@ -168,7 +184,8 @@ fun MissionScene3D(
         )
         if (data.facades.isNotEmpty()) {
             Text(
-                "${data.facades.size - data.uncoveredFacades}/${data.facades.size} facades covered",
+                "${data.facades.size - data.uncoveredFacades}/${data.facades.size} facades covered · " +
+                    "${data.recognisedPoints} points recognised",
                 style = MaterialTheme.typography.labelSmall,
                 color = cs.onSurfaceVariant,
                 modifier = Modifier.align(Alignment.TopEnd).padding(8.dp),

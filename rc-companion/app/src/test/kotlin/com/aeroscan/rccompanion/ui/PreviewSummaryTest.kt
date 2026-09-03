@@ -39,6 +39,22 @@ class PreviewSummaryTest {
     }
 
     @Test
+    fun recognised_points_and_facet_evidence_parse() {
+        val json = """{"name":"m",$base,
+            "facade_geom":[{"v":[[0,0,0],[4,0,0],[4,0,3],[0,0,3]],"n":[0,-1,0],"pts":812,
+                            "s":[[1,0.01,1],[2,-0.02,2]]},
+                           {"v":[[9,9,0],[10,9,0],[10,9,2],[9,9,2]],"n":[0,-1,0],"pts":41}],
+            "wp_target":[0,0,-1]}"""
+        val s = HomeViewModel.PreviewSummary.fromJson(json.toByteArray())
+        assertEquals(812, s.facadeGeom[0].inlierCount)
+        assertEquals(2, s.facadeGeom[0].sampleCount)
+        assertEquals(0.01, s.facadeGeom[0].sample[1], 1e-9)
+        // A facet the engine sent without a sample is still usable.
+        assertEquals(41, s.facadeGeom[1].inlierCount)
+        assertEquals(0, s.facadeGeom[1].sampleCount)
+    }
+
+    @Test
     fun old_manifold_summary_without_new_keys_still_parses() {
         val s = HomeViewModel.PreviewSummary.fromJson("""{"name":"m",$base}""".toByteArray())
         assertNull(s.gsdMedianMmPx); assertEquals(0, s.flips); assertTrue(s.stopAtWaypoint)

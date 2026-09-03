@@ -116,10 +116,43 @@ data class PlannerSettings(
     val inspectionSpeedMs: Double = 3.0,
     /** Stop at every waypoint to rotate and shoot (DJI toPointAndStop*). */
     val stopAtWaypoint: Boolean = true,
+    /** How hard the extractor looks for facades. */
+    val detail: Detail = Detail.Normal,
 ) {
+    /**
+     * Facade-detection presets. The engine takes five separate numbers; a pilot
+     * on site can reason about one axis — "it missed the small stuff" versus
+     * "it invented walls out of noise" — so the RC offers that axis and the
+     * engine clamps whatever arrives.
+     */
+    enum class Detail(
+        val label: String,
+        val minPoints: Int,
+        val epsilonM: Double,
+        val clusterEpsilonM: Double,
+        val minWallAreaM2: Double,
+        val minDensityPerM2: Double,
+    ) {
+        /** Small features: window sills, parapets, balcony panels. More noise facets. */
+        Fine("Fine", 20, 0.035, 0.18, 0.3, 15.0),
+        /** The engine's own cloud-derived defaults. */
+        Normal("Normal", 40, 0.05, 0.25, 0.5, 25.0),
+        /** Whole walls only. Fewer, larger, more certain facets. */
+        Coarse("Coarse", 90, 0.08, 0.40, 1.5, 40.0),
+    }
+
     fun toJson(): JSONObject = JSONObject().apply {
         put("inspection_speed_ms", inspectionSpeedMs)
         put("stop_at_waypoint", stopAtWaypoint)
+        // Normal means "let the engine estimate from the cloud" — sending its
+        // numbers would freeze an estimate that adapts to point density.
+        if (detail != Detail.Normal) {
+            put("fd_min_points", detail.minPoints)
+            put("fd_epsilon_m", detail.epsilonM)
+            put("fd_cluster_epsilon_m", detail.clusterEpsilonM)
+            put("fd_min_wall_area_m2", detail.minWallAreaM2)
+            put("fd_min_density_per_m2", detail.minDensityPerM2)
+        }
     }
 
     companion object {
