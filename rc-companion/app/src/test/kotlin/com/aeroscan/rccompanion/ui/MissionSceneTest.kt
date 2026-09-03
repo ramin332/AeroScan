@@ -95,6 +95,30 @@ class MissionSceneTest {
     }
 
     @Test
+    fun dragging_right_orbits_the_eye_to_the_right() {
+        // 2026-09-03, pilot on the RC: "rotating is counter intuitive in 3D
+        // (right is left)". The shipped mapping moved the scene with the finger
+        // (Google-Earth style); the pilot expects the eye to move with the
+        // finger instead, so a rightward drag now raises the azimuth and the
+        // scene swings the other way. One constant (the sign in withDrag)
+        // switches it back if that reads wrong in the air.
+        val c = OrbitCamera(azimuthDeg = 0.0, elevationDeg = 20.0, zoom = 1.0)
+        val d = scene(wps = arrayOf(wp(0, 0.0, 10.0, 0.0, 0.0), wp(1, 0.0, -10.0, 0.0, 0.0)))
+        val dragged = c.withDrag(panX = 40f, panY = 0f, zoomFactor = 1f)
+        assertEquals(10.0, dragged.azimuthDeg, 1e-9)
+        val before = SceneProjector(d, c, 400f, 300f).project(10.0, 0.0, 0.0)
+        val after = SceneProjector(d, dragged, 400f, 300f).project(10.0, 0.0, 0.0)
+        assertTrue("scene should swing left, was ${before.x} now ${after.x}", after.x < before.x)
+    }
+
+    @Test
+    fun dragging_down_looks_further_down_on_the_site() {
+        val c = OrbitCamera(azimuthDeg = 0.0, elevationDeg = 20.0, zoom = 1.0)
+        assertTrue(c.withDrag(0f, 40f, 1f).elevationDeg > c.elevationDeg)
+        assertTrue(c.withDrag(0f, -40f, 1f).elevationDeg < c.elevationDeg)
+    }
+
+    @Test
     fun points_behind_the_eye_report_non_positive_depth() {
         val d = scene(wps = arrayOf(wp(0, 0.0, 0.0, 0.0, 0.0)))
         val p = SceneProjector(d, OrbitCamera(azimuthDeg = 0.0, elevationDeg = 10.0, zoom = 1.0), 400f, 300f)

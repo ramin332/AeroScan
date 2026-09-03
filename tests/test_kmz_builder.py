@@ -584,3 +584,44 @@ class TestTurnMode:
     def test_fly_through_emits_pass_turn_mode(self):
         xml = _extract_wpml_xml(MissionConfig(stop_at_waypoint=False))
         assert "toPointAndPassWithContinuityCurvature" in xml
+
+
+def test_turn_mode_follows_stop_at_waypoint_end_to_end():
+    """The RC's At-WP toggle must reach the WPML the aircraft executes.
+
+    DJI's WPML turn modes: `toPointAndStopWithContinuityCurvature` halts at the
+    point, `toPointAndPassWithContinuityCurvature` flies through it. On
+    2026-07-10 the mission flew through and 104 of 398 photos were lost.
+    """
+    import zipfile
+    from io import BytesIO
+
+    from flight_planner.kmz_builder import build_kmz_bytes
+    from flight_planner.models import MissionConfig
+
+    def turn_modes(stop: bool) -> str:
+        raw = build_kmz_bytes(_make_test_waypoints(), MissionConfig(stop_at_waypoint=stop))
+        with zipfile.ZipFile(BytesIO(raw)) as zf:
+            name = next(n for n in zf.namelist() if n.endswith("waylines.wpml"))
+            return zf.read(name).decode("utf-8")
+
+    stopped = turn_modes(True)
+    passing = turn_modes(False)
+    assert "toPointAndStopWithContinuityCurvature" in stopped
+    assert "toPointAndPassWithContinuityCurvature" not in stopped
+    assert "toPointAndPassWithContinuityCurvature" in passing
+    assert "toPointAndStopWithContinuityCurvature" not in passing
+
+
+def test_intent_settings_select_the_turn_mode():
+    """RC toggle -> intent settings -> the flag augment_mission passes on."""
+    from flight_planner.mission_intent import coerce_settings
+
+    for sent, expected in ((True, True), (False, False)):
+        st = coerce_settings({"stop_at_waypoint": sent})
+        # Same expression _cmd_augment_mission uses; the CLI default is ignored
+        # whenever the RC supplied the key.
+        assert bool(st.get("stop_at_waypoint", not True)) is expected
+    # Key absent: the CLI's own --fly-through decides.
+    st = coerce_settings({})
+    assert bool(st.get("stop_at_waypoint", not False)) is True

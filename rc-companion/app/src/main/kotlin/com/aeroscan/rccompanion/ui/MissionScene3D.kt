@@ -53,11 +53,7 @@ fun MissionScene3D(
             .background(cs.surfaceVariant.copy(alpha = 0.5f))
             .pointerInput(Unit) {
                 detectTransformGestures { _, pan, zoom, _ ->
-                    camera = camera.withDelta(
-                        dAzimuth = (-pan.x / 4.0),
-                        dElevation = (pan.y / 4.0),
-                        dZoom = zoom.toDouble(),
-                    )
+                    camera = camera.withDrag(pan.x, pan.y, zoom)
                 }
             },
         contentAlignment = Alignment.Center,
@@ -72,7 +68,9 @@ fun MissionScene3D(
         }
         Canvas(modifier = Modifier.fillMaxSize()) {
             val p = SceneProjector(data, camera, size.width, size.height)
-            val fallbackRay = data.sceneSpanM * 0.08
+            // With no facade targets yet (before the augment) the rays need a
+            // length of their own; too short and they vanish into the waypoint dots.
+            val fallbackRay = data.sceneSpanM * 0.12
 
             // 1. Cloud — the scanned surface, drawn first so everything sits on it.
             if (data.cloudPointCount > 0) {
@@ -130,8 +128,8 @@ fun MissionScene3D(
                         data.wpE(i) + d[0] * len, data.wpN(i) + d[1] * len, data.wpU(i) + d[2] * len,
                     )
                     if (b.depth > 0.1) {
-                        drawLine(MissionPalette.aimOriginal.copy(alpha = 0.55f), Offset(a.x, a.y), Offset(b.x, b.y),
-                            strokeWidth = 1.dp.toPx())
+                        drawLine(MissionPalette.aimOriginal.copy(alpha = 0.8f), Offset(a.x, a.y), Offset(b.x, b.y),
+                            strokeWidth = 1.2.dp.toPx())
                     }
                 }
                 if (showAug) {
@@ -154,7 +152,7 @@ fun MissionScene3D(
             for (i in 0 until data.waypointCount) {
                 val q = p.project(data.wpE(i), data.wpN(i), data.wpU(i))
                 if (q.depth <= 0.1) continue
-                drawCircle(MissionPalette.path, 1.5.dp.toPx(), Offset(q.x, q.y))
+                drawCircle(MissionPalette.path, 1.dp.toPx(), Offset(q.x, q.y))
                 if (i in data.flagged) {
                     drawCircle(MissionPalette.flag, 4.5.dp.toPx(), Offset(q.x, q.y), style = Stroke(width = 1.5.dp.toPx()))
                 }

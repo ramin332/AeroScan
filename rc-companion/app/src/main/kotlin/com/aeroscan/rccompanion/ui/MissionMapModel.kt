@@ -257,6 +257,18 @@ data class OrbitCamera(
     /** Multiplier on the scene span for the eye distance. */
     val zoom: Double = 1.0,
 ) {
+    /**
+     * Apply a drag and a pinch. The scene follows the finger: dragging right
+     * turns the scene to the right, which means orbiting the eye the other way —
+     * hence the sign flip on the horizontal pan. Dragging down lifts the eye, so
+     * you look further down onto the site.
+     */
+    fun withDrag(panX: Float, panY: Float, zoomFactor: Float) = withDelta(
+        dAzimuth = panX / DRAG_DEG_PER_PX,
+        dElevation = panY / DRAG_DEG_PER_PX,
+        dZoom = zoomFactor.toDouble(),
+    )
+
     fun withDelta(dAzimuth: Double, dElevation: Double, dZoom: Double) = OrbitCamera(
         azimuthDeg = ((azimuthDeg + dAzimuth) % 360.0 + 360.0) % 360.0,
         elevationDeg = (elevationDeg + dElevation).coerceIn(MIN_ELEVATION_DEG, MAX_ELEVATION_DEG),
@@ -264,6 +276,8 @@ data class OrbitCamera(
     )
 
     companion object {
+        /** Pixels of drag per degree of orbit. */
+        const val DRAG_DEG_PER_PX = 4.0
         const val MIN_ELEVATION_DEG = 2.0
         const val MAX_ELEVATION_DEG = 85.0
         const val MIN_ZOOM = 0.25
@@ -284,7 +298,7 @@ class SceneProjector(
     private val cy = (data.minN + data.maxN) / 2.0
     private val cz = (data.minU + data.maxU) / 2.0
     private val span = max(1.0, data.sceneSpanM)
-    private val eyeDist = span * 1.35 / camera.zoom
+    private val eyeDist = span * 1.05 / camera.zoom
 
     // Camera basis. Forward points from the eye toward the scene centre, so at
     // azimuth 0 the eye sits south of the scene looking north — the same
@@ -304,7 +318,7 @@ class SceneProjector(
     private val uu = cos(el)
 
     /** Focal length in pixels: fits the scene span across the smaller viewport axis. */
-    private val focal = (min(viewW, viewH) * 0.85 / (span / eyeDist)).toDouble()
+    private val focal = (min(viewW, viewH) * 1.05 / (span / eyeDist)).toDouble()
 
     private val eyeE = cx - fe * eyeDist
     private val eyeN = cy - fn * eyeDist
