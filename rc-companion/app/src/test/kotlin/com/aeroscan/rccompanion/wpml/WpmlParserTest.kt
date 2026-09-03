@@ -175,3 +175,62 @@ class WpmlParserTest {
         return baos.toByteArray()
     }
 }
+
+/**
+ * A WPML gimbal command persists until the next one, and our augmenter writes it
+ * as a gimbalRotate action rather than waypointGimbalPitchAngle. Getting either
+ * wrong made the mission view draw every waypoint looking straight ahead —
+ * "it points at the air and can never look down" (pilot, 2026-09-03).
+ */
+class GimbalPoseCarryTest {
+
+    private fun kmz(waylines: String): ByteArray {
+        val bos = java.io.ByteArrayOutputStream()
+        java.util.zip.ZipOutputStream(bos).use { z ->
+            z.putNextEntry(java.util.zip.ZipEntry("wpmz/waylines.wpml"))
+            z.write(waylines.toByteArray())
+            z.closeEntry()
+        }
+        return bos.toByteArray()
+    }
+
+    private fun placemark(index: Int, heading: Double, pitchAction: Double?): String {
+        val action = pitchAction?.let {
+            """<wpml:actionGroup><wpml:action><wpml:actionActuatorFunc>gimbalRotate</wpml:actionActuatorFunc>
+               <wpml:actionActuatorFuncParam><wpml:gimbalPitchRotateEnable>1</wpml:gimbalPitchRotateEnable>
+               <wpml:gimbalPitchRotateAngle>$it</wpml:gimbalPitchRotateAngle>
+               </wpml:actionActuatorFuncParam></wpml:action></wpml:actionGroup>"""
+        } ?: ""
+        return """<Placemark><Point><coordinates>5.0,52.0</coordinates></Point>
+            <wpml:index>$index</wpml:index><wpml:ellipsoidHeight>40</wpml:ellipsoidHeight>
+            <wpml:waypointHeadingParam><wpml:waypointHeadingAngle>$heading</wpml:waypointHeadingAngle></wpml:waypointHeadingParam>
+            $action</Placemark>"""
+    }
+
+    private fun doc(body: String) = """<?xml version="1.0" encoding="UTF-8"?>
+        <kml xmlns="http://www.opengis.net/kml/2.2" xmlns:wpml="http://www.dji.com/wpmz/1.0.6">
+        <Document><Folder>$body</Folder></Document></kml>"""
+
+    @Test
+    fun an_action_driven_pitch_is_read_and_held_until_the_next_command() {
+        val wps = WpmlParser.parseKmz(
+            kmz(doc(placemark(0, 10.0, -28.0) + placemark(1, 20.0, null) + placemark(2, 30.0, -61.0))),
+            missionName = "m",
+        ).intent.waypoints
+        assertEquals(3, wps.size)
+        assertEquals(-28.0, wps[0].gimbalPitchDeg, 1e-9)
+        // No new command: the gimbal is still where it was, not level.
+        assertEquals(-28.0, wps[1].gimbalPitchDeg, 1e-9)
+        assertEquals(-61.0, wps[2].gimbalPitchDeg, 1e-9)
+    }
+
+    @Test
+    fun a_mission_that_never_commands_the_gimbal_stays_level() {
+        val wps = WpmlParser.parseKmz(
+            kmz(doc(placemark(0, 10.0, null) + placemark(1, 20.0, null))),
+            missionName = "m",
+        ).intent.waypoints
+        assertEquals(0.0, wps[0].gimbalPitchDeg, 1e-9)
+        assertEquals(0.0, wps[1].gimbalPitchDeg, 1e-9)
+    }
+}

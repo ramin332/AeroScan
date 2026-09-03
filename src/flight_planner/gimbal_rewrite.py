@@ -267,7 +267,14 @@ def assign_facades_viterbi(
         horiz = np.hypot(d3[:, 0], d3[:, 1])
         pitch = np.degrees(np.arctan2(-d3[:, 2], horiz))  # camera pitch to look at the centre
         pen = np.maximum(0.0, np.abs(pitch) - pitch_soft_deg) / pitch_soft_deg
-        cost = dist * weight * (1.0 + pen)
+        # The penalty orders targets; it must never disqualify one. Left
+        # uncapped it multiplies the cost by up to 2, which can push a facet
+        # that is inside the cap and plainly in view past the "no target" cost —
+        # the gimbal then refuses to look down at a wall 8 m in front of it and
+        # keeps DJI's pose instead. Capping just under the no-target cost keeps
+        # the documented invariant ("any reachable facet beats no target") while
+        # still preferring the squarer look.
+        cost = np.minimum(dist * weight * (1.0 + pen), max_distance_m * (1.0 - 1e-6))
         node[i, :F] = np.where(valid, cost, INF)
         node[i, F] = max_distance_m
         b = np.degrees(np.arctan2(-d3[:, 0], -d3[:, 1]))     # bearing WP → facet, from north

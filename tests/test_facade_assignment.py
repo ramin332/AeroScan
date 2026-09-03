@@ -129,3 +129,51 @@ def test_aim_audit_counts_far_picks_flips_and_blips():
     assert a["single_blips"] == 1
     assert a["switches"] == 2
     assert set(a) >= {"far_picks", "reversals_gt90", "switches", "single_blips", "unaimed", "standoff_p90_m"}
+
+
+def test_a_steep_look_down_never_loses_to_no_target():
+    """2026-09-03, pilot: "the gimbal can never look under the minimum height of
+    the flight path". The soft pitch penalty multiplied a facet's cost by up to
+    2, which could push a facet that is inside the reach cap and directly in view
+    past the cost of aiming at nothing — so a wall 8 m below and in front was
+    left unshot. The penalty must order targets, never disqualify them."""
+    import numpy as np
+
+    from flight_planner.gimbal_rewrite import assign_facades_viterbi
+    from flight_planner.models import Facade, Waypoint
+
+    # A ground-level wall, and a waypoint high above and slightly to the side:
+    # the look-down angle is steep enough for the old penalty to reject it.
+    wall = Facade(
+        vertices=np.array([[-2.0, 0.0, 0.0], [2.0, 0.0, 0.0], [2.0, 0.0, 2.0], [-2.0, 0.0, 2.0]]),
+        normal=np.array([0.0, -1.0, 0.0]),
+        component_tag="21.1",
+    )
+    wps = [
+        Waypoint(x=0.0, y=-2.0, z=8.0 + i * 0.01, heading_deg=0.0, gimbal_pitch_deg=0.0, index=i)
+        for i in range(3)
+    ]
+    picks = assign_facades_viterbi(wps, [wall], max_distance_m=14.6)
+    assert picks == [0, 0, 0], picks
+
+    # And it is genuinely steep — the kind of angle the penalty used to reject.
+    import math
+
+    dz = wps[0].z - float(wall.center[2])
+    horiz = math.hypot(wps[0].x - float(wall.center[0]), wps[0].y - float(wall.center[1]))
+    assert math.degrees(math.atan2(dz, horiz)) > 60.0
+
+
+def test_a_facet_outside_the_reach_cap_is_still_refused():
+    """The cap is the gate; capping the penalty must not smuggle far facets in."""
+    import numpy as np
+
+    from flight_planner.gimbal_rewrite import assign_facades_viterbi
+    from flight_planner.models import Facade, Waypoint
+
+    far = Facade(
+        vertices=np.array([[-2.0, 0.0, 0.0], [2.0, 0.0, 0.0], [2.0, 0.0, 2.0], [-2.0, 0.0, 2.0]]),
+        normal=np.array([0.0, -1.0, 0.0]),
+    )
+    wps = [Waypoint(x=0.0, y=-40.0, z=1.0, heading_deg=0.0, gimbal_pitch_deg=0.0, index=i) for i in range(2)]
+    assert assign_facades_viterbi(wps, [far], max_distance_m=14.6) == [-1, -1]

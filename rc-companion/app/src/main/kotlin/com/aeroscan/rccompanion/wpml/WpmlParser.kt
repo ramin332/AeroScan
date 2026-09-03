@@ -310,6 +310,14 @@ object WpmlParser {
         var gimbalYaw = 0.0
         var gimbalHeadingMode = "smoothTransition"
         var speed = 2.0
+        // A WPML gimbal command persists until the next one. Missions dedupe
+        // theirs (ours emits gimbalRotate only when the pose moves more than
+        // 5°), so a waypoint with no command has NOT returned to level — it is
+        // still holding the last commanded angle. Resetting per placemark drew
+        // every uncommanded waypoint as looking straight ahead, which is why
+        // the mission view appeared to photograph the air and never look down.
+        var lastGimbalPitch = 0.0
+        var lastGimbalYaw = 0.0
 
         while (true) {
             when (parser.next()) {
@@ -323,7 +331,7 @@ object WpmlParser {
                                 lon = 0.0; lat = 0.0
                                 indexVal = null
                                 executeHeight = 0.0; heading = 0.0
-                                gimbalPitch = 0.0; gimbalYaw = 0.0
+                                gimbalPitch = lastGimbalPitch; gimbalYaw = lastGimbalYaw
                                 gimbalHeadingMode = "smoothTransition"
                                 speed = 2.0
                             }
@@ -341,8 +349,17 @@ object WpmlParser {
                             "index" -> indexVal = parser.nextText().trim().toIntOrNull()
                             "executeHeight" -> executeHeight = parser.nextText().trim().toDoubleOrNull() ?: 0.0
                             "waypointHeadingAngle" -> heading = parser.nextText().trim().toDoubleOrNull() ?: 0.0
-                            "waypointGimbalPitchAngle" -> gimbalPitch = parser.nextText().trim().toDoubleOrNull() ?: 0.0
-                            "waypointGimbalYawAngle" -> gimbalYaw = parser.nextText().trim().toDoubleOrNull() ?: 0.0
+                            "waypointGimbalPitchAngle" ->
+                                gimbalPitch = parser.nextText().trim().toDoubleOrNull() ?: gimbalPitch
+                            "waypointGimbalYawAngle" ->
+                                gimbalYaw = parser.nextText().trim().toDoubleOrNull() ?: gimbalYaw
+                            // Action-driven gimbal command — what our augmenter
+                            // writes. Without this the augmented mission parsed
+                            // as pitch 0 everywhere.
+                            "gimbalPitchRotateAngle" ->
+                                gimbalPitch = parser.nextText().trim().toDoubleOrNull() ?: gimbalPitch
+                            "gimbalYawRotateAngle" ->
+                                gimbalYaw = parser.nextText().trim().toDoubleOrNull() ?: gimbalYaw
                             "waypointGimbalHeadingMode" -> {
                                 val txt = parser.nextText().trim()
                                 if (txt.isNotEmpty()) gimbalHeadingMode = txt
@@ -353,6 +370,8 @@ object WpmlParser {
                 }
                 XmlPullParser.END_TAG -> {
                     if (parser.namespace == KML_NS && parser.name == "Placemark" && inPlacemark) {
+                        lastGimbalPitch = gimbalPitch
+                        lastGimbalYaw = gimbalYaw
                         val idx = indexVal ?: out.size
                         val poses = groups.firstOrNull { idx in it.startIdx..it.endIdx }?.poses ?: emptyList()
                         out.add(ParsedWaypoint(
