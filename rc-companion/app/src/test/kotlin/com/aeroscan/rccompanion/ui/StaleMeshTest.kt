@@ -19,7 +19,7 @@ class StaleMeshTest {
         assertEquals("flight0072", s.meshFlight)
         val b = bannerFor(StatusSession.Result.Ok(s)) as BannerState.NoMesh
         assertTrue(b.label, b.label.contains("flight0072 is 7 w old"))
-        assertTrue(b.label, b.label.contains("Use old scan"))
+        assertTrue(b.label, b.label.contains("augment will use it"))
     }
 
     @Test

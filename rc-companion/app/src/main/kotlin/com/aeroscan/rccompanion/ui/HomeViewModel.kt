@@ -11,6 +11,8 @@ import com.aeroscan.rccompanion.mop.AugmentSession
 import com.aeroscan.rccompanion.mop.AugmentFraming
 import com.aeroscan.rccompanion.mop.StatusSession
 import com.aeroscan.rccompanion.wpml.WpmlParser
+import kotlinx.coroutines.Deferred
+import kotlinx.coroutines.async
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -126,8 +128,8 @@ fun bannerFor(result: StatusSession.Result): BannerState = when (result) {
             !s.envOk -> BannerState.EnvError("env error: ${s.envDetail}$mission")
             !s.meshPresent -> BannerState.NoMesh(
                 if (s.meshStale)
-                    "Newest scan ${s.meshFlight} is ${ageText(s.meshAgeS)} old (limit 6 h) — fly a new Smart3D scan, " +
-                        "or switch on 'Use old scan' to augment against it anyway$mission"
+                    "Newest scan ${s.meshFlight} is ${ageText(s.meshAgeS)} old — augment will use it; " +
+                        "fly a new Smart3D scan for a current model$mission"
                 else "No scan on the drone — fly a Smart3D scan, then augment$mission",
             )
             else -> {
@@ -185,7 +187,22 @@ class HomeViewModel(app: Application) : AndroidViewModel(app) {
         val anomalyIndicesPitchDown: IntArray,
         val icpRmseM: Double,
         val elapsedSec: Double,
+        // --- honest plan metrics (augment summary since 2026-09-02; all optional) ---
+        val gsdMedianMmPx: Double? = null,
+        val gsdTargetMmPx: Double? = null,
+        val stopAtWaypoint: Boolean = true,
+        val flips: Int = 0,
+        val farPicks: Int = 0,
+        val unaimed: Int = 0,
+        val warnings: Int = 0,
+        val errors: Int = 0,
+        val validationMessages: List<String> = emptyList(),
+        val validationIndices: IntArray = IntArray(0),
     ) {
+        /** Every waypoint the pilot should look at on the map. */
+        val flaggedIndices: Set<Int>
+            get() = (anomalyIndicesPitchUp.toList() + anomalyIndicesPitchDown.toList() + validationIndices.toList()).toSet()
+
         companion object {
             fun fromJson(jsonBytes: ByteArray): PreviewSummary {
                 val obj = JSONObject(String(jsonBytes, Charsets.UTF_8))
@@ -194,6 +211,24 @@ class HomeViewModel(app: Application) : AndroidViewModel(app) {
                 val ac = gs.getJSONObject("anomaly_counts")
                 val ai = gs.getJSONObject("anomaly_indices")
                 val icp = obj.getJSONObject("icp")
+                val gsd = obj.optJSONObject("gsd")
+                val aim = obj.optJSONObject("aim")
+                val validation = obj.optJSONArray("validation")
+                var warnings = 0; var errors = 0
+                val messages = ArrayList<String>()
+                val vIdx = ArrayList<Int>()
+                if (validation != null) for (i in 0 until validation.length()) {
+                    val v = validation.getJSONObject(i)
+                    when (v.optString("severity")) {
+                        "warning" -> warnings++
+                        "error" -> errors++
+                        else -> continue
+                    }
+                    messages.add(v.optString("message", v.optString("code")))
+                    v.optJSONArray("waypoint_indices")?.let { arr ->
+                        for (j in 0 until arr.length()) vIdx.add(arr.getInt(j))
+                    }
+                }
                 return PreviewSummary(
                     name = obj.optString("name", "Mission"),
                     waypointCount = obj.getInt("waypoints_total"),
@@ -208,6 +243,16 @@ class HomeViewModel(app: Application) : AndroidViewModel(app) {
                     anomalyIndicesPitchDown = jsonIntArray(ai.getJSONArray("pitch_down")),
                     icpRmseM = icp.getDouble("icp_rmse_m"),
                     elapsedSec = obj.getDouble("elapsed_s"),
+                    gsdMedianMmPx = gsd?.optDouble("median_mm_per_px")?.takeIf { !it.isNaN() },
+                    gsdTargetMmPx = gsd?.optDouble("target_mm_per_px")?.takeIf { !it.isNaN() },
+                    stopAtWaypoint = obj.optBoolean("stop_at_waypoint", true),
+                    flips = aim?.optInt("reversals_gt90", 0) ?: 0,
+                    farPicks = aim?.optInt("far_picks", 0) ?: 0,
+                    unaimed = aim?.optInt("unaimed", 0) ?: 0,
+                    warnings = warnings,
+                    errors = errors,
+                    validationMessages = messages,
+                    validationIndices = vIdx.toIntArray(),
                 )
             }
 
@@ -229,14 +274,18 @@ class HomeViewModel(app: Application) : AndroidViewModel(app) {
     /** Last parsed STAT, for the "replace interrupted mission?" confirmation. */
     private var lastStatus: AugmentFraming.ManifoldStatus? = null
 
-    /** Pilot's choice to augment against a scan older than the Manifold's limit. */
-    private val _allowStaleMesh = MutableStateFlow(false)
-    val allowStaleMesh: StateFlow<Boolean> = _allowStaleMesh.asStateFlow()
-    fun setAllowStaleMesh(v: Boolean) { _allowStaleMesh.value = v }
+    /** Last STAT for the status strip (null until the first successful check). */
+    private val _status = MutableStateFlow<AugmentFraming.ManifoldStatus?>(null)
+    val status: StateFlow<AugmentFraming.ManifoldStatus?> = _status.asStateFlow()
 
-    /** True when the Manifold has a scan but it is past the age limit — shows the toggle. */
-    private val _staleMeshAvailable = MutableStateFlow(false)
-    val staleMeshAvailable: StateFlow<Boolean> = _staleMeshAvailable.asStateFlow()
+    /** What the map draws: the picked KMZ as soon as it is parsed, re-aimed headings after the preview. */
+    private val _map = MutableStateFlow<MissionMapData?>(null)
+    val map: StateFlow<MissionMapData?> = _map.asStateFlow()
+
+    /** Picked KMZ parsed once at pick time (map + augment share it). */
+    private var parseJob: Deferred<WpmlParser.ParseResult?>? = null
+    private var parsedCloud: PlyParser.XyzCloud? = null
+
     /** Mission id the pilot has already agreed to replace (two-tap confirm). */
     private var replaceAcknowledgedFor: String? = null
 
@@ -247,13 +296,41 @@ class HomeViewModel(app: Application) : AndroidViewModel(app) {
     private var statusJob: Job? = null
 
     fun onFilePicked(picked: PickedFile) {
-        _ui.value = UiState.Picked(picked)
+        parseJob?.cancel()
+        _map.value = null
+        parsedCloud = null
+        _ui.value = UiState.ParsingKmz(picked)
+        val ctx = getApplication<Application>().applicationContext
+        val job = viewModelScope.async(Dispatchers.Default) {
+            val bytes = withContext(Dispatchers.IO) {
+                runCatching { ctx.contentResolver.openInputStream(picked.uri)?.use { it.readBytes() } }.getOrNull()
+            } ?: return@async null
+            runCatching {
+                WpmlParser.parseKmz(bytes, missionName = picked.displayName.removeSuffix(".kmz"))
+            }.getOrNull()
+        }
+        parseJob = job
+        viewModelScope.launch {
+            val parsed = job.await()
+            if (_ui.value !is UiState.ParsingKmz) return@launch
+            if (parsed == null) {
+                _ui.value = UiState.Error(picked, "Could not read ${picked.displayName} as a DJI KMZ (needs wpmz/waylines.wpml).")
+                return@launch
+            }
+            val cloud = withContext(Dispatchers.Default) {
+                parsed.cloudPlyBytes?.let { runCatching { PlyParser.read(it) }.getOrNull() }
+            }
+            parsedCloud = cloud
+            _map.value = withContext(Dispatchers.Default) { buildMissionMap(parsed.intent, cloud) }
+            _ui.value = UiState.Picked(picked)
+        }
     }
 
     fun reset() {
         augmentJob?.cancel()
         augmentJob = null
         session = null
+        _map.value = null
         _ui.value = UiState.Idle
     }
 
@@ -275,17 +352,11 @@ class HomeViewModel(app: Application) : AndroidViewModel(app) {
             return
         }
 
-        // Fail fast on a known-bad readiness state (from the PING/STAT banner) —
+        // Fail fast on a known-bad readiness state (from the PING/STAT strip) —
         // don't upload a KMZ and run a doomed ~2-min augment when the Manifold has
-        // already told us it can't succeed (no mesh / bad env / unreachable).
-        val useStaleMesh = _allowStaleMesh.value && (lastStatus?.meshStale == true)
-        val blockReason: String? = when (val b = banner.value) {
-            is BannerState.NoMesh -> if (useStaleMesh) null
-                else "No fresh scan on the drone — fly a Smart3D scan, or switch on 'Use old scan' in the banner."
-            is BannerState.EnvError -> "Manifold env not ready (${b.label}). Augment can't run."
-            is BannerState.Unreachable -> "AeroScan app not running on the drone — enable it in DJI Pilot 2 (camera view → payload panel) and wait for the banner to turn green."
-            else -> null  // Idle / Checking / Ready — proceed
-        }
+        // already told us it can't succeed. An old scan is NOT a blocker: the chip
+        // shows its age and the Manifold's age gate is bypassed on purpose.
+        val blockReason = augmentBlockReason(connection.value, banner.value, lastStatus)
         if (blockReason != null) {
             _ui.value = UiState.Error(picked, blockReason)
             return
@@ -305,35 +376,34 @@ class HomeViewModel(app: Application) : AndroidViewModel(app) {
         }
 
         augmentJob = viewModelScope.launch {
-            _ui.value = UiState.ParsingKmz(picked)
             val ctx = getApplication<Application>().applicationContext
 
-            // 1. Read picked KMZ → parse waylines + extract cloud.ply.
-            val kmzBytes = withContext(Dispatchers.IO) {
-                runCatching {
-                    ctx.contentResolver.openInputStream(picked.uri)?.use { it.readBytes() }
-                }.getOrNull()
-            }
-            if (kmzBytes == null) {
-                _ui.value = UiState.Error(picked, "Could not read picked file. Try re-selecting.")
-                return@launch
-            }
-            val parseResult = withContext(Dispatchers.Default) {
-                runCatching {
-                    WpmlParser.parseKmz(kmzBytes, missionName = picked.displayName.removeSuffix(".kmz"))
+            // 1. The KMZ was parsed at pick time; reuse it (re-parse on retry after an error).
+            val parseResult = parseJob?.let { runCatching { it.await() }.getOrNull() }
+                ?: withContext(Dispatchers.IO) {
+                    runCatching {
+                        ctx.contentResolver.openInputStream(picked.uri)?.use { it.readBytes() }
+                    }.getOrNull()
+                }?.let { bytes ->
+                    withContext(Dispatchers.Default) {
+                        runCatching {
+                            WpmlParser.parseKmz(bytes, missionName = picked.displayName.removeSuffix(".kmz"))
+                        }.getOrNull()
+                    }
                 }
-            }
-            val intent = parseResult.getOrNull()?.intent
-            val cloudBytes = parseResult.getOrNull()?.cloudPlyBytes
+            val intent = parseResult?.intent
+            val cloudBytes = parseResult?.cloudPlyBytes
             if (intent == null) {
-                _ui.value = UiState.Error(picked,
-                    "KMZ parse failed: ${parseResult.exceptionOrNull()?.message ?: "unknown"}")
+                _ui.value = UiState.Error(picked, "KMZ parse failed — pick the file again.")
                 return@launch
             }
             if (cloudBytes == null) {
                 _ui.value = UiState.Error(picked,
                     "KMZ has no cloud.ply — required as the ICP target.")
                 return@launch
+            }
+            if (_map.value == null) {
+                _map.value = withContext(Dispatchers.Default) { buildMissionMap(intent, parsedCloud) }
             }
 
             // 2. Voxel-downsample the cloud at 1 m.
@@ -388,6 +458,14 @@ class HomeViewModel(app: Application) : AndroidViewModel(app) {
                             val savedPath = saveAugmentedKmz(
                                 ctx, picked.displayName, ev.augmentedKmz, ev.summaryJson,
                             )
+                            // Re-aimed headings onto the map: parse the augmented KMZ
+                            // (same waypoint count, new headings/pitches).
+                            _map.value = withContext(Dispatchers.Default) {
+                                val aug = runCatching {
+                                    WpmlParser.parseKmz(ev.augmentedKmz, missionName = summary.name).intent
+                                }.getOrNull()
+                                buildMissionMap(intent, parsedCloud, aug, summary.flaggedIndices)
+                            }
                             _ui.value = UiState.ReviewReady(picked, summary, ev.augmentedKmz, savedPath)
                         }
                         is AugmentSession.Event.ExecuteSent -> {
@@ -411,7 +489,8 @@ class HomeViewModel(app: Application) : AndroidViewModel(app) {
                 }
             }
 
-            sess.sendAndAwaitPreview(intent, fingerprintBytes, allowStaleMesh = useStaleMesh)
+            // Always allow an older scan: the strip shows its age, the pilot decides by tapping Augment.
+            sess.sendAndAwaitPreview(intent, fingerprintBytes, allowStaleMesh = true)
         }
     }
 
@@ -454,7 +533,7 @@ class HomeViewModel(app: Application) : AndroidViewModel(app) {
             while (true) {
                 val q = StatusSession().query()
                 lastStatus = (q as? StatusSession.Result.Ok)?.status
-                _staleMeshAvailable.value = lastStatus?.meshStale == true
+                if (lastStatus != null) _status.value = lastStatus
                 val result = bannerFor(q)
                 _banner.value = result
                 val wait = nextPollDelayMs(result) ?: break
