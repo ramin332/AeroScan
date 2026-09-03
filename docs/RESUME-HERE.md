@@ -27,6 +27,66 @@ the execution. **Instrument before optimising.**
 - Still unflown: everything from 2026-09-02 (stop-at-WP, no gimbal-yaw, Viterbi picker, telemetry CSV,
   Continue). First flight is a measurement flight.
 
+## 2026-09-03 RC control panel + 3D mission view (built, NOT yet on the aircraft)
+
+The RC app is now a control panel: a four-chip status strip, a stepper, a mission
+view, six stat tiles and one action button. Prose is down to one line per state.
+
+What is new beyond the layout:
+
+- **3D orbit view** (drag to rotate, pinch to zoom) drawing the scanned cloud, the
+  facades, the path and one camera ray per waypoint. The top-down map can only show
+  bearing, and a bearing that looks right can still be aimed at the ground — this is
+  the view that answers "is the camera pointed at the wall".
+- **Facade coverage.** The augment summary now carries `facade_geom` (corner vertices
+  + normal, mission ENU) and `wp_target` (which facade each waypoint aims at). Walls
+  no waypoint photographs draw red, and a "No photos" tile counts them. The
+  2026-09-03 bench run reported **92 of 219 facades with zero inspection waypoints** —
+  visible now at plan time.
+- **Pitch is on the map**: the AeroScan heading tick is coloured light (level, at a
+  wall) to dark (steeply down, at the ground) and foreshortened by pitch.
+- **"Use old scan" toggle is gone.** An old scan is always allowed; the scan chip
+  shows its age. Only "no scan at all" blocks Augment.
+- **Planner knobs ride in the mission intent** (`settings`), so speed no longer needs
+  a PSDK rebuild to change. Speed (1/2/3 m/s) and stop-vs-fly-through are on the
+  panel; GSD, dwell, assign mode and reach are accepted by the engine and await UI.
+- **ENU on the RC now uses the same WGS84 series as the engine.** The flat 111 320
+  approximation was ~0.4 m off over 200 m of easting — enough to visibly offset the
+  Manifold's facades from our waypoints.
+
+### The photo-interval warning on a stop-mode plan was wrong
+
+`photo_interval_too_short` ("100 photo waypoints are too close for camera interval
+(0.5s at 3.0m/s)") fired on a **stop-at-waypoint** mission. In stop mode the aircraft
+halts at every waypoint, so transit speed cannot starve the shutter. The check is now
+gated on fly-through mode. Dropping to 1 m/s to "fix" it would have cost roughly three
+times the mission time for nothing.
+
+### Why the RC app "loses the connection" until you reopen Pilot 2
+
+Measured on the RC on 2026-09-03 (logcat, our app in front, Pilot 2 alive in the
+background): `CoreExistReceiver` logs `setNeedTryConnect false` and the aircraft link
+drops, then returns ~10 s later — **every ~22 s**. Only one MSDK app may hold the
+aircraft link at a time, and DJI's guidance for the RC Plus is to force-exit Pilot
+before starting a third-party MSDK app.
+
+The app now records link drops, shows `Link shared with Pilot 2` in amber, names the
+remedy (close Pilot 2 from recent apps while uploading, reopen it to fly), and refuses
+to start an augment into a link that has not been up for 4 s — instead of dying
+mid-transfer.
+
+**Not yet proven:** that force-stopping Pilot 2 stops the flapping. The decisive test
+(force-stop Pilot 2, watch our app's link for 3 minutes) could not run — the RC was
+unplugged. Run it before drawing conclusions.
+
+### To finish on the aircraft (needs it powered on)
+
+1. `bash scripts/deploy_to_manifold.sh --host=<manifold-ip>` — the engine changes
+   (facade_geom, wp_target, settings, the interval-check fix) are **laptop-only**.
+2. `adb install -r output/rc-companion/rc-companion-debug-2026-09-03-3d.apk`.
+3. Augment `busboom10-7.kmz` once and check the 3D view draws facades and rays.
+4. Force-stop Pilot 2, then watch the link for 3 minutes to confirm the flapping stops.
+
 ## The ONE next action — reflight and re-measure the gimbal
 
 DPK, Manifold commits and laptop augment changes are all deployed (2026-09-03). Fly `2bf3308`+. Then pull the photos and run:
