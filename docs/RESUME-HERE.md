@@ -104,6 +104,39 @@ The 182 uncovered facades are the real finding. Thin facets — a median of 44 p
 each — are what a van and a few cars look like when carved into 219 pieces. `Detail:
 Coarse` is the lever to test.
 
+### Detail presets measured on the aircraft, 2026-09-03
+
+Same mission (`busboom10-7.kmz`, 398 waypoints), same July scan, three settings:
+
+| | facets | walls ≥2m² unshot | waypoints aimed | GSD mm/px | run |
+|---|---|---|---|---|---|
+| Fine | 461 | 78 | 398 | 2.00 | 15 s |
+| Normal | 219 | 92 | 391 | 2.11 | 25 s |
+| Coarse | 48 | 39 | 362 | 2.46 | 16 s |
+
+**More facets does not mean more coverage.** The number of *distinct facets any
+waypoint aims at* stayed between 15 and 40 across all three. Coverage is bounded by
+the aim picker — one target per waypoint, with a switch cost — not by how finely the
+cloud is carved. Detail changes what the mission *could* see, not what it does see.
+
+**The Coarse preset originally took an hour, for nothing.** Its wider region-growing
+radius (`cluster_epsilon` 0.40 m) ran 3626 s where 0.25 m ran 16 s, and both produced
+byte-identical output: 48 facets, same inliers, same aim, same GSD. Coarseness must
+come from the filters (`min_points`, area, density), never from widening the neighbour
+search. The preset now keeps Normal's radius and `mission_intent.SETTING_KEYS` caps
+the knob at 0.30 so nobody can ask for the hour from the field.
+
+The RC's coverage tile counts walls of at least 2 m² (the engine's own threshold).
+Counting every facet said 182 at Normal and 421 at Fine for the same site, which
+measures the detector's chattiness rather than what the mission misses.
+
+**Manifold housekeeping:** the registration cache lives at `/open_app/dev/data/.regcache`
+and needs an ACL for the sandboxed app user, mirroring `data/received`:
+
+```bash
+setfacl -m u:apppsdk-demo:rwx -d -m u:apppsdk-demo:rwx /open_app/dev/data/.regcache
+```
+
 ### To finish on the aircraft (needs it powered on)
 
 1. `bash scripts/deploy_to_manifold.sh --host=<manifold-ip>` — the engine changes
