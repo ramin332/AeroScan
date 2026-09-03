@@ -349,6 +349,7 @@ def augment_mission(
     target_gsd_mm_per_px: float | None = None,
     min_action_dwell_s: float | None = None,
     facade_detect: dict | None = None,
+    min_facade_height_m: float | None = None,
     reuse_registration: bool = True,
     switch_ratio: float = _NEN_SWITCH_RATIO,
     stop_at_waypoint: bool = True,
@@ -484,6 +485,24 @@ def augment_mission(
         intent.ref_lat, intent.ref_lon, intent.ref_alt,
     )
     _log(f"      facades after polygon filter: {len(facades)}")
+
+    # Height gate. Ground is the 2nd percentile of the registered cloud's Z —
+    # robust to the reconstruction noise DJI's perception clouds carry (~0.5 m)
+    # without needing the extractor's fitted plane out here.
+    if min_facade_height_m:
+        ground_z = float(np.percentile(points_xyz[:, 2], 2.0))
+        before_height = len(facades)
+        facades = [f for f in facades
+                   if float(f.center[2]) - ground_z >= min_facade_height_m]
+        for i, f in enumerate(facades):
+            f.index = i
+        _log(f"      height gate (>= {min_facade_height_m:.1f} m above ground z={ground_z:.2f}): "
+             f"{before_height} → {len(facades)} facets")
+        if not facades:
+            raise SystemExit(
+                f"Min facade height {min_facade_height_m:.1f} m removed every facet — "
+                "lower it or turn it off."
+            )
     if not facades:
         raise SystemExit(
             "Facade extraction produced 0 facades — cannot augment gimbals. "
@@ -774,6 +793,7 @@ def _cmd_augment_mission(args: argparse.Namespace) -> int:
             target_gsd_mm_per_px=st.get("target_gsd_mm_per_px"),
             min_action_dwell_s=st.get("min_action_dwell_s"),
             facade_detect=facade_detect_kwargs(st),
+            min_facade_height_m=st.get("min_facade_height_m"),
             pitch_margin_deg=args.pitch_margin_deg,
             summary_json=args.summary_json,
             log=not args.json,

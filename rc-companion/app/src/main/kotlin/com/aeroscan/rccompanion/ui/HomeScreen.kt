@@ -157,7 +157,8 @@ fun HomeScreen(viewModel: HomeViewModel = viewModel()) {
                         enabled = stepOf(ui) != 1,
                         onSpeed = viewModel::setInspectionSpeed,
                         onStop = viewModel::setStopAtWaypoint,
-                        onDetail = viewModel::setDetail,
+                        onReach = viewModel::setReach,
+                        onMinHeight = viewModel::setMinHeight,
                     )
                     ActionPanel(
                         ui = ui,
@@ -317,7 +318,8 @@ private fun PlannerControls(
     enabled: Boolean,
     onSpeed: (Double) -> Unit,
     onStop: (Boolean) -> Unit,
-    onDetail: (PlannerSettings.Detail) -> Unit,
+    onReach: (Double?) -> Unit,
+    onMinHeight: (Double?) -> Unit,
 ) {
     val cs = MaterialTheme.colorScheme
     Column(
@@ -343,11 +345,18 @@ private fun PlannerControls(
             onChange = onStop,
         )
         SegToggle(
-            label = "Detail",
-            options = PlannerSettings.Detail.entries.map { it to it.label },
-            selected = settings.detail,
+            label = "Reach",
+            options = PlannerSettings.REACH_CHOICES.map { it to PlannerSettings.reachLabel(it) },
+            selected = settings.reachM,
             enabled = enabled,
-            onChange = onDetail,
+            onChange = onReach,
+        )
+        SegToggle(
+            label = "Min height",
+            options = PlannerSettings.MIN_HEIGHT_CHOICES.map { it to PlannerSettings.minHeightLabel(it) },
+            selected = settings.minHeightM,
+            enabled = enabled,
+            onChange = onMinHeight,
         )
     }
 }

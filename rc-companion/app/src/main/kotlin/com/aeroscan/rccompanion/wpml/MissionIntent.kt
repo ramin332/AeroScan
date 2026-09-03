@@ -116,53 +116,39 @@ data class PlannerSettings(
     val inspectionSpeedMs: Double = 3.0,
     /** Stop at every waypoint to rotate and shoot (DJI toPointAndStop*). */
     val stopAtWaypoint: Boolean = true,
-    /** How hard the extractor looks for facades. */
-    val detail: Detail = Detail.Normal,
-) {
     /**
-     * Facade-detection presets. The engine takes five separate numbers; a pilot
-     * on site can reason about one axis — "it missed the small stuff" versus
-     * "it invented walls out of noise" — so the RC offers that axis and the
-     * engine clamps whatever arrives.
+     * How far a waypoint may aim, metres, or null to let the engine derive it
+     * from the target resolution (the distance at which GSD doubles, ~14.6 m
+     * for the wide lens at 2 mm/px). Trades resolution against how many
+     * waypoints get a target at all: measured 2026-09-03, 10 m gave 1.90 mm/px
+     * but left 106 waypoints unaimed, while 20 m aimed all 398 at 2.16 mm/px.
      */
-    enum class Detail(
-        val label: String,
-        val minPoints: Int,
-        val epsilonM: Double,
-        val clusterEpsilonM: Double,
-        val minWallAreaM2: Double,
-        val minDensityPerM2: Double,
-    ) {
-        /** Small features: window sills, parapets, balcony panels. More noise facets. */
-        Fine("Fine", 20, 0.035, 0.18, 0.3, 15.0),
-        /** The engine's own cloud-derived defaults. */
-        Normal("Normal", 40, 0.05, 0.25, 0.5, 25.0),
-        /**
-         * Whole walls only. Fewer, larger, more certain facets.
-         *
-         * The cluster radius deliberately matches Normal. Measured on the
-         * Manifold 2026-09-03: 0.40 took 3626 s and 0.25 took 16 s for the same
-         * 48 facets. Coarseness comes from the filters, never from widening the
-         * neighbour search.
-         */
-        Coarse("Coarse", 90, 0.08, 0.25, 1.5, 40.0),
-    }
-
+    val reachM: Double? = null,
+    /**
+     * Ignore facets whose centre sits below this height above the ground, or
+     * null for no gate. Ground-level facets pull the aim down onto tarmac and
+     * parked cars and waste frames.
+     */
+    val minHeightM: Double? = null,
+) {
     fun toJson(): JSONObject = JSONObject().apply {
         put("inspection_speed_ms", inspectionSpeedMs)
         put("stop_at_waypoint", stopAtWaypoint)
-        // Normal means "let the engine estimate from the cloud" — sending its
-        // numbers would freeze an estimate that adapts to point density.
-        if (detail != Detail.Normal) {
-            put("fd_min_points", detail.minPoints)
-            put("fd_epsilon_m", detail.epsilonM)
-            put("fd_cluster_epsilon_m", detail.clusterEpsilonM)
-            put("fd_min_wall_area_m2", detail.minWallAreaM2)
-            put("fd_min_density_per_m2", detail.minDensityPerM2)
-        }
+        reachM?.let { put("max_facade_distance_m", it) }
+        minHeightM?.let { put("min_facade_height_m", it) }
     }
 
     companion object {
         val SPEED_CHOICES = listOf(1.0, 2.0, 3.0)
+
+        /** null = derive from the target GSD. The rest are inside the engine clamp. */
+        val REACH_CHOICES: List<Double?> = listOf(null, 10.0, 20.0, 30.0)
+
+        /** null = no height gate. */
+        val MIN_HEIGHT_CHOICES: List<Double?> = listOf(null, 1.0, 2.0, 3.0)
+
+        fun reachLabel(v: Double?): String = v?.let { "${it.toInt()} m" } ?: "Auto"
+
+        fun minHeightLabel(v: Double?): String = v?.let { "${it.toInt()} m" } ?: "Off"
     }
 }

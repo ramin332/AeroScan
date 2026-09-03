@@ -139,6 +139,11 @@ SETTING_KEYS: dict[str, tuple[type, float, float]] = {
     "fd_cluster_epsilon_m": (float, 0.05, 0.30),
     "fd_min_wall_area_m2": (float, 0.1, 50.0),
     "fd_min_density_per_m2": (float, 1.0, 400.0),
+    # Ignore facets whose centre sits below this height above the ground. On a
+    # low target (a van, a car) the extractor finds tarmac-level facets that
+    # pull the aim down and waste frames; on a building it drops kerbs, planters
+    # and parked cars so the mission spends its waypoints on the facade.
+    "min_facade_height_m": (float, 0.0, 20.0),
 }
 
 #: Detection settings, mapped onto facades_from_pointcloud_cgal keyword names.

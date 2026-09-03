@@ -328,7 +328,8 @@ class HomeViewModel(app: Application) : AndroidViewModel(app) {
     val settings: StateFlow<PlannerSettings> = _settings.asStateFlow()
     fun setInspectionSpeed(ms: Double) { _settings.value = _settings.value.copy(inspectionSpeedMs = ms) }
     fun setStopAtWaypoint(v: Boolean) { _settings.value = _settings.value.copy(stopAtWaypoint = v) }
-    fun setDetail(d: PlannerSettings.Detail) { _settings.value = _settings.value.copy(detail = d) }
+    fun setReach(m: Double?) { _settings.value = _settings.value.copy(reachM = m) }
+    fun setMinHeight(m: Double?) { _settings.value = _settings.value.copy(minHeightM = m) }
 
     /**
      * Run the augment again on the mission already picked, with whatever the

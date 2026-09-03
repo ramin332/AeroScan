@@ -42,46 +42,50 @@ class PlannerSettingsTest {
     }
 
     @Test
-    fun normal_detail_sends_no_detection_knobs() {
-        // Normal must let the engine keep its cloud-derived estimate; freezing
-        // those numbers would stop them adapting to point density.
-        val s = org.json.JSONObject(intent.toJsonString(settings = PlannerSettings()))
+    fun a_min_height_gate_reaches_the_engine_and_off_sends_nothing() {
+        val gated = org.json.JSONObject(intent.toJsonString(settings = PlannerSettings(minHeightM = 2.0)))
             .getJSONObject("settings")
-        assertTrue(!s.has("fd_min_points"))
-        assertTrue(!s.has("fd_epsilon_m"))
-    }
-
-    @Test
-    fun fine_and_coarse_send_the_full_detection_set() {
-        for (d in listOf(PlannerSettings.Detail.Fine, PlannerSettings.Detail.Coarse)) {
-            val s = org.json.JSONObject(intent.toJsonString(settings = PlannerSettings(detail = d)))
-                .getJSONObject("settings")
-            assertEquals(d.minPoints, s.getInt("fd_min_points"))
-            assertEquals(d.epsilonM, s.getDouble("fd_epsilon_m"), 1e-9)
-            assertEquals(d.clusterEpsilonM, s.getDouble("fd_cluster_epsilon_m"), 1e-9)
-            assertEquals(d.minWallAreaM2, s.getDouble("fd_min_wall_area_m2"), 1e-9)
-            assertEquals(d.minDensityPerM2, s.getDouble("fd_min_density_per_m2"), 1e-9)
-        }
-        // Fine must look harder than Coarse, or the labels lie.
-        assertTrue(PlannerSettings.Detail.Fine.minPoints < PlannerSettings.Detail.Coarse.minPoints)
-        assertTrue(PlannerSettings.Detail.Fine.minWallAreaM2 < PlannerSettings.Detail.Coarse.minWallAreaM2)
-    }
-
-    @Test
-    fun detection_knobs_stay_inside_the_engine_clamps() {
-        // mission_intent.SETTING_KEYS ranges.
-        for (d in PlannerSettings.Detail.entries) {
-            assertTrue(d.minPoints in 8..2000)
-            assertTrue(d.epsilonM in 0.01..0.50)
-            assertTrue(d.clusterEpsilonM in 0.05..2.00)
-            assertTrue(d.minWallAreaM2 in 0.1..50.0)
-            assertTrue(d.minDensityPerM2 in 1.0..400.0)
-        }
+        assertEquals(2.0, gated.getDouble("min_facade_height_m"), 1e-9)
+        val off = org.json.JSONObject(intent.toJsonString(settings = PlannerSettings()))
+            .getJSONObject("settings")
+        assertTrue(!off.has("min_facade_height_m"))
+        // Off must mean no gate, not a gate at zero.
+        assertEquals(null, PlannerSettings.MIN_HEIGHT_CHOICES.first())
+        assertEquals("Off", PlannerSettings.minHeightLabel(null))
+        assertTrue(PlannerSettings.MIN_HEIGHT_CHOICES.filterNotNull().all { it in 0.0..20.0 })
     }
 
     @Test
     fun offered_speeds_stay_inside_the_engine_clamp() {
         // mission_intent.SETTING_KEYS clamps inspection_speed_ms to [0.3, 6.0].
         assertTrue(PlannerSettings.SPEED_CHOICES.all { it in 0.3..6.0 })
+    }
+}
+
+/** Aim reach: the lever that actually bounds coverage. */
+class ReachSettingTest {
+    private val intent = ImportedKmz("m", 52.0, 5.0, 30.0, emptyList(), emptyList())
+
+    private fun settings(json: String) = org.json.JSONObject(json).getJSONObject("settings")
+
+    @Test
+    fun auto_sends_nothing_so_the_engine_derives_it_from_the_gsd() {
+        val s = settings(intent.toJsonString(settings = PlannerSettings(reachM = null)))
+        assertTrue(!s.has("max_facade_distance_m"))
+    }
+
+    @Test
+    fun an_explicit_reach_reaches_the_engine() {
+        val s = settings(intent.toJsonString(settings = PlannerSettings(reachM = 20.0)))
+        assertEquals(20.0, s.getDouble("max_facade_distance_m"), 1e-9)
+    }
+
+    @Test
+    fun offered_reaches_stay_inside_the_engine_clamp_and_start_at_auto() {
+        // mission_intent.SETTING_KEYS clamps max_facade_distance_m to [1, 100].
+        assertEquals(null, PlannerSettings.REACH_CHOICES.first())
+        assertTrue(PlannerSettings.REACH_CHOICES.filterNotNull().all { it in 1.0..100.0 })
+        assertEquals("Auto", PlannerSettings.reachLabel(null))
+        assertEquals("20 m", PlannerSettings.reachLabel(20.0))
     }
 }

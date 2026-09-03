@@ -498,3 +498,13 @@ def test_registration_cache_dir_is_stable_across_missions(tmp_path, monkeypatch)
     monkeypatch.delenv("AEROSCAN_CACHE_DIR")
     # Without the override it must still not depend on any per-mission path.
     assert _registration_cache_dir() == _registration_cache_dir()
+
+
+def test_min_facade_height_is_a_clamped_setting():
+    from flight_planner.mission_intent import coerce_settings
+
+    assert coerce_settings({"min_facade_height_m": 2.0})["min_facade_height_m"] == 2.0
+    assert coerce_settings({"min_facade_height_m": 99.0})["min_facade_height_m"] == 20.0
+    assert coerce_settings({"min_facade_height_m": -5.0})["min_facade_height_m"] == 0.0
+    # Absent means no gate at all, not a gate at zero.
+    assert "min_facade_height_m" not in coerce_settings({})
