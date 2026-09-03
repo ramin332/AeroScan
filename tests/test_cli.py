@@ -390,7 +390,7 @@ def test_facade_detect_kwargs_maps_pilot_knobs_to_the_extractor():
     st = coerce_settings({
         "fd_min_points": 12,
         "fd_epsilon_m": 0.08,
-        "fd_cluster_epsilon_m": 0.4,
+        "fd_cluster_epsilon_m": 0.25,
         "fd_min_wall_area_m2": 1.0,
         "fd_min_density_per_m2": 10.0,
         "inspection_speed_ms": 2.0,
@@ -398,7 +398,7 @@ def test_facade_detect_kwargs_maps_pilot_knobs_to_the_extractor():
     kw = facade_detect_kwargs(st)
     assert kw["min_points"] == 12
     assert kw["epsilon"] == 0.08
-    assert kw["cluster_epsilon"] == 0.4
+    assert kw["cluster_epsilon"] == 0.25
     assert kw["min_wall_area_m2"] == 1.0
     assert kw["min_roof_area_m2"] == 1.0
     assert kw["min_tilted_area_m2"] == 0.8
@@ -478,3 +478,23 @@ def test_registration_cache_survives_a_corrupt_entry(tmp_path):
     c._ply.write_bytes(b"not a ply")
     c._meta.write_text("{not json")
     assert c.load() is None
+
+
+def test_cluster_epsilon_is_capped_at_the_measured_safe_value():
+    """Measured on the Manifold 2026-09-03: 0.40 took 3626 s, 0.25 took 16 s, and
+    both produced the same 48 facets. A pilot must not be able to ask for the hour."""
+    from flight_planner.mission_intent import coerce_settings
+
+    assert coerce_settings({"fd_cluster_epsilon_m": 0.40})["fd_cluster_epsilon_m"] == 0.30
+    assert coerce_settings({"fd_cluster_epsilon_m": 2.0})["fd_cluster_epsilon_m"] == 0.30
+    assert coerce_settings({"fd_cluster_epsilon_m": 0.25})["fd_cluster_epsilon_m"] == 0.25
+
+
+def test_registration_cache_dir_is_stable_across_missions(tmp_path, monkeypatch):
+    from flight_planner.cli import _registration_cache_dir
+
+    monkeypatch.setenv("AEROSCAN_CACHE_DIR", str(tmp_path / "cache"))
+    assert _registration_cache_dir() == tmp_path / "cache"
+    monkeypatch.delenv("AEROSCAN_CACHE_DIR")
+    # Without the override it must still not depend on any per-mission path.
+    assert _registration_cache_dir() == _registration_cache_dir()

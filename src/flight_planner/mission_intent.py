@@ -132,7 +132,11 @@ SETTING_KEYS: dict[str, tuple[type, float, float]] = {
     # region-growing extractor tolerates before it stops producing anything.
     "fd_min_points": (int, 8, 2000),
     "fd_epsilon_m": (float, 0.01, 0.50),
-    "fd_cluster_epsilon_m": (float, 0.05, 2.00),
+    # Capped at 0.30 deliberately. Measured on the Manifold 2026-09-03 with the
+    # busboom cloud: 0.40 took 3626 s and 0.25 took 16 s for BYTE-IDENTICAL
+    # facets (48 either way). Widening the region-growing neighbour search buys
+    # nothing here and can strand a pilot in the field for an hour.
+    "fd_cluster_epsilon_m": (float, 0.05, 0.30),
     "fd_min_wall_area_m2": (float, 0.1, 50.0),
     "fd_min_density_per_m2": (float, 1.0, 400.0),
 }

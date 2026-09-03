@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import sys
 import tempfile
 import time
@@ -88,6 +89,21 @@ _ANOMALY_PITCH_UP_DEG = 25.0
 _ANOMALY_PITCH_DOWN_DEG = -85.0
 
 
+
+
+
+def _registration_cache_dir() -> Path:
+    """Where registered clouds live.
+
+    Deliberately NOT beside the output KMZ: the output path changes per mission
+    while the registration depends only on the flight and the ICP target, so
+    keying the location to the output would miss the cache on every run.
+    """
+    env = os.environ.get("AEROSCAN_CACHE_DIR")
+    if env:
+        return Path(env)
+    return Path("/open_app/dev/data/.regcache") if Path("/open_app/dev/data").is_dir() \
+        else Path(tempfile.gettempdir()) / "aeroscan-regcache"
 
 
 class _RegistrationCache:
@@ -373,7 +389,7 @@ def augment_mission(
     # makes "change a detection setting and look again" a seconds-long loop on
     # the RC instead of a multi-minute one.
     cache = _RegistrationCache(
-        Path(output_kmz).parent / ".regcache", flight_id, icp_target_ply, voxel_m,
+        _registration_cache_dir(), flight_id, icp_target_ply, voxel_m,
     ) if reuse_registration else None
     cached = cache.load() if cache else None
 

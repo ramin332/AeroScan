@@ -59,6 +59,21 @@ data class FacadeQuad(
     val sampleCount: Int get() = sample.size / 3
     val cornerCount: Int get() = v.size / 3
     val covered: Boolean get() = waypoints > 0
+
+    /**
+     * Planar area of the rectangle, m². Used to separate walls worth flagging
+     * from the slivers a fine setting produces by the hundred.
+     */
+    val areaM2: Double
+        get() {
+            if (cornerCount < 3) return 0.0
+            val ax = v[3] - v[0]; val ay = v[4] - v[1]; val az = v[5] - v[2]
+            val bx = v[v.size - 3] - v[0]; val by = v[v.size - 2] - v[1]; val bz = v[v.size - 1] - v[2]
+            val cx = ay * bz - az * by
+            val cy = az * bx - ax * bz
+            val cz = ax * by - ay * bx
+            return sqrt(cx * cx + cy * cy + cz * cz)
+        }
     fun cx(): Double { var s = 0.0; for (i in 0 until cornerCount) s += v[3 * i]; return s / cornerCount }
     fun cy(): Double { var s = 0.0; for (i in 0 until cornerCount) s += v[3 * i + 1]; return s / cornerCount }
     fun cz(): Double { var s = 0.0; for (i in 0 until cornerCount) s += v[3 * i + 2]; return s / cornerCount }
@@ -107,7 +122,14 @@ data class MissionMapData(
     val cloudPointCount: Int get() = cloudXYZ.size / 3
     /** Waypoints whose original mission commands a multi-pose rosette. */
     val rosetteWaypoints: Int get() = posesOriginal.count { it.isNotEmpty() }
-    val uncoveredFacades: Int get() = facades.count { !it.covered }
+    /**
+     * Walls of at least [SIGNIFICANT_FACADE_M2] that no waypoint photographs.
+     * Counting every facet instead would say 182 at Normal and 421 at Fine on
+     * the same site — a number that tracks the detector's chattiness rather
+     * than what the mission misses. This matches the engine's own warning.
+     */
+    val uncoveredFacades: Int get() = facades.count { !it.covered && it.areaM2 >= SIGNIFICANT_FACADE_M2 }
+    val significantFacades: Int get() = facades.count { it.areaM2 >= SIGNIFICANT_FACADE_M2 }
     /** Points the extractor recognised as belonging to some facade. */
     val recognisedPoints: Int get() = facades.sumOf { it.inlierCount }
 
@@ -119,6 +141,9 @@ data class MissionMapData(
     val sceneSpanM: Double
         get() = sqrt(widthM * widthM + heightM * heightM + (maxU - minU) * (maxU - minU))
 }
+
+/** Smallest facade the coverage count takes seriously (matches validate.py). */
+const val SIGNIFICANT_FACADE_M2 = 2.0
 
 /** Cap on drawn cloud points — a Canvas with 400 K dots is unusable on the RC. */
 const val MAP_CLOUD_MAX_POINTS = 4000

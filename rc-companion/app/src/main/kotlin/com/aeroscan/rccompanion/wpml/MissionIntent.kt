@@ -137,8 +137,15 @@ data class PlannerSettings(
         Fine("Fine", 20, 0.035, 0.18, 0.3, 15.0),
         /** The engine's own cloud-derived defaults. */
         Normal("Normal", 40, 0.05, 0.25, 0.5, 25.0),
-        /** Whole walls only. Fewer, larger, more certain facets. */
-        Coarse("Coarse", 90, 0.08, 0.40, 1.5, 40.0),
+        /**
+         * Whole walls only. Fewer, larger, more certain facets.
+         *
+         * The cluster radius deliberately matches Normal. Measured on the
+         * Manifold 2026-09-03: 0.40 took 3626 s and 0.25 took 16 s for the same
+         * 48 facets. Coarseness comes from the filters, never from widening the
+         * neighbour search.
+         */
+        Coarse("Coarse", 90, 0.08, 0.25, 1.5, 40.0),
     }
 
     fun toJson(): JSONObject = JSONObject().apply {

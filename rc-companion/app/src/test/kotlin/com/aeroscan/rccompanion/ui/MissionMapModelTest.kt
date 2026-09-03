@@ -169,3 +169,35 @@ class RosetteTest {
         assertTrue(bearings.max() - bearings.min() == 60.0)
     }
 }
+
+/** Coverage must count walls, not slivers. */
+class CoverageCountTest {
+    private fun wall(e: Double, w: Double, h: Double) = FacadeQuad(
+        v = doubleArrayOf(e, 5.0, 0.0, e + w, 5.0, 0.0, e + w, 5.0, h, e, 5.0, h),
+        n = doubleArrayOf(0.0, -1.0, 0.0), waypoints = 0,
+    )
+
+    @Test
+    fun area_comes_from_the_rectangle() {
+        assertEquals(12.0, wall(0.0, 4.0, 3.0).areaM2, 1e-9)
+        assertEquals(0.25, wall(0.0, 0.5, 0.5).areaM2, 1e-9)
+    }
+
+    @Test
+    fun only_walls_of_two_square_metres_count_as_unshot() {
+        val kmz = ImportedKmz(
+            "t", 52.0, 5.0, 30.0,
+            listOf(ParsedWaypoint(0, 5.0, 52.0, 30.0, 0.0, -10.0)),
+            emptyList(),
+        )
+        val d = buildMissionMap(
+            kmz, null,
+            facades = listOf(wall(0.0, 4.0, 3.0), wall(20.0, 0.4, 0.4), wall(40.0, 0.3, 0.3)),
+            targets = IntArray(0),
+        )
+        // Three facets have no waypoints; only the 12 m² wall is worth flagging.
+        assertEquals(3, d.facades.count { !it.covered })
+        assertEquals(1, d.uncoveredFacades)
+        assertEquals(1, d.significantFacades)
+    }
+}

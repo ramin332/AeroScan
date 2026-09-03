@@ -212,7 +212,7 @@ fun MissionLegend(data: MissionMapData?, modifier: Modifier = Modifier) {
         LegendItem(MissionPalette.aimAugmentedLevel, "at wall")
         LegendItem(MissionPalette.aimAugmentedSteep, "steep down")
         if (data != null && data.facades.isNotEmpty()) {
-            LegendItem(MissionPalette.facadeUncovered, "no photos: ${data.uncoveredFacades}")
+            LegendItem(MissionPalette.facadeUncovered, "unshot walls: ${data.uncoveredFacades}")
         }
         LegendItem(MissionPalette.flag, "check")
     }

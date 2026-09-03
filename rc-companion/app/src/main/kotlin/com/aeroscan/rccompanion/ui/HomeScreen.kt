@@ -271,7 +271,7 @@ private fun tilesFor(ui: HomeViewModel.UiState, map: MissionMapData?): List<Tile
             map?.takeIf { it.facades.isNotEmpty() }?.let { if (it.uncoveredFacades == 0) Tone.Good else Tone.Warn },
         ),
         Tile(
-            "No photos", map?.takeIf { it.facades.isNotEmpty() }?.uncoveredFacades?.toString() ?: "—",
+            "Walls unshot", map?.takeIf { it.facades.isNotEmpty() }?.uncoveredFacades?.toString() ?: "—",
             map?.takeIf { it.facades.isNotEmpty() }?.let { if (it.uncoveredFacades == 0) Tone.Good else Tone.Warn },
         ),
         Tile("GSD mm/px", gsd ?: "—", gsdTone),
