@@ -139,13 +139,25 @@ fun MissionScene3D(
                 if (a.depth <= 0.1) continue
                 val len = aimRayLength(data, i, fallbackRay)
                 if (showOrig) {
-                    val d = aimDirection(data.headingsOriginal[i], data.pitchesOriginal[i])
-                    val b = p.project(
-                        data.wpE(i) + d[0] * len, data.wpN(i) + d[1] * len, data.wpU(i) + d[2] * len,
-                    )
-                    if (b.depth > 0.1) {
-                        drawLine(MissionPalette.aimOriginal.copy(alpha = 0.8f), Offset(a.x, a.y), Offset(b.x, b.y),
-                            strokeWidth = 1.2.dp.toPx())
+                    // Smart3D does not shoot one frame per waypoint — it cycles a
+                    // 3–5 pose rosette (±30° yaw, tens of degrees of pitch) while
+                    // flying. Draw every pose; a single ray would be a fiction.
+                    val poses = data.posesOriginal[i]
+                    val rays = if (poses.isNotEmpty()) {
+                        (0 until poses.size / 2).map {
+                            aimDirection(data.headingsOriginal[i] + poses[2 * it + 1], poses[2 * it])
+                        }
+                    } else {
+                        listOf(aimDirection(data.headingsOriginal[i], data.pitchesOriginal[i]))
+                    }
+                    for (d in rays) {
+                        val b = p.project(
+                            data.wpE(i) + d[0] * len, data.wpN(i) + d[1] * len, data.wpU(i) + d[2] * len,
+                        )
+                        if (b.depth > 0.1) {
+                            drawLine(MissionPalette.aimOriginal.copy(alpha = 0.55f), Offset(a.x, a.y), Offset(b.x, b.y),
+                                strokeWidth = 1.dp.toPx())
+                        }
                     }
                 }
                 if (showAug) {

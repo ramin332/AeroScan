@@ -139,8 +139,22 @@ fun MissionMap(
             for (i in 0 until data.waypointCount) {
                 val o = px(data.wpE(i), data.wpN(i))
                 if (showOrig) {
-                    drawLine(MissionPalette.aimOriginal, o, tickEnd(o, data.headingsOriginal[i], tick),
-                        strokeWidth = 1.5.dp.toPx())
+                    // Smart3D cycles a fan of poses around the waypoint heading,
+                    // so draw the fan, not one ray that never gets shot alone.
+                    val poses = data.posesOriginal[i]
+                    if (poses.isNotEmpty()) {
+                        for (k in 0 until poses.size / 2) {
+                            val shorten = cos(poses[2 * k] * PI / 180.0).toFloat().coerceIn(0.15f, 1f)
+                            drawLine(
+                                MissionPalette.aimOriginal.copy(alpha = 0.7f), o,
+                                tickEnd(o, data.headingsOriginal[i] + poses[2 * k + 1], tick * shorten),
+                                strokeWidth = 1.dp.toPx(),
+                            )
+                        }
+                    } else {
+                        drawLine(MissionPalette.aimOriginal, o, tickEnd(o, data.headingsOriginal[i], tick),
+                            strokeWidth = 1.5.dp.toPx())
+                    }
                 }
                 val hs = data.headingsAugmented
                 val ps = data.pitchesAugmented
@@ -191,7 +205,10 @@ fun MissionLegend(data: MissionMapData?, modifier: Modifier = Modifier) {
         verticalAlignment = Alignment.CenterVertically,
     ) {
         LegendItem(MissionPalette.cloud, "scan")
-        LegendItem(MissionPalette.aimOriginal, "DJI aim")
+        LegendItem(
+            MissionPalette.aimOriginal,
+            if (data != null && data.rosetteWaypoints > 0) "DJI rosette" else "DJI aim",
+        )
         LegendItem(MissionPalette.aimAugmentedLevel, "at wall")
         LegendItem(MissionPalette.aimAugmentedSteep, "steep down")
         if (data != null && data.facades.isNotEmpty()) {

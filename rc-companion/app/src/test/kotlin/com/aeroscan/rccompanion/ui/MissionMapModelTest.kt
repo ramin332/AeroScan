@@ -15,7 +15,10 @@ class MissionMapModelTest {
     private val refAlt = 30.0
     private val m = metersPerDeg(refLat)
 
-    private fun wp(i: Int, dE: Double, dN: Double, heading: Double, pitch: Double = -20.0, dU: Double = 0.0) =
+    private fun wp(
+        i: Int, dE: Double, dN: Double, heading: Double, pitch: Double = -20.0, dU: Double = 0.0,
+        poses: List<com.aeroscan.rccompanion.wpml.SmartObliquePose> = emptyList(),
+    ) =
         ParsedWaypoint(
             index = i,
             lon = refLon + dE / m[1],
@@ -23,6 +26,7 @@ class MissionMapModelTest {
             altEgm96 = refAlt + dU,
             headingDeg = heading,
             gimbalPitchDeg = pitch,
+            smartObliquePoses = poses,
         )
 
     private fun kmz(vararg wps: ParsedWaypoint, poly: List<DoubleArray> = emptyList()) =
@@ -119,5 +123,49 @@ class MissionMapModelTest {
         )
         assertEquals(0, d.cloudPointCount)
         assertTrue(d.maxE < 100)
+    }
+}
+
+/** Smart3D shoots a rosette, not one frame per waypoint. */
+class RosetteTest {
+    private val m = metersPerDeg(52.0)
+
+    private fun wp(i: Int, poses: List<com.aeroscan.rccompanion.wpml.SmartObliquePose>) = ParsedWaypoint(
+        index = i, lon = 5.0, lat = 52.0, altEgm96 = 30.0,
+        headingDeg = 57.0, gimbalPitchDeg = -37.0, smartObliquePoses = poses,
+    )
+
+    private fun pose(pitch: Double, yaw: Double) =
+        com.aeroscan.rccompanion.wpml.SmartObliquePose(pitchDeg = pitch, yawOffsetDeg = yaw)
+
+    @Test
+    fun every_pose_reaches_the_model_flattened_as_pitch_then_yaw_offset() {
+        // The real busboom10-7 waypoint 0: centre plus two pairs at ±30° yaw.
+        val poses = listOf(pose(-37.0, 0.0), pose(-7.0, -30.0), pose(-7.0, 30.0), pose(-67.0, 30.0), pose(-67.0, -30.0))
+        val d = buildMissionMap(ImportedKmz("t", 52.0, 5.0, 30.0, listOf(wp(0, poses)), emptyList()), null)
+        assertEquals(1, d.rosetteWaypoints)
+        assertEquals(10, d.posesOriginal[0].size)
+        assertEquals(-37.0, d.posesOriginal[0][0], 1e-9)
+        assertEquals(0.0, d.posesOriginal[0][1], 1e-9)
+        assertEquals(-7.0, d.posesOriginal[0][2], 1e-9)
+        assertEquals(-30.0, d.posesOriginal[0][3], 1e-9)
+    }
+
+    @Test
+    fun a_waypoint_without_a_rosette_reports_none() {
+        val d = buildMissionMap(ImportedKmz("t", 52.0, 5.0, 30.0, listOf(wp(0, emptyList())), emptyList()), null)
+        assertEquals(0, d.rosetteWaypoints)
+        assertTrue(d.posesOriginal[0].isEmpty())
+    }
+
+    @Test
+    fun the_rosette_spans_the_yaw_offsets_the_kmz_encodes() {
+        val poses = listOf(pose(-37.0, 0.0), pose(-7.0, -30.0), pose(-7.0, 30.0))
+        val d = buildMissionMap(ImportedKmz("t", 52.0, 5.0, 30.0, listOf(wp(0, poses)), emptyList()), null)
+        val flat = d.posesOriginal[0]
+        val bearings = (0 until flat.size / 2).map { d.headingsOriginal[0] + flat[2 * it + 1] }
+        assertEquals(listOf(57.0, 27.0, 87.0), bearings)
+        // Which is the point: one ray at 57° would hide a 60° spread.
+        assertTrue(bearings.max() - bearings.min() == 60.0)
     }
 }

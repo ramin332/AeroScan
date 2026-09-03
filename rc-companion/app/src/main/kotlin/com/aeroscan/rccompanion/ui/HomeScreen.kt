@@ -124,7 +124,7 @@ fun HomeScreen(viewModel: HomeViewModel = viewModel()) {
                         SegToggle(
                             label = "Aim",
                             options = listOf(
-                                MapLayer.Original to "DJI",
+                                MapLayer.Original to (if (map?.rosetteWaypoints ?: 0 > 0) "DJI rosette" else "DJI"),
                                 MapLayer.Augmented to "AeroScan",
                                 MapLayer.Both to "Both",
                             ),

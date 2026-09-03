@@ -71,6 +71,15 @@ data class MissionMapData(
     val headingsOriginal: DoubleArray,
     /** Gimbal pitch per waypoint as the KMZ commands it (deg, 0 = level, −90 = down). */
     val pitchesOriginal: DoubleArray,
+    /**
+     * DJI's Smart3D rosette per waypoint, flattened as [pitch, yawOffset, …].
+     * Smart3D does not shoot one frame per waypoint: it cycles a fan of 3–5
+     * poses around the waypoint heading (±30° yaw, tens of degrees of pitch),
+     * so drawing a single ray for "what DJI does" would be a fiction. Empty for
+     * waypoints that carry no rosette, and for augmented missions, which command
+     * one pose per waypoint by design.
+     */
+    val posesOriginal: Array<DoubleArray>,
     /** Headings after augmentation, or null before the preview lands. */
     val headingsAugmented: DoubleArray?,
     /** Gimbal pitch after augmentation, or null before the preview lands. */
@@ -96,6 +105,8 @@ data class MissionMapData(
     val widthM: Double get() = maxE - minE
     val heightM: Double get() = maxN - minN
     val cloudPointCount: Int get() = cloudXYZ.size / 3
+    /** Waypoints whose original mission commands a multi-pose rosette. */
+    val rosetteWaypoints: Int get() = posesOriginal.count { it.isNotEmpty() }
     val uncoveredFacades: Int get() = facades.count { !it.covered }
     /** Points the extractor recognised as belonging to some facade. */
     val recognisedPoints: Int get() = facades.sumOf { it.inlierCount }
@@ -138,6 +149,7 @@ fun buildMissionMap(
     val path = DoubleArray(n * 3)
     val hOrig = DoubleArray(n)
     val pOrig = DoubleArray(n)
+    val posesOrig = Array(n) { DoubleArray(0) }
     var minE = Double.POSITIVE_INFINITY; var minN = Double.POSITIVE_INFINITY
     var maxE = Double.NEGATIVE_INFINITY; var maxN = Double.NEGATIVE_INFINITY
     var minU = Double.POSITIVE_INFINITY; var maxU = Double.NEGATIVE_INFINITY
@@ -154,6 +166,14 @@ fun buildMissionMap(
         path[3 * i] = e; path[3 * i + 1] = no; path[3 * i + 2] = u
         hOrig[i] = wp.headingDeg
         pOrig[i] = wp.gimbalPitchDeg
+        if (wp.smartObliquePoses.isNotEmpty()) {
+            val flat = DoubleArray(wp.smartObliquePoses.size * 2)
+            wp.smartObliquePoses.forEachIndexed { k, pose ->
+                flat[2 * k] = pose.pitchDeg
+                flat[2 * k + 1] = pose.yawOffsetDeg
+            }
+            posesOrig[i] = flat
+        }
         sumE += e; sumN += no
         grow(e, no, u)
     }
@@ -208,6 +228,7 @@ fun buildMissionMap(
         pathXYZ = path,
         headingsOriginal = hOrig,
         pitchesOriginal = pOrig,
+        posesOriginal = posesOrig,
         headingsAugmented = hAug,
         pitchesAugmented = pAug,
         targets = if (targets.size == n) targets else IntArray(0),
