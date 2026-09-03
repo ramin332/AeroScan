@@ -25,9 +25,24 @@ class PreviewSummaryTest {
     }
 
     @Test
+    fun facade_geometry_and_targets_parse_for_the_mission_view() {
+        val json = """{"name":"m",$base,
+            "facade_geom":[{"v":[[0,0,0],[4,0,0],[4,0,3],[0,0,3]],"n":[0,-1,0]},
+                           {"v":[[9,9,0],[10,9,0],[10,9,2],[9,9,2]],"n":[0,-1,0]}],
+            "wp_target":[0,0,-1]}"""
+        val s = HomeViewModel.PreviewSummary.fromJson(json.toByteArray())
+        assertEquals(2, s.facadeGeom.size)
+        assertEquals(4, s.facadeGeom[0].cornerCount)
+        assertEquals(4.0, s.facadeGeom[0].v[3], 1e-9)
+        assertEquals(-1.0, s.facadeGeom[0].n[1], 1e-9)
+        assertEquals(listOf(0, 0, -1), s.wpTargets.toList())
+    }
+
+    @Test
     fun old_manifold_summary_without_new_keys_still_parses() {
         val s = HomeViewModel.PreviewSummary.fromJson("""{"name":"m",$base}""".toByteArray())
         assertNull(s.gsdMedianMmPx); assertEquals(0, s.flips); assertTrue(s.stopAtWaypoint)
+        assertTrue(s.facadeGeom.isEmpty()); assertEquals(0, s.wpTargets.size)
         assertEquals(setOf(3, 10, 11), s.flaggedIndices)
     }
 }

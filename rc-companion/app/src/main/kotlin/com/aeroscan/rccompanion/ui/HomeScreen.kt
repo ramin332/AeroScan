@@ -53,6 +53,8 @@ fun HomeScreen(viewModel: HomeViewModel = viewModel()) {
     val conn by viewModel.connection.collectAsStateWithLifecycle()
     val banner by viewModel.banner.collectAsStateWithLifecycle()
     val status by viewModel.status.collectAsStateWithLifecycle()
+    val drops by viewModel.linkDrops.collectAsStateWithLifecycle()
+    val upSince by viewModel.linkUpSince.collectAsStateWithLifecycle()
     val map by viewModel.map.collectAsStateWithLifecycle()
     val ctx = LocalContext.current
     val pick = rememberKmzPicker { viewModel.onFilePicked(it) }
@@ -63,9 +65,13 @@ fun HomeScreen(viewModel: HomeViewModel = viewModel()) {
         if (conn is Connection.State.AircraftConnected) viewModel.checkStatus()
     }
 
-    val panel = panelStatusFor(conn, banner, status)
-    val blockReason = augmentBlockReason(conn, banner, status)
+    // Re-evaluated on every recomposition; the connection flow ticks whenever the
+    // link changes, which is exactly when these can flip.
+    val now = System.currentTimeMillis()
+    val panel = panelStatusFor(conn, banner, status, drops, now)
+    val blockReason = augmentBlockReason(conn, banner, status, drops, upSince, now)
     var layer by remember { mutableStateOf(MapLayer.Both) }
+    var view by remember { mutableStateOf(MapView.Top) }
 
     Scaffold { padding ->
         Column(
@@ -83,7 +89,17 @@ fun HomeScreen(viewModel: HomeViewModel = viewModel()) {
                 Spacer(Modifier.width(24.dp))
                 Stepper(current = stepOf(ui))
                 Spacer(Modifier.weight(1f))
-                LayerToggle(layer = layer, enabled = map?.headingsAugmented != null, onChange = { layer = it })
+                SegToggle(
+                    label = "View",
+                    options = listOf(MapView.Top to "Top", MapView.Orbit to "3D"),
+                    selected = view, enabled = true, onChange = { view = it },
+                )
+                Spacer(Modifier.width(12.dp))
+                SegToggle(
+                    label = "Aim",
+                    options = listOf(MapLayer.Original to "DJI", MapLayer.Augmented to "AeroScan", MapLayer.Both to "Both"),
+                    selected = layer, enabled = map?.headingsAugmented != null, onChange = { layer = it },
+                )
             }
             StatusStrip(
                 status = panel,
@@ -94,8 +110,10 @@ fun HomeScreen(viewModel: HomeViewModel = viewModel()) {
                 horizontalArrangement = Arrangement.spacedBy(12.dp),
                 modifier = Modifier.height(IntrinsicSize.Min),
             ) {
-                Column(modifier = Modifier.weight(1.45f)) {
-                    MissionMap(data = map, heightDp = 280, layer = layer)
+                Column(modifier = Modifier.weight(1.45f), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    if (view == MapView.Top) MissionMap(data = map, heightDp = 268, layer = layer)
+                    else MissionScene3D(data = map, heightDp = 268, layer = layer)
+                    MissionLegend(map)
                 }
                 Column(
                     modifier = Modifier
@@ -161,21 +179,31 @@ private fun Stepper(current: Int) {
 }
 
 @Composable
-private fun LayerToggle(layer: MapLayer, enabled: Boolean, onChange: (MapLayer) -> Unit) {
+private fun <T> SegToggle(
+    label: String,
+    options: List<Pair<T, String>>,
+    selected: T,
+    enabled: Boolean,
+    onChange: (T) -> Unit,
+) {
     val cs = MaterialTheme.colorScheme
     Row(horizontalArrangement = Arrangement.spacedBy(4.dp), verticalAlignment = Alignment.CenterVertically) {
-        Text("Headings:", style = MaterialTheme.typography.labelMedium, color = cs.onSurfaceVariant)
-        listOf(MapLayer.Original to "DJI", MapLayer.Augmented to "AeroScan", MapLayer.Both to "Both").forEach { (l, name) ->
-            val on = l == layer
+        Text("$label:", style = MaterialTheme.typography.labelMedium, color = cs.onSurfaceVariant)
+        options.forEach { (value, name) ->
+            val on = value == selected
             Text(
                 name,
                 style = MaterialTheme.typography.labelMedium,
-                color = if (!enabled) cs.onSurfaceVariant.copy(alpha = 0.5f) else if (on) cs.onPrimaryContainer else cs.onSurfaceVariant,
+                color = when {
+                    !enabled -> cs.onSurfaceVariant.copy(alpha = 0.5f)
+                    on -> cs.onPrimaryContainer
+                    else -> cs.onSurfaceVariant
+                },
                 fontWeight = if (on) FontWeight.Bold else FontWeight.Normal,
                 modifier = Modifier
                     .clip(RoundedCornerShape(6.dp))
                     .background(if (on && enabled) cs.primaryContainer else cs.surfaceVariant)
-                    .clickable(enabled = enabled) { onChange(l) }
+                    .clickable(enabled = enabled) { onChange(value) }
                     .padding(horizontal = 8.dp, vertical = 3.dp),
             )
         }
@@ -201,11 +229,17 @@ private fun tilesFor(ui: HomeViewModel.UiState, map: MissionMapData?): List<Tile
     val issues = s?.let { it.warnings + it.errors }
     return listOf(
         Tile("Waypoints", wps?.toString() ?: "—"),
-        Tile("Facades", s?.facadeCount?.toString() ?: "—"),
+        Tile(
+            "Facades", s?.facadeCount?.toString() ?: "—",
+            map?.takeIf { it.facades.isNotEmpty() }?.let { if (it.uncoveredFacades == 0) Tone.Good else Tone.Warn },
+        ),
+        Tile(
+            "No photos", map?.takeIf { it.facades.isNotEmpty() }?.uncoveredFacades?.toString() ?: "—",
+            map?.takeIf { it.facades.isNotEmpty() }?.let { if (it.uncoveredFacades == 0) Tone.Good else Tone.Warn },
+        ),
         Tile("GSD mm/px", gsd ?: "—", gsdTone),
         Tile("Aimed", aimed ?: "—", s?.let { if (it.unaimed == 0) Tone.Good else Tone.Warn }),
         Tile("Warnings", issues?.toString() ?: "—", issues?.let { if (it == 0) Tone.Good else if (s.errors > 0) Tone.Bad else Tone.Warn }),
-        Tile("Flips >90°", s?.flips?.toString() ?: "—", s?.let { if (it.flips == 0) Tone.Good else Tone.Warn }),
     )
 }
 

@@ -298,3 +298,40 @@ def test_intent_ignores_unknown_keys_such_as_allow_stale_mesh():
     d["allow_stale_mesh"] = True
     k = intent_dict_to_imported_kmz(d)
     assert k.name == "TestSite" and len(k.waypoints) == 2
+
+
+def test_facade_geometry_serializes_rectangles_and_normals():
+    """The RC draws these; they must be plain float lists in the mission ENU frame."""
+    import numpy as np
+
+    from flight_planner.cli import _facade_geometry
+    from flight_planner.models import Facade
+
+    quad = Facade(
+        vertices=np.array([[0.0, 0.0, 0.0], [4.0, 0.0, 0.0], [4.0, 0.0, 3.0], [0.0, 0.0, 3.0]]),
+        normal=np.array([0.0, -1.0, 0.0]),
+    )
+    out = _facade_geometry([quad])
+    assert len(out) == 1
+    assert out[0]["v"] == [[0.0, 0.0, 0.0], [4.0, 0.0, 0.0], [4.0, 0.0, 3.0], [0.0, 0.0, 3.0]]
+    assert out[0]["n"] == [0.0, -1.0, 0.0]
+
+
+def test_facade_geometry_reduces_many_sided_facets_to_a_rectangle():
+    import numpy as np
+
+    from flight_planner.cli import _facade_geometry
+    from flight_planner.models import Facade
+
+    ring = np.array([[np.cos(t) * 2, 0.0, np.sin(t) * 2] for t in np.linspace(0, 6.0, 12)])
+    out = _facade_geometry([Facade(vertices=ring, normal=np.array([0.0, 1.0, 0.0]))])
+    assert len(out[0]["v"]) == 4
+
+
+def test_facade_geometry_skips_degenerate_facets():
+    import numpy as np
+
+    from flight_planner.cli import _facade_geometry
+    from flight_planner.models import Facade
+
+    assert _facade_geometry([Facade(vertices=np.zeros((2, 3)), normal=np.array([0.0, 0.0, 1.0]))]) == []

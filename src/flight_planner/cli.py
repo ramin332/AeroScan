@@ -86,6 +86,45 @@ _ANOMALY_PITCH_UP_DEG = 25.0
 _ANOMALY_PITCH_DOWN_DEG = -85.0
 
 
+
+def _facade_geometry(facades) -> list[dict]:
+    """Facade rectangles for the RC mission view.
+
+    Each entry carries the corner vertices and the outward normal in the
+    mission's local-ENU frame (same frame as the waypoints, anchored on the
+    intent's reference point), rounded to centimetres to keep the PRVW frame
+    small. Facets with more than 8 corners are reduced to their planar
+    bounding rectangle so the payload stays bounded.
+    """
+    out: list[dict] = []
+    for f in facades:
+        v = np.asarray(f.vertices, dtype=float)
+        if v.ndim != 2 or v.shape[0] < 3:
+            continue
+        if v.shape[0] > 8:
+            c = v.mean(axis=0)
+            n = np.asarray(f.normal, dtype=float)
+            n = n / (np.linalg.norm(n) or 1.0)
+            # Build an in-plane frame and take the axis-aligned box in it.
+            ref = np.array([0.0, 0.0, 1.0]) if abs(n[2]) < 0.9 else np.array([1.0, 0.0, 0.0])
+            u = np.cross(n, ref)
+            u = u / (np.linalg.norm(u) or 1.0)
+            w = np.cross(n, u)
+            d = v - c
+            su, sw = d @ u, d @ w
+            v = np.array([
+                c + u * su.min() + w * sw.min(),
+                c + u * su.max() + w * sw.min(),
+                c + u * su.max() + w * sw.max(),
+                c + u * su.min() + w * sw.max(),
+            ])
+        out.append({
+            "v": [[round(float(a), 2) for a in p] for p in v],
+            "n": [round(float(a), 3) for a in np.asarray(f.normal, dtype=float)],
+        })
+    return out
+
+
 def _gimbal_summary(waypoints: list[Waypoint]) -> dict:
     """Compact stats over the augmented waypoints — what rc-companion needs
     to render the preview screen and what the pilot should glance at before
@@ -485,6 +524,13 @@ def augment_mission(
         "waypoints_aimed": aimed,
         "facades": len(facades),
         "gimbal_stats": _gimbal_summary(new_waypoints),
+        # Geometry for the RC's mission view: facade rectangles in the same
+        # local-ENU frame as the waypoints (intent ref), plus which facade each
+        # waypoint was aimed at. Lets the pilot see WHAT is being photographed
+        # (and which walls get nothing) before approving. ~25 KB for 220 facets.
+        "facade_geom": _facade_geometry(facades),
+        "wp_target": [int(getattr(w, "facade_index", -1) if getattr(w, "facade_index", None) is not None else -1)
+                      for w in new_waypoints],
         "stop_at_waypoint": stop_at_waypoint,
         "aim": {"mode": assign_mode, "switch_cost": switch_cost, "reach_m": max_facade_distance_m, **audit},
         "gsd": {

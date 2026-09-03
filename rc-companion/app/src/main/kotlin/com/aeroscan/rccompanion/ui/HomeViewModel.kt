@@ -198,6 +198,10 @@ class HomeViewModel(app: Application) : AndroidViewModel(app) {
         val errors: Int = 0,
         val validationMessages: List<String> = emptyList(),
         val validationIndices: IntArray = IntArray(0),
+        /** Facade rectangles in mission ENU, for the mission view. Empty on older Manifolds. */
+        val facadeGeom: List<FacadeQuad> = emptyList(),
+        /** Facade each waypoint is aimed at, −1 = none. Empty on older Manifolds. */
+        val wpTargets: IntArray = IntArray(0),
     ) {
         /** Every waypoint the pilot should look at on the map. */
         val flaggedIndices: Set<Int>
@@ -214,6 +218,23 @@ class HomeViewModel(app: Application) : AndroidViewModel(app) {
                 val gsd = obj.optJSONObject("gsd")
                 val aim = obj.optJSONObject("aim")
                 val validation = obj.optJSONArray("validation")
+                val geom = obj.optJSONArray("facade_geom")
+                val quads = ArrayList<FacadeQuad>(geom?.length() ?: 0)
+                if (geom != null) for (i in 0 until geom.length()) {
+                    val g = geom.getJSONObject(i)
+                    val vs = g.optJSONArray("v") ?: continue
+                    val v = DoubleArray(vs.length() * 3)
+                    for (c in 0 until vs.length()) {
+                        val corner = vs.getJSONArray(c)
+                        v[3 * c] = corner.getDouble(0); v[3 * c + 1] = corner.getDouble(1); v[3 * c + 2] = corner.getDouble(2)
+                    }
+                    val ns = g.optJSONArray("n")
+                    val nv = DoubleArray(3)
+                    if (ns != null) for (k in 0 until minOf(3, ns.length())) nv[k] = ns.getDouble(k)
+                    quads.add(FacadeQuad(v, nv, 0))
+                }
+                val tgt = obj.optJSONArray("wp_target")
+                val targets = IntArray(tgt?.length() ?: 0) { tgt!!.getInt(it) }
                 var warnings = 0; var errors = 0
                 val messages = ArrayList<String>()
                 val vIdx = ArrayList<Int>()
@@ -253,6 +274,8 @@ class HomeViewModel(app: Application) : AndroidViewModel(app) {
                     errors = errors,
                     validationMessages = messages,
                     validationIndices = vIdx.toIntArray(),
+                    facadeGeom = quads,
+                    wpTargets = targets,
                 )
             }
 
@@ -290,6 +313,8 @@ class HomeViewModel(app: Application) : AndroidViewModel(app) {
     private var replaceAcknowledgedFor: String? = null
 
     val connection: StateFlow<Connection.State> = Connection.state
+    val linkDrops: StateFlow<List<Long>> = Connection.drops
+    val linkUpSince: StateFlow<Long?> = Connection.upSince
 
     private var augmentJob: Job? = null
     private var session: AugmentSession? = null
@@ -356,7 +381,10 @@ class HomeViewModel(app: Application) : AndroidViewModel(app) {
         // don't upload a KMZ and run a doomed ~2-min augment when the Manifold has
         // already told us it can't succeed. An old scan is NOT a blocker: the chip
         // shows its age and the Manifold's age gate is bypassed on purpose.
-        val blockReason = augmentBlockReason(connection.value, banner.value, lastStatus)
+        val blockReason = augmentBlockReason(
+            connection.value, banner.value, lastStatus,
+            drops = Connection.drops.value, upSinceMs = Connection.upSince.value,
+        )
         if (blockReason != null) {
             _ui.value = UiState.Error(picked, blockReason)
             return
@@ -464,7 +492,10 @@ class HomeViewModel(app: Application) : AndroidViewModel(app) {
                                 val aug = runCatching {
                                     WpmlParser.parseKmz(ev.augmentedKmz, missionName = summary.name).intent
                                 }.getOrNull()
-                                buildMissionMap(intent, parsedCloud, aug, summary.flaggedIndices)
+                                buildMissionMap(
+                                    intent, parsedCloud, aug, summary.flaggedIndices,
+                                    facades = summary.facadeGeom, targets = summary.wpTargets,
+                                )
                             }
                             _ui.value = UiState.ReviewReady(picked, summary, ev.augmentedKmz, savedPath)
                         }

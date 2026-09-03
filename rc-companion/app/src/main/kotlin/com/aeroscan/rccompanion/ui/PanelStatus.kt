@@ -44,9 +44,13 @@ fun panelStatusFor(
     conn: Connection.State,
     banner: BannerState,
     status: AugmentFraming.ManifoldStatus?,
+    drops: List<Long> = emptyList(),
+    nowMs: Long = System.currentTimeMillis(),
 ): PanelStatus {
+    val flapping = LinkHealth.isFlapping(drops, nowMs)
     val aircraft = when (conn) {
-        is Connection.State.AircraftConnected -> Chip("Aircraft linked", Tone.Good)
+        is Connection.State.AircraftConnected ->
+            if (flapping) Chip("Link shared with Pilot 2", Tone.Warn) else Chip("Aircraft linked", Tone.Good)
         is Connection.State.AircraftDisconnected -> Chip("Aircraft off", Tone.Bad)
         is Connection.State.Registered -> Chip("Waiting for aircraft", Tone.Neutral)
         is Connection.State.Initializing -> Chip("Starting…", Tone.Neutral)
@@ -91,8 +95,14 @@ fun augmentBlockReason(
     conn: Connection.State,
     banner: BannerState,
     status: AugmentFraming.ManifoldStatus?,
+    drops: List<Long> = emptyList(),
+    upSinceMs: Long? = null,
+    nowMs: Long = System.currentTimeMillis(),
 ): String? = when {
     conn !is Connection.State.AircraftConnected -> "Power on the aircraft and pair the RC."
+    // A drop mid-transfer kills the augment, so wait for the link to settle.
+    !LinkHealth.isSettled(upSinceMs, nowMs) && upSinceMs != null -> "Aircraft link just came up — starting in a moment."
+    LinkHealth.isFlapping(drops, nowMs) -> LinkHealth.advice(drops, nowMs)
     banner is BannerState.Unreachable -> "AeroScan app is not running on the drone. Pilot 2 → camera view → payload panel → enable AeroScan."
     banner is BannerState.EnvError -> "Manifold environment error — augment cannot run."
     banner is BannerState.NoMesh && (status == null || !status.meshExists) -> "No scan on the drone. Fly a Smart3D scan first."

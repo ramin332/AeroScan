@@ -130,3 +130,14 @@ def test_median_gsd_helper():
     assert median_gsd_mm_per_px(wps, [_facade_at(18.34)], CameraName.WIDE) is not None
     assert abs(median_gsd_mm_per_px(wps, [_facade_at(18.34)], CameraName.WIDE) - 5.01) < 0.05
     assert median_gsd_mm_per_px([_wp(0, 0.0, facade=-1)], [_facade_at(18.34)], CameraName.WIDE) is None
+
+
+def test_stop_at_waypoint_skips_photo_interval_check():
+    """2026-09-03: the RC showed "100 photo waypoints are too close for camera
+    interval (0.5s at 3.0m/s)" on a stop-mode mission. In stop mode the aircraft
+    halts at every waypoint, so transit speed cannot starve the shutter."""
+    wps = [_wp(i, x=i * 0.3, facade=0) for i in range(6)]
+    fly = validate_mission(wps, MissionConfig(flight_speed_ms=3.0, stop_at_waypoint=False))
+    stop = validate_mission(wps, MissionConfig(flight_speed_ms=3.0, stop_at_waypoint=True))
+    assert "photo_interval_too_short" in _codes(fly)
+    assert "photo_interval_too_short" not in _codes(stop)

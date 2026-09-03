@@ -172,12 +172,15 @@ def validate_mission(
             waypoint_indices=[wp.index for wp in near_limit_wps[:5]],
         ))
 
-    # Photo interval check
+    # Photo interval check — only meaningful when the aircraft flies through
+    # the waypoints. In stop mode (toPointAndStopWithContinuityCurvature) it
+    # halts at every waypoint, so the shutter never races the flight speed and
+    # the transit speed between points is irrelevant to the photo interval.
     from .camera import get_camera
     camera_spec = get_camera(config.camera)
     min_interval = camera_spec.min_interval_s
     too_close_wps = []
-    for i in range(1, len(inspection_wps)):
+    for i in range(1, len(inspection_wps) if not config.stop_at_waypoint else 0):
         wp_a, wp_b = inspection_wps[i - 1], inspection_wps[i]
         if wp_a.facade_index != wp_b.facade_index:
             continue  # skip cross-facade pairs
