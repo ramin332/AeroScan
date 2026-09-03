@@ -159,6 +159,7 @@ fun HomeScreen(viewModel: HomeViewModel = viewModel()) {
                         onStop = viewModel::setStopAtWaypoint,
                         onReach = viewModel::setReach,
                         onMinHeight = viewModel::setMinHeight,
+                        onShots = viewModel::setShots,
                     )
                     ActionPanel(
                         ui = ui,
@@ -320,6 +321,7 @@ private fun PlannerControls(
     onStop: (Boolean) -> Unit,
     onReach: (Double?) -> Unit,
     onMinHeight: (Double?) -> Unit,
+    onShots: (Int) -> Unit,
 ) {
     val cs = MaterialTheme.colorScheme
     Column(
@@ -357,6 +359,14 @@ private fun PlannerControls(
             selected = settings.minHeightM,
             enabled = enabled,
             onChange = onMinHeight,
+        )
+        SegToggle(
+            label = "Shots/WP",
+            options = PlannerSettings.SHOT_CHOICES.map { it to "$it" },
+            selected = settings.shotsPerWaypoint,
+            // Extra shots need the aircraft to hold still.
+            enabled = enabled && settings.stopAtWaypoint,
+            onChange = onShots,
         )
     }
 }

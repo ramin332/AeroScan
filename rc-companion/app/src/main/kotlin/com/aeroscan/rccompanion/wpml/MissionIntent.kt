@@ -130,12 +130,20 @@ data class PlannerSettings(
      * parked cars and waste frames.
      */
     val minHeightM: Double? = null,
+    /**
+     * Photos taken at each stop. The nose aims at the primary wall; extras pan
+     * the gimbal within its travel to walls nothing else photographs. Needs the
+     * stop — in fly-through the aircraft has moved on before the sequence ends,
+     * which is how 104 of 398 photos were lost on 2026-07-10 with a single shot.
+     */
+    val shotsPerWaypoint: Int = 1,
 ) {
     fun toJson(): JSONObject = JSONObject().apply {
         put("inspection_speed_ms", inspectionSpeedMs)
         put("stop_at_waypoint", stopAtWaypoint)
         reachM?.let { put("max_facade_distance_m", it) }
         minHeightM?.let { put("min_facade_height_m", it) }
+        put("shots_per_waypoint", if (stopAtWaypoint) shotsPerWaypoint else 1)
     }
 
     companion object {
@@ -143,6 +151,13 @@ data class PlannerSettings(
 
         /** null = derive from the target GSD. The rest are inside the engine clamp. */
         val REACH_CHOICES: List<Double?> = listOf(null, 10.0, 20.0, 30.0)
+
+        /**
+         * One or two. Measured on the aircraft 2026-09-03: three produced a
+         * byte-identical mission to two — with the nose on the primary wall
+         * there is never a third unshot wall inside the gimbal's pan window.
+         */
+        val SHOT_CHOICES = listOf(1, 2)
 
         /** null = no height gate. */
         val MIN_HEIGHT_CHOICES: List<Double?> = listOf(null, 1.0, 2.0, 3.0)

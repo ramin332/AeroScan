@@ -89,3 +89,37 @@ class ReachSettingTest {
         assertEquals("20 m", PlannerSettings.reachLabel(20.0))
     }
 }
+
+/** Extra photos per stop — the coverage lever, and why it needs the stop. */
+class ShotsPerWaypointTest {
+    private val intent = ImportedKmz("m", 52.0, 5.0, 30.0, emptyList(), emptyList())
+
+    private fun settings(s: PlannerSettings) =
+        org.json.JSONObject(intent.toJsonString(settings = s)).getJSONObject("settings")
+
+    @Test
+    fun the_choice_reaches_the_engine_in_stop_mode() {
+        assertEquals(2, settings(PlannerSettings(stopAtWaypoint = true, shotsPerWaypoint = 2))
+            .getInt("shots_per_waypoint"))
+    }
+
+    @Test
+    fun only_one_or_two_are_offered() {
+        // Three measured byte-identical to two on the aircraft.
+        assertEquals(listOf(1, 2), PlannerSettings.SHOT_CHOICES)
+    }
+
+    @Test
+    fun fly_through_is_forced_back_to_one_shot() {
+        // The aircraft is still moving while the action sequence runs.
+        assertEquals(1, settings(PlannerSettings(stopAtWaypoint = false, shotsPerWaypoint = 2))
+            .getInt("shots_per_waypoint"))
+    }
+
+    @Test
+    fun offered_counts_stay_inside_the_engine_clamp() {
+        assertEquals(1, PlannerSettings.SHOT_CHOICES.first())
+        assertTrue(PlannerSettings.SHOT_CHOICES.all { it in 1..4 })
+        assertTrue(PlannerSettings.SHOT_CHOICES.size == 2)
+    }
+}

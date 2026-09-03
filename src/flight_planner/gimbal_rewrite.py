@@ -16,6 +16,8 @@ from typing import Sequence
 import numpy as np
 
 from .models import (
+    ActionType,
+    CameraAction,
     GIMBAL_TILT_MAX_DEG,
     GIMBAL_TILT_MIN_DEG,
     Facade,
@@ -349,6 +351,76 @@ def aim_audit(
     }
 
 
+
+def assign_extra_shots(
+    waypoints: Sequence[Waypoint],
+    facades: Sequence[Facade],
+    primary: Sequence[int],
+    *,
+    max_distance_m: float,
+    pan_window_deg: float,
+    shots_per_waypoint: int,
+    pitch_min: float,
+    pitch_max: float,
+) -> list[list[tuple[int, float, float]]]:
+    """Extra photos to take at each waypoint without moving the aircraft.
+
+    The nose is already aimed at the waypoint's primary facet, and the M4E's
+    gimbal pans ±60° from the nose — measured, not assumed: the 2026-07-10
+    photos show a median pan of 51.5° with 41 frames sitting on the stop. So a
+    second and third wall can be photographed from the same stop by panning the
+    gimbal, with no airframe rotation and no extra travel.
+
+    Only facets no other waypoint already photographs are handed out, and each
+    is handed out once, so the extras spend themselves on the walls the mission
+    would otherwise miss rather than re-shooting the same one.
+
+    Returns, per waypoint, a list of ``(facade_index, pitch_deg, yaw_deg)`` with
+    yaw absolute from north — the same convention as ``Waypoint.gimbal_yaw_deg``.
+    """
+    if shots_per_waypoint <= 1 or not facades:
+        return [[] for _ in waypoints]
+
+    C = np.array([np.asarray(f.center, float) for f in facades])
+    Nn = np.array([np.asarray(f.normal, float) for f in facades])
+    Nn /= np.maximum(np.linalg.norm(Nn, axis=1, keepdims=True), 1e-9)
+
+    taken = {i for i in primary if i is not None and i >= 0}
+    out: list[list[tuple[int, float, float]]] = []
+    for wi, wp in enumerate(waypoints):
+        extras: list[tuple[int, float, float]] = []
+        want = shots_per_waypoint - 1
+        pi = primary[wi] if wi < len(primary) else -1
+        if want <= 0 or pi is None or pi < 0:
+            out.append(extras)
+            continue
+
+        pos = np.array([wp.x, wp.y, wp.z], dtype=np.float64)
+        d3 = C - pos
+        dist = np.linalg.norm(d3, axis=1)
+        signed = np.einsum("ij,ij->i", -d3, Nn)          # waypoint on the outward side
+        bearing = np.degrees(np.arctan2(d3[:, 0], d3[:, 1]))
+        pan = np.abs(_wrap180(bearing - float(wp.heading_deg)))
+        horiz = np.hypot(d3[:, 0], d3[:, 1])
+        pitch = np.degrees(np.arctan2(d3[:, 2], horiz))
+
+        order = np.argsort(dist)
+        for fi in order:
+            if len(extras) >= want:
+                break
+            i = int(fi)
+            if i in taken or dist[i] > max_distance_m or dist[i] < 1e-6:
+                continue
+            if signed[i] <= 0 or pan[i] > pan_window_deg:
+                continue
+            p = float(min(pitch_max, max(pitch_min, pitch[i])))
+            y = float(_wrap180(bearing[i]))
+            extras.append((i, p, y))
+            taken.add(i)
+        out.append(extras)
+    return out
+
+
 def rewrite_gimbals_perpendicular(
     waypoints: list[Waypoint],
     facades: list[Facade],
@@ -361,6 +433,8 @@ def rewrite_gimbals_perpendicular(
     yaw_rate_deg_per_s: float = 60.0,
     heading_rate_fraction: float = 0.5,
     command_gimbal_yaw: bool = False,
+    shots_per_waypoint: int = 1,
+    pan_window_deg: float = 45.0,
     assign_mode: str = "viterbi",
     switch_cost: float = 4.0,
 ) -> list[Waypoint]:
@@ -535,5 +609,34 @@ def rewrite_gimbals_perpendicular(
                 f"than {heading_rate_fraction:.0%} of {yaw_rate_deg_per_s:.0f}°/s to keep "
                 f"gimbal pan within ±{max_gimbal_pan_deg:.0f}°. The aircraft will yaw hard there."
             )
+
+    if shots_per_waypoint > 1:
+        picks = [w.facade_index for w in out]
+        extras = assign_extra_shots(
+            out, facades, picks,
+            max_distance_m=max_distance_m,
+            pan_window_deg=pan_window_deg,
+            shots_per_waypoint=shots_per_waypoint,
+            pitch_min=pitch_min,
+            pitch_max=pitch_max,
+        )
+        rebuilt: list[Waypoint] = []
+        for wp, shots in zip(out, extras):
+            if not shots:
+                rebuilt.append(wp)
+                continue
+            # Own the whole sequence: one photo on the nose bearing, then a
+            # pan-and-shoot pair per extra wall. Anything DJI left on the
+            # waypoint is dropped here rather than downstream.
+            acts = [CameraAction(action_type=ActionType.TAKE_PHOTO)]
+            for _fi, pitch, yaw in shots:
+                acts.append(CameraAction(
+                    action_type=ActionType.GIMBAL_ROTATE,
+                    gimbal_pitch_deg=pitch,
+                    gimbal_yaw_deg=yaw,
+                ))
+                acts.append(CameraAction(action_type=ActionType.TAKE_PHOTO))
+            rebuilt.append(replace(wp, actions=acts, extra_facade_indices=[fi for fi, _p, _y in shots]))
+        out = rebuilt
 
     return out

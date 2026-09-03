@@ -184,9 +184,20 @@ def _build_mission(
             yaw=wp.gimbal_yaw_deg,
         )
 
+        # Actions run in order inside one sequence group, so a waypoint can
+        # rotate the gimbal and shoot more than once. Extra shots pan the gimbal
+        # off the nose; the airframe never turns.
+        shot = 0
         for action in wp.actions:
             if action.action_type == ActionType.TAKE_PHOTO:
-                wb.take_photo(f"wp{wp.index}")
+                suffix = f"wp{wp.index}" if shot == 0 else f"wp{wp.index}_{shot}"
+                wb.take_photo(suffix)
+                shot += 1
+            elif action.action_type == ActionType.GIMBAL_ROTATE:
+                wb.gimbal_rotate(
+                    pitch=_clamp_pitch(action.gimbal_pitch_deg),
+                    yaw=action.gimbal_yaw_deg,
+                )
             elif action.action_type == ActionType.HOVER:
                 wb.hover(action.hover_time_s)
 

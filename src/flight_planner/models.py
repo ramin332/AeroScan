@@ -157,6 +157,9 @@ class Waypoint:
 
     # Metadata
     facade_index: int = -1
+    # Facets photographed by extra shots at this waypoint (gimbal pan, no
+    # airframe rotation). Empty unless shots_per_waypoint > 1.
+    extra_facade_indices: list[int] = field(default_factory=list)
     component_tag: str = ""  # NL-SfB code, e.g. "21.1"
     is_detail_point: bool = False
     is_transition: bool = False  # transit waypoint (no photo, higher speed)

@@ -144,6 +144,11 @@ SETTING_KEYS: dict[str, tuple[type, float, float]] = {
     # pull the aim down and waste frames; on a building it drops kerbs, planters
     # and parked cars so the mission spends its waypoints on the facade.
     "min_facade_height_m": (float, 0.0, 20.0),
+    # Photos per stop. The nose aims at the primary wall; extras pan the gimbal
+    # within its ±60° travel to walls nothing else photographs. Needs the stop —
+    # in fly-through the aircraft is still moving while the sequence runs.
+    "shots_per_waypoint": (int, 1, 4),
+    "gimbal_pan_window_deg": (float, 0.0, 55.0),
 }
 
 #: Detection settings, mapped onto facades_from_pointcloud_cgal keyword names.

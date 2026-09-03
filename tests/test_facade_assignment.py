@@ -177,3 +177,62 @@ def test_a_facet_outside_the_reach_cap_is_still_refused():
     )
     wps = [Waypoint(x=0.0, y=-40.0, z=1.0, heading_deg=0.0, gimbal_pitch_deg=0.0, index=i) for i in range(2)]
     assert assign_facades_viterbi(wps, [far], max_distance_m=14.6) == [-1, -1]
+
+
+def _wall(index, e, n, w=4.0, h=3.0, normal=(0.0, -1.0, 0.0)):
+    import numpy as np
+
+    from flight_planner.models import Facade
+
+    return Facade(
+        vertices=np.array([[e, n, 0.0], [e + w, n, 0.0], [e + w, n, h], [e, n, h]]),
+        normal=np.array(normal, dtype=float), index=index, component_tag="21.1",
+    )
+
+
+def test_extra_shots_go_to_walls_nothing_else_photographs():
+    """One stop, one nose bearing, several walls: the gimbal pans to the ones the
+    mission would otherwise miss, and never hands the same wall out twice."""
+    from flight_planner.gimbal_rewrite import assign_extra_shots
+    from flight_planner.models import Waypoint
+
+    facades = [_wall(0, -2.0, 6.0), _wall(1, 6.0, 6.0), _wall(2, 14.0, 6.0)]
+    wps = [
+        Waypoint(x=0.0, y=0.0, z=2.0, heading_deg=0.0, gimbal_pitch_deg=0.0, index=0),
+        Waypoint(x=1.0, y=0.0, z=2.0, heading_deg=0.0, gimbal_pitch_deg=0.0, index=1),
+    ]
+    extras = assign_extra_shots(
+        wps, facades, [0, 0], max_distance_m=30.0, pan_window_deg=50.0,
+        shots_per_waypoint=2, pitch_min=-88.0, pitch_max=33.0,
+    )
+    picked = [i for shots in extras for i, _p, _y in shots]
+    assert 0 not in picked, "the primary is already photographed"
+    assert len(picked) == len(set(picked)), "a wall must not be handed out twice"
+    assert picked, "a reachable unshot wall inside the pan window should be taken"
+
+
+def test_extra_shots_stay_inside_the_gimbals_pan_travel():
+    """The M4E pans ±60° from the nose; asking for more just parks it on the stop
+    (2026-07-10: 41 frames sat there while the target was elsewhere)."""
+    from flight_planner.gimbal_rewrite import assign_extra_shots
+    from flight_planner.models import Waypoint
+
+    # Directly behind the aircraft's nose — 180° away, far outside any window.
+    facades = [_wall(0, -2.0, 6.0), _wall(1, -2.0, -6.0, normal=(0.0, 1.0, 0.0))]
+    wps = [Waypoint(x=0.0, y=0.0, z=2.0, heading_deg=0.0, gimbal_pitch_deg=0.0, index=0)]
+    extras = assign_extra_shots(
+        wps, facades, [0], max_distance_m=30.0, pan_window_deg=45.0,
+        shots_per_waypoint=3, pitch_min=-88.0, pitch_max=33.0,
+    )
+    assert extras[0] == []
+
+
+def test_one_shot_per_waypoint_produces_no_extras():
+    from flight_planner.gimbal_rewrite import assign_extra_shots
+    from flight_planner.models import Waypoint
+
+    wps = [Waypoint(x=0.0, y=0.0, z=2.0, heading_deg=0.0, gimbal_pitch_deg=0.0, index=0)]
+    assert assign_extra_shots(
+        wps, [_wall(0, -2.0, 6.0)], [-1], max_distance_m=30.0, pan_window_deg=45.0,
+        shots_per_waypoint=1, pitch_min=-88.0, pitch_max=33.0,
+    ) == [[]]

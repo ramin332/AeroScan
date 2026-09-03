@@ -163,11 +163,13 @@ def _coverage_summary(facades, waypoints) -> dict:
     """How much of what we found the mission actually photographs."""
     from .validate import MIN_INSPECTABLE_FACADE_M2
 
-    targeted = {
-        w.facade_index for w in waypoints
-        if getattr(w, "facade_index", None) is not None and w.facade_index >= 0
-        and not getattr(w, "is_transition", False)
-    }
+    targeted: set[int] = set()
+    for w in waypoints:
+        if getattr(w, "is_transition", False):
+            continue
+        if getattr(w, "facade_index", None) is not None and w.facade_index >= 0:
+            targeted.add(w.facade_index)
+        targeted.update(getattr(w, "extra_facade_indices", ()) or ())
     walls = [f for f in facades if (f.width * f.height) >= MIN_INSPECTABLE_FACADE_M2]
     return {
         "facets": len(facades),
@@ -371,6 +373,8 @@ def augment_mission(
     min_action_dwell_s: float | None = None,
     facade_detect: dict | None = None,
     min_facade_height_m: float | None = None,
+    shots_per_waypoint: int = 1,
+    pan_window_deg: float = 45.0,
     reuse_registration: bool = True,
     switch_ratio: float = _NEN_SWITCH_RATIO,
     stop_at_waypoint: bool = True,
@@ -547,16 +551,24 @@ def augment_mission(
         preserve_heading=False,
         assign_mode=assign_mode,
         switch_cost=switch_cost,
+        # Extra shots need the aircraft to hold still while the action sequence
+        # runs; in fly-through it is still moving, which is how 104 of 398
+        # photos were lost on 2026-07-10 with only one shot per waypoint.
+        shots_per_waypoint=shots_per_waypoint if stop_at_waypoint else 1,
+        pan_window_deg=pan_window_deg,
     )
     audit = aim_audit(new_waypoints, facades, far_standoff_m=max_facade_distance_m)
     _log(f"      aim audit: reach {max_facade_distance_m:.1f} m  mode {assign_mode}  "
          f"switches {audit['switches']}  flips>90° {audit['reversals_gt90']}  blips {audit['single_blips']}  "
          f"far {audit['far_picks']}  unaimed {audit['unaimed']}")
-    # NEN-2767: stop-and-shoot at fixed speed, single TAKE_PHOTO per WP.
-    # Matches server.api /versions/{id}/rewrite-gimbals exactly.
+    # NEN-2767: stop-and-shoot at fixed speed, one TAKE_PHOTO per WP.
+    # Matches server.api /versions/{id}/rewrite-gimbals exactly — except where
+    # the rewrite built a pan-and-shoot sequence for extra walls, which owns its
+    # own action list and must not be flattened back to a single photo.
     for w in new_waypoints:
         w.speed_ms = inspection_speed_ms
-        w.actions = [CameraAction(action_type=ActionType.TAKE_PHOTO, camera=CameraName.WIDE)]
+        if not w.extra_facade_indices:
+            w.actions = [CameraAction(action_type=ActionType.TAKE_PHOTO, camera=CameraName.WIDE)]
 
     aimed = sum(1 for w in new_waypoints if w.facade_index >= 0)
     _log(f"      waypoints: {len(new_waypoints)}   re-aimed: {aimed}   unchanged (no facade in range): {len(new_waypoints) - aimed}")
@@ -671,6 +683,10 @@ def augment_mission(
         # width x height reaches MIN_INSPECTABLE_FACADE_M2 — the same measure
         # validate.py uses for the facades_uncovered warning.
         "coverage": _coverage_summary(facades, new_waypoints),
+        "photos": sum(
+            1 for w in new_waypoints for a in w.actions
+            if getattr(a, "action_type", None) is not None and a.action_type.value == "takePhoto"
+        ),
         "gimbal_stats": _gimbal_summary(new_waypoints),
         # Geometry for the RC's mission view: facade rectangles in the same
         # local-ENU frame as the waypoints (intent ref), plus which facade each
@@ -820,6 +836,8 @@ def _cmd_augment_mission(args: argparse.Namespace) -> int:
             min_action_dwell_s=st.get("min_action_dwell_s"),
             facade_detect=facade_detect_kwargs(st),
             min_facade_height_m=st.get("min_facade_height_m"),
+            shots_per_waypoint=int(st.get("shots_per_waypoint", 1)),
+            pan_window_deg=float(st.get("gimbal_pan_window_deg", 45.0)),
             pitch_margin_deg=args.pitch_margin_deg,
             summary_json=args.summary_json,
             log=not args.json,

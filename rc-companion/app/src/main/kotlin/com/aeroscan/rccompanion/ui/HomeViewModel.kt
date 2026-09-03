@@ -340,6 +340,7 @@ class HomeViewModel(app: Application) : AndroidViewModel(app) {
     fun setStopAtWaypoint(v: Boolean) { _settings.value = _settings.value.copy(stopAtWaypoint = v) }
     fun setReach(m: Double?) { _settings.value = _settings.value.copy(reachM = m) }
     fun setMinHeight(m: Double?) { _settings.value = _settings.value.copy(minHeightM = m) }
+    fun setShots(n: Int) { _settings.value = _settings.value.copy(shotsPerWaypoint = n) }
 
     /**
      * Run the augment again on the mission already picked, with whatever the

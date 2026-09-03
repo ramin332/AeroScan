@@ -625,3 +625,44 @@ def test_intent_settings_select_the_turn_mode():
     # Key absent: the CLI's own --fly-through decides.
     st = coerce_settings({})
     assert bool(st.get("stop_at_waypoint", not False)) is True
+
+
+def test_extra_shots_become_a_rotate_and_shoot_sequence():
+    """Several photos at one waypoint: each gets its own gimbal pose and its own
+    file suffix, all inside the waypoint's single sequence action group."""
+    import zipfile
+    from io import BytesIO
+
+    from flight_planner.kmz_builder import build_kmz_bytes
+    from flight_planner.models import ActionType, CameraAction, MissionConfig
+
+    wps = _make_test_waypoints(2)
+    wps[0].actions = [
+        CameraAction(action_type=ActionType.TAKE_PHOTO),
+        CameraAction(action_type=ActionType.GIMBAL_ROTATE, gimbal_pitch_deg=-40.0, gimbal_yaw_deg=95.0),
+        CameraAction(action_type=ActionType.TAKE_PHOTO),
+    ]
+    raw = build_kmz_bytes(wps, MissionConfig(stop_at_waypoint=True))
+    with zipfile.ZipFile(BytesIO(raw)) as zf:
+        name = next(n for n in zf.namelist() if n.endswith("waylines.wpml"))
+        xml = zf.read(name).decode("utf-8")
+    assert "wp0_1" in xml, "the second photo needs its own file suffix"
+    assert xml.count("<wpml:actionActuatorFunc>takePhoto") == 3  # 2 at wp0, 1 at wp1
+    assert "-40" in xml and "95" in xml
+
+
+def test_extra_shots_in_fly_through_are_an_error():
+    from flight_planner.models import ActionType, CameraAction, MissionConfig
+    from flight_planner.validate import validate_mission
+
+    wps = _make_test_waypoints(2)
+    wps[0].extra_facade_indices = [3]
+    wps[0].actions = wps[0].actions + [
+        CameraAction(action_type=ActionType.GIMBAL_ROTATE, gimbal_pitch_deg=-40.0),
+        CameraAction(action_type=ActionType.TAKE_PHOTO),
+    ]
+    codes = {i.code for i in validate_mission(wps, MissionConfig(stop_at_waypoint=False))}
+    assert "extra_shots_need_stop" in codes
+    assert "extra_shots_need_stop" not in {
+        i.code for i in validate_mission(wps, MissionConfig(stop_at_waypoint=True))
+    }

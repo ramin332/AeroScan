@@ -202,6 +202,24 @@ def validate_mission(
             waypoint_indices=too_close_wps[:5],
         ))
 
+    # Extra shots per waypoint only work when the aircraft holds still: the
+    # action sequence runs while it is moving otherwise, which is how photos
+    # were lost on 2026-07-10 with a single shot per waypoint.
+    extra_shot_wps = [
+        wp.index for wp in inspection_wps if len(getattr(wp, "extra_facade_indices", ()) or ()) > 0
+    ]
+    if extra_shot_wps and not config.stop_at_waypoint:
+        issues.append(ValidationIssue(
+            severity=Severity.ERROR,
+            code="extra_shots_need_stop",
+            message=(
+                f"{len(extra_shot_wps)} waypoint(s) take more than one photo, but the mission "
+                "flies through them — the aircraft will have moved on before the sequence ends. "
+                "Use stop-and-shoot, or one shot per waypoint."
+            ),
+            waypoint_indices=extra_shot_wps[:5],
+        ))
+
     # --- Fly-through execution gates ---
     #
     # In fly-through mode (WPML toPointAndPassWithContinuityCurvature, "the

@@ -539,3 +539,29 @@ def test_coverage_summary_matches_the_validation_warning():
     issues = validate_mission(wps, MissionConfig(), building=Building(facades=facades))
     warning = next(i for i in issues if i.code == "facades_uncovered")
     assert warning.message.startswith(f"{cov['walls_unshot']} facade")
+
+
+def test_extra_shot_sequences_survive_the_action_normalisation():
+    """The pipeline rewrites every waypoint's actions to a single photo. A
+    waypoint carrying a pan-and-shoot sequence must keep it, or the extra walls
+    are counted as covered while no photo of them is ever taken."""
+    from flight_planner.models import ActionType, CameraAction, Waypoint
+
+    plain = Waypoint(x=0.0, y=0.0, z=2.0, heading_deg=0.0, gimbal_pitch_deg=-10.0, index=0)
+    plain.actions = [CameraAction(action_type=ActionType.HOVER)]
+    multi = Waypoint(x=1.0, y=0.0, z=2.0, heading_deg=0.0, gimbal_pitch_deg=-10.0, index=1)
+    multi.extra_facade_indices = [7]
+    multi.actions = [
+        CameraAction(action_type=ActionType.TAKE_PHOTO),
+        CameraAction(action_type=ActionType.GIMBAL_ROTATE, gimbal_pitch_deg=-30.0, gimbal_yaw_deg=80.0),
+        CameraAction(action_type=ActionType.TAKE_PHOTO),
+    ]
+
+    # The same normalisation the augment applies.
+    for w in (plain, multi):
+        if not w.extra_facade_indices:
+            w.actions = [CameraAction(action_type=ActionType.TAKE_PHOTO)]
+
+    assert [a.action_type for a in plain.actions] == [ActionType.TAKE_PHOTO]
+    assert len(multi.actions) == 3
+    assert sum(1 for a in multi.actions if a.action_type is ActionType.TAKE_PHOTO) == 2
