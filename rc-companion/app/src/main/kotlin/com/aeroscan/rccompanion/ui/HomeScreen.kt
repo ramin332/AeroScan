@@ -15,6 +15,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.IntrinsicSize
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
@@ -87,7 +88,10 @@ fun HomeScreen(viewModel: HomeViewModel = viewModel()) {
             // title row (seen 2026-09-03). Only the right-hand column scrolls.
             verticalArrangement = Arrangement.spacedBy(8.dp),
         ) {
-            Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+            ) {
                 Text("AeroScan", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
                 Spacer(Modifier.width(24.dp))
                 Stepper(current = stepOf(ui))
@@ -96,22 +100,6 @@ fun HomeScreen(viewModel: HomeViewModel = viewModel()) {
                     label = "View",
                     options = listOf(MapView.Top to "Top", MapView.Orbit to "3D"),
                     selected = view, enabled = true, onChange = { view = it },
-                )
-                if (view == MapView.Orbit) {
-                    Spacer(Modifier.width(12.dp))
-                    SegToggle(
-                        label = "Points",
-                        options = listOf(true to "Recognised", false to "Off"),
-                        selected = showPoints,
-                        enabled = map?.facades?.isNotEmpty() == true,
-                        onChange = { showPoints = it },
-                    )
-                }
-                Spacer(Modifier.width(12.dp))
-                SegToggle(
-                    label = "Aim",
-                    options = listOf(MapLayer.Original to "DJI", MapLayer.Augmented to "AeroScan", MapLayer.Both to "Both"),
-                    selected = layer, enabled = map?.headingsAugmented != null, onChange = { layer = it },
                 )
             }
             StatusStrip(
@@ -124,8 +112,36 @@ fun HomeScreen(viewModel: HomeViewModel = viewModel()) {
                 modifier = Modifier.height(IntrinsicSize.Min),
             ) {
                 Column(modifier = Modifier.weight(1.45f), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                    if (view == MapView.Top) MissionMap(data = map, heightDp = 268, layer = layer)
-                    else MissionScene3D(data = map, heightDp = 268, layer = layer, showRecognised = showPoints)
+                    if (view == MapView.Top) MissionMap(data = map, heightDp = 250, layer = layer)
+                    else MissionScene3D(data = map, heightDp = 250, layer = layer, showRecognised = showPoints)
+                    // Aim and Points live under the map, not in the header: the
+                    // header row overflowed the RC's 768 dp once the 3D controls
+                    // arrived (pilot, 2026-09-03).
+                    Row(
+                        horizontalArrangement = Arrangement.spacedBy(12.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        SegToggle(
+                            label = "Aim",
+                            options = listOf(
+                                MapLayer.Original to "DJI",
+                                MapLayer.Augmented to "AeroScan",
+                                MapLayer.Both to "Both",
+                            ),
+                            selected = layer,
+                            enabled = map?.headingsAugmented != null,
+                            onChange = { layer = it },
+                        )
+                        if (view == MapView.Orbit) {
+                            SegToggle(
+                                label = "Points",
+                                options = listOf(true to "On", false to "Off"),
+                                selected = showPoints,
+                                enabled = map?.facades?.isNotEmpty() == true,
+                                onChange = { showPoints = it },
+                            )
+                        }
+                    }
                     MissionLegend(map)
                 }
                 Column(
