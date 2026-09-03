@@ -44,8 +44,12 @@ class PreviewSummaryTest {
             "facade_geom":[{"v":[[0,0,0],[4,0,0],[4,0,3],[0,0,3]],"n":[0,-1,0],"pts":812,
                             "s":[[1,0.01,1],[2,-0.02,2]]},
                            {"v":[[9,9,0],[10,9,0],[10,9,2],[9,9,2]],"n":[0,-1,0],"pts":41}],
-            "wp_target":[0,0,-1]}"""
+            "wp_target":[0,0,-1],
+            "coverage":{"facets":219,"facets_targeted":37,"walls":140,"walls_unshot":92}}"""
         val s = HomeViewModel.PreviewSummary.fromJson(json.toByteArray())
+        assertEquals(219, s.facets)
+        assertEquals(37, s.facetsTargeted)
+        assertEquals(92, s.wallsUnshot)
         assertEquals(812, s.facadeGeom[0].inlierCount)
         assertEquals(2, s.facadeGeom[0].sampleCount)
         assertEquals(0.01, s.facadeGeom[0].sample[1], 1e-9)

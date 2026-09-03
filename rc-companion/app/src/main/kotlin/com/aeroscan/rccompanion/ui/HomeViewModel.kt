@@ -203,6 +203,11 @@ class HomeViewModel(app: Application) : AndroidViewModel(app) {
         val facadeGeom: List<FacadeQuad> = emptyList(),
         /** Facade each waypoint is aimed at, −1 = none. Empty on older Manifolds. */
         val wpTargets: IntArray = IntArray(0),
+        /** The engine's own coverage count — the same numbers as its warning. */
+        val facets: Int = 0,
+        val facetsTargeted: Int = 0,
+        val walls: Int = 0,
+        val wallsUnshot: Int = 0,
     ) {
         /** Every waypoint the pilot should look at on the map. */
         val flaggedIndices: Set<Int>
@@ -240,6 +245,7 @@ class HomeViewModel(app: Application) : AndroidViewModel(app) {
                     }
                     quads.add(FacadeQuad(v, nv, 0, g.optInt("pts", 0), sample))
                 }
+                val cov = obj.optJSONObject("coverage")
                 val tgt = obj.optJSONArray("wp_target")
                 val targets = IntArray(tgt?.length() ?: 0) { tgt!!.getInt(it) }
                 var warnings = 0; var errors = 0
@@ -283,6 +289,10 @@ class HomeViewModel(app: Application) : AndroidViewModel(app) {
                     validationIndices = vIdx.toIntArray(),
                     facadeGeom = quads,
                     wpTargets = targets,
+                    facets = cov?.optInt("facets", 0) ?: 0,
+                    facetsTargeted = cov?.optInt("facets_targeted", 0) ?: 0,
+                    walls = cov?.optInt("walls", 0) ?: 0,
+                    wallsUnshot = cov?.optInt("walls_unshot", 0) ?: 0,
                 )
             }
 
@@ -530,6 +540,10 @@ class HomeViewModel(app: Application) : AndroidViewModel(app) {
                                 buildMissionMap(
                                     intent, parsedCloud, aug, summary.flaggedIndices,
                                     facades = summary.facadeGeom, targets = summary.wpTargets,
+                                    coverage = Coverage(
+                                        facets = summary.facets, facetsTargeted = summary.facetsTargeted,
+                                        walls = summary.walls, wallsUnshot = summary.wallsUnshot,
+                                    ),
                                 )
                             }
                             _ui.value = UiState.ReviewReady(picked, summary, ev.augmentedKmz, savedPath)

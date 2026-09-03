@@ -158,6 +158,27 @@ class _RegistrationCache:
             pass
 
 
+
+def _coverage_summary(facades, waypoints) -> dict:
+    """How much of what we found the mission actually photographs."""
+    from .validate import MIN_INSPECTABLE_FACADE_M2
+
+    targeted = {
+        w.facade_index for w in waypoints
+        if getattr(w, "facade_index", None) is not None and w.facade_index >= 0
+        and not getattr(w, "is_transition", False)
+    }
+    walls = [f for f in facades if (f.width * f.height) >= MIN_INSPECTABLE_FACADE_M2]
+    return {
+        "facets": len(facades),
+        "facets_targeted": len(targeted),
+        "walls": len(walls),
+        "walls_targeted": sum(1 for f in walls if f.index in targeted),
+        "walls_unshot": sum(1 for f in walls if f.index not in targeted),
+        "min_wall_area_m2": MIN_INSPECTABLE_FACADE_M2,
+    }
+
+
 def _facade_geometry(facades) -> list[dict]:
     """Facade rectangles for the RC mission view.
 
@@ -645,6 +666,11 @@ def augment_mission(
         "waypoints_total": len(new_waypoints),
         "waypoints_aimed": aimed,
         "facades": len(facades),
+        # One authoritative coverage block so the RC never has to recompute it
+        # and disagree with the engine's own warning. "walls" are facets whose
+        # width x height reaches MIN_INSPECTABLE_FACADE_M2 — the same measure
+        # validate.py uses for the facades_uncovered warning.
+        "coverage": _coverage_summary(facades, new_waypoints),
         "gimbal_stats": _gimbal_summary(new_waypoints),
         # Geometry for the RC's mission view: facade rectangles in the same
         # local-ENU frame as the waypoints (intent ref), plus which facade each

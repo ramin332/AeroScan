@@ -9,6 +9,10 @@ import math
 from dataclasses import dataclass, field
 from enum import Enum
 
+#: Smallest facade worth flagging as unphotographed, m². Below this a facet is
+#: a sill or a sliver, and a mission that skips it has not failed.
+MIN_INSPECTABLE_FACADE_M2 = 2.0
+
 from .models import (
     CAMERAS,
     AlgorithmConfig,
@@ -369,7 +373,7 @@ def validate_mission(
         covered = {wp.facade_index for wp in inspection_wps if wp.facade_index is not None and wp.facade_index >= 0}
         large_uncovered = [
             f.index for f in building.facades
-            if f.index not in covered and (f.width * f.height) >= 2.0
+            if f.index not in covered and (f.width * f.height) >= MIN_INSPECTABLE_FACADE_M2
         ]
         if large_uncovered:
             issues.append(ValidationIssue(

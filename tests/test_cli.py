@@ -508,3 +508,34 @@ def test_min_facade_height_is_a_clamped_setting():
     assert coerce_settings({"min_facade_height_m": -5.0})["min_facade_height_m"] == 0.0
     # Absent means no gate at all, not a gate at zero.
     assert "min_facade_height_m" not in coerce_settings({})
+
+
+def test_coverage_summary_matches_the_validation_warning():
+    """One number on the screen, one in the warning; they must be the same one."""
+    import numpy as np
+
+    from flight_planner.cli import _coverage_summary
+    from flight_planner.models import Building, Facade, MissionConfig, Waypoint
+    from flight_planner.validate import validate_mission
+
+    def wall(index, w, h):
+        return Facade(
+            vertices=np.array([[0.0, 0.0, 0.0], [w, 0.0, 0.0], [w, 0.0, h], [0.0, 0.0, h]]),
+            normal=np.array([0.0, -1.0, 0.0]), index=index, component_tag="21.1",
+        )
+
+    facades = [wall(0, 4.0, 3.0), wall(1, 5.0, 2.0), wall(2, 0.5, 0.5)]
+    wps = [
+        Waypoint(x=0.0, y=-6.0, z=2.0, heading_deg=0.0, gimbal_pitch_deg=-10.0, facade_index=0, index=0),
+        Waypoint(x=1.0, y=-6.0, z=2.0, heading_deg=0.0, gimbal_pitch_deg=-10.0, facade_index=0, index=1),
+    ]
+    cov = _coverage_summary(facades, wps)
+    assert cov["facets"] == 3
+    assert cov["facets_targeted"] == 1
+    assert cov["walls"] == 2          # the 0.25 m² sliver is not a wall
+    assert cov["walls_targeted"] == 1
+    assert cov["walls_unshot"] == 1
+
+    issues = validate_mission(wps, MissionConfig(), building=Building(facades=facades))
+    warning = next(i for i in issues if i.code == "facades_uncovered")
+    assert warning.message.startswith(f"{cov['walls_unshot']} facade")

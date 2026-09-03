@@ -196,8 +196,8 @@ fun MissionScene3D(
         )
         if (data.facades.isNotEmpty()) {
             Text(
-                "${data.facades.size - data.uncoveredFacades}/${data.facades.size} facades covered · " +
-                    "${data.recognisedPoints} points recognised",
+                "${data.targetedFacets} of ${data.facades.size} facets aimed at · " +
+                    "${data.uncoveredFacades} walls unshot",
                 style = MaterialTheme.typography.labelSmall,
                 color = cs.onSurfaceVariant,
                 modifier = Modifier.align(Alignment.TopEnd).padding(8.dp),

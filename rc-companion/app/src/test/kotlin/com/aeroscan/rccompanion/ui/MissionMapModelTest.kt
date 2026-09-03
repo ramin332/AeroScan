@@ -201,3 +201,42 @@ class CoverageCountTest {
         assertEquals(1, d.significantFacades)
     }
 }
+
+/** The screen must not invent a coverage number that disagrees with the engine. */
+class EngineCoverageTest {
+    private fun quad(e: Double, w: Double, h: Double) = FacadeQuad(
+        v = doubleArrayOf(e, 5.0, 0.0, e + w, 5.0, 0.0, e + w, 5.0, h, e, 5.0, h),
+        n = doubleArrayOf(0.0, -1.0, 0.0), waypoints = 0,
+    )
+
+    private val kmz = ImportedKmz(
+        "t", 52.0, 5.0, 30.0,
+        listOf(ParsedWaypoint(0, 5.0, 52.0, 30.0, 0.0, -10.0)),
+        emptyList(),
+    )
+
+    @Test
+    fun the_engines_numbers_win_when_it_sends_them() {
+        val d = buildMissionMap(
+            kmz, null,
+            facades = listOf(quad(0.0, 4.0, 3.0), quad(20.0, 4.0, 3.0)),
+            targets = intArrayOf(0),
+            coverage = Coverage(facets = 219, facetsTargeted = 37, walls = 140, wallsUnshot = 92),
+        )
+        assertEquals(37, d.targetedFacets)
+        assertEquals(92, d.uncoveredFacades)
+        assertEquals(140, d.significantFacades)
+    }
+
+    @Test
+    fun without_them_it_falls_back_to_counting_locally() {
+        val d = buildMissionMap(
+            kmz, null,
+            facades = listOf(quad(0.0, 4.0, 3.0), quad(20.0, 4.0, 3.0), quad(40.0, 0.4, 0.4)),
+            targets = intArrayOf(0),
+        )
+        assertEquals(1, d.targetedFacets)
+        assertEquals(1, d.uncoveredFacades)   // the sliver does not count
+        assertEquals(2, d.significantFacades)
+    }
+}

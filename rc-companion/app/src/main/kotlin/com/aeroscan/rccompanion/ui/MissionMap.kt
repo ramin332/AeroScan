@@ -2,6 +2,8 @@ package com.aeroscan.rccompanion.ui
 
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -199,8 +201,10 @@ fun MissionMap(
 
 @Composable
 fun MissionLegend(data: MissionMapData?, modifier: Modifier = Modifier) {
+    // The legend must never wrap: on the RC "check" broke into three stacked
+    // letters once the unshot-wall count joined the row (2026-09-03).
     Row(
-        modifier = modifier,
+        modifier = modifier.horizontalScroll(rememberScrollState()),
         horizontalArrangement = Arrangement.spacedBy(12.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
@@ -223,6 +227,6 @@ private fun LegendItem(color: Color, label: String) {
     Row(verticalAlignment = Alignment.CenterVertically) {
         Box(Modifier.size(10.dp).clip(CircleShape).background(color))
         Spacer(Modifier.width(4.dp))
-        Text(label, style = MaterialTheme.typography.labelSmall)
+        Text(label, style = MaterialTheme.typography.labelSmall, maxLines = 1, softWrap = false)
     }
 }

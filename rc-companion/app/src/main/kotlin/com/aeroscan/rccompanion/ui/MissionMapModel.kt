@@ -79,6 +79,16 @@ data class FacadeQuad(
     fun cz(): Double { var s = 0.0; for (i in 0 until cornerCount) s += v[3 * i + 2]; return s / cornerCount }
 }
 
+/** The engine's coverage count, so the RC never computes a rival number. */
+data class Coverage(
+    val facets: Int = 0,
+    val facetsTargeted: Int = 0,
+    val walls: Int = 0,
+    val wallsUnshot: Int = 0,
+) {
+    val known: Boolean get() = facets > 0
+}
+
 data class MissionMapData(
     /** E,N,U triples, one per waypoint, flight order. */
     val pathXYZ: DoubleArray,
@@ -115,6 +125,7 @@ data class MissionMapData(
     val maxN: Double,
     val minU: Double,
     val maxU: Double,
+    val coverage: Coverage = Coverage(),
 ) {
     val waypointCount: Int get() = pathXYZ.size / 3
     val widthM: Double get() = maxE - minE
@@ -128,8 +139,14 @@ data class MissionMapData(
      * the same site — a number that tracks the detector's chattiness rather
      * than what the mission misses. This matches the engine's own warning.
      */
-    val uncoveredFacades: Int get() = facades.count { !it.covered && it.areaM2 >= SIGNIFICANT_FACADE_M2 }
-    val significantFacades: Int get() = facades.count { it.areaM2 >= SIGNIFICANT_FACADE_M2 }
+    val uncoveredFacades: Int
+        get() = if (coverage.known) coverage.wallsUnshot
+        else facades.count { !it.covered && it.areaM2 >= SIGNIFICANT_FACADE_M2 }
+    val significantFacades: Int
+        get() = if (coverage.known) coverage.walls else facades.count { it.areaM2 >= SIGNIFICANT_FACADE_M2 }
+    /** Facets any waypoint aims at — NOT walls covered; the two differ a lot. */
+    val targetedFacets: Int
+        get() = if (coverage.known) coverage.facetsTargeted else targets.filter { it >= 0 }.distinct().size
     /** Points the extractor recognised as belonging to some facade. */
     val recognisedPoints: Int get() = facades.sumOf { it.inlierCount }
 
@@ -165,6 +182,7 @@ fun buildMissionMap(
     flagged: Set<Int> = emptySet(),
     facades: List<FacadeQuad> = emptyList(),
     targets: IntArray = IntArray(0),
+    coverage: Coverage = Coverage(),
 ): MissionMapData {
     val refLat = original.refLat
     val refLon = original.refLon
@@ -264,6 +282,7 @@ fun buildMissionMap(
         minE = minE - MAP_PAD_M, minN = minN - MAP_PAD_M,
         maxE = maxE + MAP_PAD_M, maxN = maxN + MAP_PAD_M,
         minU = minU, maxU = maxU,
+        coverage = coverage,
     )
 }
 
