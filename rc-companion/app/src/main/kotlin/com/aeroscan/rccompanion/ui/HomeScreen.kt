@@ -2,6 +2,7 @@ package com.aeroscan.rccompanion.ui
 
 import android.content.Intent
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -11,6 +12,8 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.IntrinsicSize
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -24,6 +27,9 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -59,31 +65,45 @@ fun HomeScreen(viewModel: HomeViewModel = viewModel()) {
 
     val panel = panelStatusFor(conn, banner, status)
     val blockReason = augmentBlockReason(conn, banner, status)
+    var layer by remember { mutableStateOf(MapLayer.Both) }
 
     Scaffold { padding ->
         Column(
             modifier = Modifier
                 .fillMaxSize()
                 .padding(padding)
-                .padding(horizontal = 16.dp, vertical = 12.dp)
-                .verticalScroll(rememberScrollState()),
-            verticalArrangement = Arrangement.spacedBy(12.dp),
+                .padding(horizontal = 16.dp, vertical = 8.dp),
+            // No outer scroll on purpose: the RC viewport is ~400 dp tall and a
+            // scrollable column auto-scrolled to its end on launch, hiding the
+            // title row (seen 2026-09-03). Only the right-hand column scrolls.
+            verticalArrangement = Arrangement.spacedBy(8.dp),
         ) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Text("AeroScan", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.SemiBold)
+            Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+                Text("AeroScan", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
                 Spacer(Modifier.width(24.dp))
                 Stepper(current = stepOf(ui))
+                Spacer(Modifier.weight(1f))
+                LayerToggle(layer = layer, enabled = map?.headingsAugmented != null, onChange = { layer = it })
             }
             StatusStrip(
                 status = panel,
                 checking = banner is BannerState.Checking,
                 onRefresh = viewModel::checkStatus,
             )
-            Row(horizontalArrangement = Arrangement.spacedBy(16.dp)) {
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(12.dp),
+                modifier = Modifier.height(IntrinsicSize.Min),
+            ) {
                 Column(modifier = Modifier.weight(1.45f)) {
-                    MissionMap(data = map)
+                    MissionMap(data = map, heightDp = 280, layer = layer)
                 }
-                Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                Column(
+                    modifier = Modifier
+                        .weight(1f)
+                        .fillMaxHeight()
+                        .verticalScroll(rememberScrollState()),
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
                     StatTiles(ui = ui, map = map)
                     ActionPanel(
                         ui = ui,
@@ -123,7 +143,7 @@ private fun Stepper(current: Int) {
             val done = i < current
             Text(
                 "${i + 1} $name",
-                style = MaterialTheme.typography.labelLarge,
+                style = MaterialTheme.typography.labelMedium,
                 color = when {
                     active -> cs.onPrimaryContainer
                     done -> cs.onSurface
@@ -133,9 +153,31 @@ private fun Stepper(current: Int) {
                 modifier = Modifier
                     .clip(RoundedCornerShape(6.dp))
                     .background(if (active) cs.primaryContainer else cs.surface)
-                    .padding(horizontal = 10.dp, vertical = 4.dp),
+                    .padding(horizontal = 8.dp, vertical = 3.dp),
             )
             if (i < STEPS.lastIndex) Text("›", color = cs.onSurfaceVariant)
+        }
+    }
+}
+
+@Composable
+private fun LayerToggle(layer: MapLayer, enabled: Boolean, onChange: (MapLayer) -> Unit) {
+    val cs = MaterialTheme.colorScheme
+    Row(horizontalArrangement = Arrangement.spacedBy(4.dp), verticalAlignment = Alignment.CenterVertically) {
+        Text("Headings:", style = MaterialTheme.typography.labelMedium, color = cs.onSurfaceVariant)
+        listOf(MapLayer.Original to "DJI", MapLayer.Augmented to "AeroScan", MapLayer.Both to "Both").forEach { (l, name) ->
+            val on = l == layer
+            Text(
+                name,
+                style = MaterialTheme.typography.labelMedium,
+                color = if (!enabled) cs.onSurfaceVariant.copy(alpha = 0.5f) else if (on) cs.onPrimaryContainer else cs.onSurfaceVariant,
+                fontWeight = if (on) FontWeight.Bold else FontWeight.Normal,
+                modifier = Modifier
+                    .clip(RoundedCornerShape(6.dp))
+                    .background(if (on && enabled) cs.primaryContainer else cs.surfaceVariant)
+                    .clickable(enabled = enabled) { onChange(l) }
+                    .padding(horizontal = 8.dp, vertical = 3.dp),
+            )
         }
     }
 }
@@ -170,9 +212,9 @@ private fun tilesFor(ui: HomeViewModel.UiState, map: MissionMapData?): List<Tile
 @Composable
 private fun StatTiles(ui: HomeViewModel.UiState, map: MissionMapData?) {
     val tiles = tilesFor(ui, map)
-    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
         tiles.chunked(3).forEach { row ->
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                 row.forEach { t -> StatTile(t, Modifier.weight(1f)) }
             }
         }
@@ -186,12 +228,12 @@ private fun StatTile(t: Tile, modifier: Modifier = Modifier) {
         modifier = modifier
             .clip(RoundedCornerShape(8.dp))
             .background(cs.surfaceVariant.copy(alpha = 0.6f))
-            .padding(horizontal = 10.dp, vertical = 8.dp),
+            .padding(horizontal = 8.dp, vertical = 5.dp),
     ) {
         Text(t.label.uppercase(), style = MaterialTheme.typography.labelSmall, color = cs.onSurfaceVariant)
         Text(
             t.value,
-            style = MaterialTheme.typography.headlineSmall,
+            style = MaterialTheme.typography.titleLarge,
             color = t.tone?.let { toneColor(it) } ?: cs.onSurface,
             fontWeight = FontWeight.SemiBold,
         )
@@ -218,8 +260,8 @@ private fun ActionPanel(
             .fillMaxWidth()
             .clip(RoundedCornerShape(8.dp))
             .background(cs.surfaceVariant.copy(alpha = 0.6f))
-            .padding(12.dp),
-        verticalArrangement = Arrangement.spacedBy(8.dp),
+            .padding(10.dp),
+        verticalArrangement = Arrangement.spacedBy(6.dp),
     ) {
         when (ui) {
             HomeViewModel.UiState.Idle -> {

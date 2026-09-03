@@ -137,14 +137,14 @@ private fun RowScope.StatusChip(chip: Chip) {
             .weight(1f)
             .clip(RoundedCornerShape(6.dp))
             .background(cs.surfaceVariant)
-            .padding(horizontal = 10.dp, vertical = 8.dp),
+            .padding(horizontal = 10.dp, vertical = 6.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Box(Modifier.size(10.dp).clip(CircleShape).background(toneColor(chip.tone)))
         Spacer(Modifier.width(8.dp))
         Text(
             chip.label,
-            style = MaterialTheme.typography.labelLarge,
+            style = MaterialTheme.typography.labelMedium,
             maxLines = 1,
             overflow = TextOverflow.Ellipsis,
         )

@@ -39,8 +39,17 @@ import kotlin.math.sin
  * grey for what the KMZ said, blue for what the augmenter re-aimed it to.
  * Red rings mark waypoints the summary flagged. Pure Canvas, works offline.
  */
+enum class MapLayer { Original, Augmented, Both }
+
 @Composable
-fun MissionMap(data: MissionMapData?, modifier: Modifier = Modifier, heightDp: Int = 320) {
+fun MissionMap(
+    data: MissionMapData?,
+    modifier: Modifier = Modifier,
+    heightDp: Int = 320,
+    layer: MapLayer = MapLayer.Both,
+) {
+    val showOrig = layer != MapLayer.Augmented || data?.headingsAugmented == null
+    val showAug = layer != MapLayer.Original
     val cs = MaterialTheme.colorScheme
     val cloudColor = cs.onSurface.copy(alpha = 0.28f)
     val polyColor = cs.outline
@@ -119,8 +128,10 @@ fun MissionMap(data: MissionMapData?, modifier: Modifier = Modifier, heightDp: I
                     }
                     for (i in 0 until data.waypointCount) {
                         val o = px(data.pathXY[2 * i], data.pathXY[2 * i + 1])
-                        drawLine(origColor, o, tickEnd(o, data.headingsOriginal[i], tick), strokeWidth = 1.dp.toPx())
-                        data.headingsAugmented?.let {
+                        if (showOrig) {
+                            drawLine(origColor, o, tickEnd(o, data.headingsOriginal[i], tick), strokeWidth = 1.5.dp.toPx())
+                        }
+                        if (showAug) data.headingsAugmented?.let {
                             drawLine(augColor, o, tickEnd(o, it[i], tick * 1.3f), strokeWidth = 2.dp.toPx())
                         }
                     }
