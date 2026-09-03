@@ -145,6 +145,53 @@ setfacl -m u:apppsdk-demo:rwx -d -m u:apppsdk-demo:rwx /open_app/dev/data/.regca
 3. Augment `busboom10-7.kmz` once and check the 3D view draws facades and rays.
 4. Force-stop Pilot 2, then watch the link for 3 minutes to confirm the flapping stops.
 
+## Where 2026-09-03 ended — read this before flying
+
+Everything below is deployed. Nothing below has been flown.
+
+**On the aircraft (Manifold):** engine deployed with all thirteen planner settings,
+the extra-shot pass, the coverage block and the registration cache. `psdk-demo` DPK
+installed and active. 42 GB free on `/blackbox`. The C app did not change today, so
+`aeroscan-psdk` stays at `9d054ae`.
+
+**On the RC:** APK of 15:19 — control panel, 3D orbit view with recognised points,
+rosette drawing, Speed / At-WP / Reach / Min height / Shots-per-WP.
+
+**Two things that are NOT ready:**
+
+1. **No scan on the current flight slot** (`flight0078`). Every augment today ran
+   against the seven-week-old July scan, which is fine for checking the tooling and
+   wrong for a real mission. Fly a Smart3D scan first, then augment.
+2. **The mission sitting on the aircraft is stale.** `mission_progress.json` shows
+   `20260903T130224Z_462` in state `ready` — built at 13:02, before the parser fix,
+   the coverage fix and the extra-shot work. Re-augment before flying or the aircraft
+   flies the old plan.
+
+### What the day's measurements settled
+
+| question | answer |
+|---|---|
+| Does Detail (facet fineness) buy coverage? | No. 461 / 219 / 48 facets, coverage unmoved. Removed from the panel. |
+| Does Reach? | Barely: 92 unshot walls at 14.6 m, 82 at 20 m. It does aim every waypoint (7 unaimed at Auto, 0 at 20 m). |
+| Does switch cost? | No. 36–49 facets targeted, 92 unshot throughout. |
+| What does? | A second photo per stop: 92 unshot walls → 78, at 398 → 576 photos. |
+| Three shots? | Byte-identical to two. Never a third unshot wall inside the pan window. |
+| Is the aim itself correct? | Yes — 0.0° error against the target facet on every waypoint carrying a gimbal command. |
+
+### Bugs found and fixed today
+
+- The RC parser reset the gimbal to level at every waypoint and never read the
+  `gimbalPitchRotateAngle` our augmenter writes, so the mission view drew every
+  waypoint aiming at the horizon. The mission was always correct.
+- The pipeline rewrote every waypoint's actions to a single photo *after* the aim
+  rewrite, so extra shots counted as coverage while no photo was written.
+- The panel computed its own coverage figure and disagreed with the engine's warning.
+- Coarse detection's wide cluster radius took 3626 s for output identical to 16 s.
+- The registration cache lived beside the output KMZ, whose path changes every
+  mission, so it would have missed every time.
+- I blamed Pilot 2 for the link cycling. A three-minute watch disproved it; the cause
+  is the payload app not running.
+
 ## The ONE next action — reflight and re-measure the gimbal
 
 DPK, Manifold commits and laptop augment changes are all deployed (2026-09-03). Fly `2bf3308`+. Then pull the photos and run:
