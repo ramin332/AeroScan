@@ -1,25 +1,29 @@
 package com.aeroscan.rccompanion.ui
 
 /**
- * Whether the aircraft link is being handed back and forth with another MSDK app.
+ * Whether the aircraft link is cycling instead of holding.
  *
- * Background: only one app at a time may hold the aircraft link on the RC. DJI's
- * guidance for the RC Plus is to force-exit DJI Pilot before starting a
- * third-party MSDK app. We cannot do that for the pilot — and we do not want to,
- * because Pilot 2 is where the Fly widget lives — so instead we name the symptom
- * and give the remedy at the moment it bites, and we refuse to start a multi-
- * minute augment into a link that is about to drop.
+ * Measured on the RC 2026-09-03. Every `Product connected` was followed within a
+ * second by `initPSDKDevice error … PAYLOAD.FetchWidgetFile:-13` and `widgetSet
+ * is null or data is empty!`, then a disconnect about 20 s later — over and over,
+ * while the AeroScan payload app on the Manifold was NOT running. With the payload
+ * app running the link held for a full three-minute watch, with DJI Pilot 2 alive
+ * in the background the whole time.
  *
- * Measured on the RC 2026-09-03 with Pilot 2 alive in the background: drop →
- * reconnect every ~22 s. A single drop (walking out of range, a reboot) is
- * normal and must not trigger the warning, so the threshold is two drops inside
- * the window.
+ * So the cause is the payload, not competition with Pilot 2. (An earlier reading
+ * of the same log blamed Pilot 2 for taking the link back; the three-minute watch
+ * with Pilot 2 running and the payload up disproved it.) This matches what the
+ * pilot described: enable the payload in Pilot 2 and only then does the RC app
+ * connect properly.
+ *
+ * A single drop (walking out of range, a reboot) is normal and must not trigger
+ * the warning, so the threshold is two drops inside the window.
  */
 object LinkHealth {
-    /** Drops inside this window count toward "flapping". */
+    /** Drops inside this window count toward "cycling". */
     const val WINDOW_MS = 90_000L
 
-    /** Two drops in the window is a handover fight, not a one-off. */
+    /** Two drops in the window is a cycle, not a one-off. */
     const val FLAP_DROPS = 2
 
     /** A fresh link needs to hold this long before a transfer may start. */
@@ -36,7 +40,8 @@ object LinkHealth {
     /** What to tell the pilot, or null when the link is healthy. */
     fun advice(drops: List<Long>, nowMs: Long): String? =
         if (isFlapping(drops, nowMs))
-            "The aircraft link keeps switching between this app and DJI Pilot 2. " +
-                "Close Pilot 2 from the recent-apps list while you upload, then reopen it to fly."
+            "The aircraft link keeps dropping and coming back. Enable the AeroScan payload in " +
+                "DJI Pilot 2 (camera view, payload panel) — the link cycles about every 20 s while " +
+                "the payload app is not running."
         else null
 }

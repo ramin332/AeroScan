@@ -9,9 +9,11 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
- * 2026-09-03: with Pilot 2 alive in the background the RC's logcat showed
- * CoreExistReceiver "setNeedTryConnect false" then a disconnect every ~22 s.
- * Only one MSDK app may hold the aircraft link at a time.
+ * 2026-09-03: the RC's logcat showed the aircraft link connecting, failing to
+ * fetch the payload widget file, and disconnecting ~20 s later, over and over,
+ * while the AeroScan payload app was not running. With the payload up the link
+ * held for a three-minute watch with Pilot 2 alive throughout — so the remedy is
+ * to start the payload, not to close Pilot 2.
  */
 class LinkHealthTest {
     private val t = 1_000_000L
@@ -35,20 +37,22 @@ class LinkHealthTest {
     }
 
     @Test
-    fun advice_names_pilot_2_and_the_remedy() {
+    fun advice_names_the_payload_as_the_remedy_not_closing_pilot_2() {
         val a = LinkHealth.advice(listOf(t - 20_000, t - 2_000), t)!!
-        assertTrue(a, a.contains("Pilot 2"))
-        assertTrue(a, a.contains("Close"))
+        assertTrue(a, a.contains("payload"))
+        assertTrue(a, a.contains("Enable"))
+        // The three-minute watch disproved the "close Pilot 2" advice.
+        assertTrue(a, !a.contains("Close Pilot 2"))
     }
 
     @Test
-    fun a_flapping_link_shows_amber_and_blocks_the_augment() {
+    fun a_cycling_link_shows_amber_and_blocks_the_augment() {
         val drops = listOf(t - 40_000, t - 5_000)
         val chip = panelStatusFor(linked, readyBanner, ready, drops, t).aircraft
         assertEquals(Tone.Warn, chip.tone)
-        assertEquals("Link shared with Pilot 2", chip.label)
+        assertEquals("Aircraft link cycling", chip.label)
         val why = augmentBlockReason(linked, readyBanner, ready, drops, upSinceMs = t - 60_000, nowMs = t)
-        assertTrue(why!!, why.contains("Pilot 2"))
+        assertTrue(why!!, why.contains("payload"))
     }
 
     @Test

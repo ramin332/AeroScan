@@ -50,7 +50,7 @@ fun panelStatusFor(
     val flapping = LinkHealth.isFlapping(drops, nowMs)
     val aircraft = when (conn) {
         is Connection.State.AircraftConnected ->
-            if (flapping) Chip("Link shared with Pilot 2", Tone.Warn) else Chip("Aircraft linked", Tone.Good)
+            if (flapping) Chip("Aircraft link cycling", Tone.Warn) else Chip("Aircraft linked", Tone.Good)
         is Connection.State.AircraftDisconnected -> Chip("Aircraft off", Tone.Bad)
         is Connection.State.Registered -> Chip("Waiting for aircraft", Tone.Neutral)
         is Connection.State.Initializing -> Chip("Starting…", Tone.Neutral)

@@ -62,22 +62,47 @@ halts at every waypoint, so transit speed cannot starve the shutter. The check i
 gated on fly-through mode. Dropping to 1 m/s to "fix" it would have cost roughly three
 times the mission time for nothing.
 
-### Why the RC app "loses the connection" until you reopen Pilot 2
+### Why the RC app "loses the connection" — it is the payload, not Pilot 2
 
-Measured on the RC on 2026-09-03 (logcat, our app in front, Pilot 2 alive in the
-background): `CoreExistReceiver` logs `setNeedTryConnect false` and the aircraft link
-drops, then returns ~10 s later — **every ~22 s**. Only one MSDK app may hold the
-aircraft link at a time, and DJI's guidance for the RC Plus is to force-exit Pilot
-before starting a third-party MSDK app.
+Measured on the RC on 2026-09-03. Every `Product connected` was followed within a
+second by `initPSDKDevice error … PAYLOAD.FetchWidgetFile:-13` and `widgetSet is null
+or data is empty!`, then a disconnect about 20 s later, over and over — the whole time
+the AeroScan payload app on the Manifold was **not running**. Once the payload app was
+started, the link held for a full three-minute watch **with DJI Pilot 2 alive in the
+background throughout**.
 
-The app now records link drops, shows `Link shared with Pilot 2` in amber, names the
-remedy (close Pilot 2 from recent apps while uploading, reopen it to fly), and refuses
-to start an augment into a link that has not been up for 4 s — instead of dying
-mid-transfer.
+**A first reading of the same log blamed Pilot 2** for taking the link back ("only one
+MSDK app may hold the aircraft link"). The three-minute watch disproved it: Pilot 2 ran
+the whole time and the link never dropped. The correlation that survives is the payload.
 
-**Not yet proven:** that force-stopping Pilot 2 stops the flapping. The decisive test
-(force-stop Pilot 2, watch our app's link for 3 minutes) could not run — the RC was
-unplugged. Run it before drawing conclusions.
+This matches what the pilot described from the field: enter camera view, enable the
+PSDK payload, and only then does the RC app connect properly. The essential step is
+starting the payload — reopening Pilot 2 is incidental.
+
+The app records link drops, shows `Aircraft link cycling` in amber, names the remedy
+(enable the AeroScan payload in Pilot 2), and refuses to start an augment into a link
+that has not been up for 4 s rather than dying mid-transfer.
+
+### Verified on the aircraft, 2026-09-03
+
+An augment of `busboom10-7.kmz` against the 7-week-old July scan returned in **25 s**
+and produced:
+
+| | |
+|---|---|
+| Facades | 219, every one with its inlier count and a sample |
+| Facades no waypoint photographs | **182 of 219** |
+| Waypoints aimed | 391 of 398 |
+| Inliers per facet | 35 min, 44 median, 221 max |
+| Summary size | 461 KB (the 16 MB frame cap is untroubled) |
+
+The registration cache wrote a 17 MB entry, so re-augmenting with different detection
+settings skips the mesh load and the ICP. The bogus `photo_interval_too_short` warning
+is gone on a stop-mode plan, as intended.
+
+The 182 uncovered facades are the real finding. Thin facets — a median of 44 points
+each — are what a van and a few cars look like when carved into 219 pieces. `Detail:
+Coarse` is the lever to test.
 
 ### To finish on the aircraft (needs it powered on)
 
