@@ -24,4 +24,4 @@ flight-debug/
 docs/flights/**/flight[0-9]*/
 docs/flights/**/*.augmented.kmz
 flight-archive/
-deliverables/
+deliverables/*

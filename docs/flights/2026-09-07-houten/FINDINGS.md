@@ -36,9 +36,37 @@ photos multiplied the walls covered by 14×, because the second shot is aimed at
 other waypoint was going to photograph. This is the 2026-09-03 bench prediction (92 → 78
 unshot) landing much harder on a real house than it did on the test-venue vans.
 
-Note C flies **twice as fast** as B and still covers 14× more. Speed was not the cost —
-the fly-through mode was, and the plan-time warnings said so before the flight:
-B was flagged `action_dwell_too_short` on 56 waypoints, C on none.
+C's legs fly twice as fast as B's, but that is not the same as a faster mission:
+stopping at every waypoint makes C **3.2× longer in the air** (measured below).
+The plan-time warnings flagged the difference in advance — B was marked
+`action_dwell_too_short` on 56 waypoints, C on none.
+
+### What it costs in the air
+
+Commanded speed is not mission time. C flies its legs at 2 m/s but **stops at all
+276 waypoints**, and the stops dominate:
+
+| | photos | first → last frame | span | per waypoint |
+|---|---|---|---|---|
+| A — DJI rosette | 635 | 14:04:18 → 14:10:48 | **6.5 min** | — |
+| B — 1 m/s, fly-through | 276 | 14:18:37 → 14:25:17 | **6.7 min** | 1.4 s |
+| C — 2 m/s, stop + 2 shots | 539 | 14:32:50 → 14:54:03 | **21.2 min** | 4.6 s |
+
+**C takes 3.2× as long as B**, despite flying its legs twice as fast. About 3.2 s
+per waypoint goes to arriving precisely, settling, and running the two-shot
+sequence — the pilot's report that the aircraft dawdles at every point, measured.
+
+The trade is still strongly in C's favour, but it is a trade:
+
+| | B | C |
+|---|---|---|
+| Walls ≥ 2 m² photographed | 5 | 71 |
+| Mission time | 6.7 min | 21.2 min |
+| **Walls per minute** | **0.75** | **3.3** |
+
+So C buys 14× the coverage for 3.2× the time — **4.4× more coverage per minute**.
+Whether that is the right deal depends on battery budget, and reducing the
+per-waypoint overhead is now the most valuable open optimisation.
 
 ## All three sites
 
