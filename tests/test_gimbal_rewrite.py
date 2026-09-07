@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 
 from flight_planner.gimbal_rewrite import rewrite_gimbals_perpendicular
-from flight_planner.models import Facade, Waypoint
+from flight_planner.models import ActionType, Facade, Waypoint
 
 
 def _make_facade(normal: tuple[float, float, float], center: tuple[float, float, float], size: float = 4.0) -> Facade:
@@ -106,3 +106,69 @@ def test_default_leaves_yaw_uncommanded_so_the_gimbal_cannot_saturate():
     assert out.gimbal_pitch_deg is not None
     # The nose carries the azimuth instead.
     assert abs(out.heading_deg - (-90.0)) < 0.5
+
+
+# --- the primary shot must be aimed, not inherited -------------------------
+#
+# A waypoint that takes extra photos pans the gimbal away from the nose. The
+# next waypoint commands pitch but no yaw, so the gimbal keeps that pan and the
+# primary photo is taken looking at the previous waypoint's wall. Measured on
+# Houten flight C (2026-09-07): correlation +0.985 between a waypoint's panned
+# yaw and the NEXT waypoint's primary pan, and 13.6° median bearing error on the
+# primary shots against 6.7° for the same mission flown without extra shots.
+
+def _scene_with_a_wall_nobody_targets():
+    """Two waypoints that both aim at the same wall, plus a second wall off to the
+    side that no waypoint picks as its primary — so it is available to an extra,
+    panned shot. `assign_extra_shots` only hands out facets nothing else covers,
+    so a scene where every wall is already a primary produces no extras at all
+    and would make these tests pass without asserting anything."""
+    facades = [
+        _make_facade((-1.0, 0.0, 0.0), (12.0, 0.0, 5.0)),   # straight ahead
+        _make_facade((-0.8, -0.6, 0.0), (8.0, 6.0, 5.0)),   # off to the left
+    ]
+    wps = [
+        Waypoint(x=0.0, y=0.0, z=5.0, heading_deg=90.0, speed_ms=2.0),
+        Waypoint(x=0.0, y=1.0, z=5.0, heading_deg=90.0, speed_ms=2.0),
+    ]
+    return wps, facades
+
+
+def test_extra_shots_aim_the_gimbal_back_before_the_primary_photo():
+    wps, facades = _scene_with_a_wall_nobody_targets()
+    out = rewrite_gimbals_perpendicular(
+        wps, facades, max_distance_m=50.0, shots_per_waypoint=2, pan_window_deg=55.0
+    )
+    for wp in out:
+        if len(wp.actions) <= 1:
+            continue
+        first = wp.actions[0]
+        assert first.action_type is ActionType.GIMBAL_ROTATE, (
+            "the primary photo must be preceded by an explicit aim, or it inherits "
+            "the previous waypoint's pan"
+        )
+        assert first.gimbal_yaw_deg is not None
+        assert wp.actions[1].action_type is ActionType.TAKE_PHOTO
+
+
+def test_the_primary_aim_stays_inside_the_gimbal_pan_limit():
+    wps, facades = _scene_with_a_wall_nobody_targets()
+    out = rewrite_gimbals_perpendicular(
+        wps, facades, max_distance_m=50.0, shots_per_waypoint=2,
+        pan_window_deg=55.0, max_gimbal_pan_deg=20.0,
+    )
+    for wp in out:
+        if not wp.actions or wp.actions[0].action_type is not ActionType.GIMBAL_ROTATE:
+            continue
+        pan = ((wp.actions[0].gimbal_yaw_deg - wp.heading_deg) + 180.0) % 360.0 - 180.0
+        assert abs(pan) <= 20.0 + 1e-6, f"primary aim demanded {pan:.1f}° of pan"
+
+
+def test_a_single_shot_mission_still_commands_no_gimbal_yaw():
+    """The 2026-07-10 fix (2bf3308) must survive: one shot per waypoint means the
+    gimbal follows the nose and no yaw is commanded anywhere."""
+    wps, facades = _scene_with_a_wall_nobody_targets()
+    out = rewrite_gimbals_perpendicular(wps, facades, max_distance_m=50.0, shots_per_waypoint=1)
+    assert all(wp.gimbal_yaw_deg is None for wp in out)
+    assert all(a.action_type is not ActionType.GIMBAL_ROTATE
+               for wp in out for a in wp.actions)

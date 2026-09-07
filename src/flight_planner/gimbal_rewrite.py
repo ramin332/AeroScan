@@ -522,6 +522,10 @@ def rewrite_gimbals_perpendicular(
     pitch_max = GIMBAL_TILT_MAX_DEG - pitch_margin_deg
 
     out: list[Waypoint] = []
+    # Bearing (absolute, from north) the primary shot is aimed along, per output
+    # waypoint. Kept even when `command_gimbal_yaw` is False, because a mission
+    # that pans the gimbal for extra shots has to be able to aim it back.
+    primary_bearing: list[float | None] = []
     previous_index: int | None = None
     for wi, wp in enumerate(waypoints):
         pos = np.array([wp.x, wp.y, wp.z], dtype=np.float64)
@@ -539,6 +543,7 @@ def rewrite_gimbals_perpendicular(
             )
         if pick is None:
             out.append(replace(wp, facade_index=wp.facade_index))
+            primary_bearing.append(None)
             continue
 
         idx, _ = pick
@@ -551,6 +556,7 @@ def rewrite_gimbals_perpendicular(
         norm = float(np.linalg.norm(look))
         if norm < 1e-6:
             out.append(replace(wp, facade_index=wp.facade_index))
+            primary_bearing.append(None)
             continue
         look = look / norm
         # Yaw: bearing from north, clockwise. ENU x=East, y=North.
@@ -578,6 +584,7 @@ def rewrite_gimbals_perpendicular(
             actions=[a for a in wp.actions if getattr(a, "action_type", None)],
         )
         out.append(new_wp)
+        primary_bearing.append(float(yaw_deg))
 
     if not preserve_heading and command_gimbal_yaw and out:
         # The gimbal keeps its exact absolute-north aim (`gimbal_yaw_deg`). The
@@ -621,14 +628,41 @@ def rewrite_gimbals_perpendicular(
             pitch_max=pitch_max,
         )
         rebuilt: list[Waypoint] = []
-        for wp, shots in zip(out, extras):
+        for wi, (wp, shots) in enumerate(zip(out, extras)):
             if not shots:
                 rebuilt.append(wp)
                 continue
             # Own the whole sequence: one photo on the nose bearing, then a
             # pan-and-shoot pair per extra wall. Anything DJI left on the
             # waypoint is dropped here rather than downstream.
-            acts = [CameraAction(action_type=ActionType.TAKE_PHOTO)]
+            acts: list[CameraAction] = []
+            # Aim the gimbal at the primary target before shooting it.
+            #
+            # Without this the waypoint commands pitch but no yaw, so the gimbal
+            # keeps the absolute heading the PREVIOUS waypoint's pan left it at
+            # and the primary photo is taken looking wherever that was. Measured
+            # on the 2026-09-07 Houten flight C, from the JPEG XMP: the primary
+            # shot's pan tracked the previous waypoint's pan with a correlation
+            # of +0.985 (5.0° median where the previous pan was under 10°, 36.6°
+            # where it was over 30°), and the primary shots missed their target
+            # by 13.6° median against 6.7° on the same mission flown without
+            # extra shots. Commanding yaw here is safe: the same flight showed
+            # the M4E honours an absolute-north gimbal yaw to a median of 0.1°
+            # over 256 frames.
+            bearing = primary_bearing[wi] if wi < len(primary_bearing) else None
+            if bearing is not None:
+                # Keep the request inside the gimbal's travel; the ±60° stop is
+                # what saturated on 2026-07-10.
+                pan = ((bearing - float(wp.heading_deg)) + 180.0) % 360.0 - 180.0
+                if abs(pan) > max_gimbal_pan_deg:
+                    pan = math.copysign(max_gimbal_pan_deg, pan)
+                aim = ((float(wp.heading_deg) + pan) + 180.0) % 360.0 - 180.0
+                acts.append(CameraAction(
+                    action_type=ActionType.GIMBAL_ROTATE,
+                    gimbal_pitch_deg=wp.gimbal_pitch_deg,
+                    gimbal_yaw_deg=float(aim),
+                ))
+            acts.append(CameraAction(action_type=ActionType.TAKE_PHOTO))
             for _fi, pitch, yaw in shots:
                 acts.append(CameraAction(
                     action_type=ActionType.GIMBAL_ROTATE,
