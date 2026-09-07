@@ -51,6 +51,7 @@ rsync -avz --delete ${DRY} \
     --exclude 'sim_output/' \
     --exclude 'kmz/' \
     --exclude 'flight-archive/' \
+    --exclude 'deliverables/' \
     --exclude 'flight-debug/' \
     --exclude '*.db' \
     --exclude 'dist/' \

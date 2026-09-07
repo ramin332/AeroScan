@@ -1,8 +1,76 @@
-# RESUME HERE — AeroScan fly-readiness (last updated 2026-09-02)
+# RESUME HERE — AeroScan fly-readiness (last updated 2026-09-07)
 
 > Single entry point for picking up the on-drone augment→fly work next session.
 > Read this first, then the linked detail docs. Everything is merged to `main`.
 > On the Manifold, `cd /open_app/dev`.
+
+## ► CONTINUE HERE — 2026-09-07, after Houten
+
+**Three flights over real houses. Everything from 2026-09-02/03 flew, and it worked.**
+Full write-up: `docs/flights/2026-09-07-houten/FINDINGS.md`. Executive summary (NL):
+`docs/reports/2026-09-07-directiesamenvatting-houten.md`. Team package:
+`deliverables/aeroscan-houten-2026-09-07*` (gitignored).
+
+### What flew, and what the photos proved
+
+| | |
+|---|---|
+| Sites | 0709Houten (flight0079), Houten2-0709 (flight0080), Houten-3 (flight0082) |
+| Comparison set | A = DJI Smart3D rosette (635 photos) · B = `…131731Z_187` 1 m/s fly-through 1 shot (276) · C = `…133135Z_705` 2 m/s stop 2 shots (539) — all on Houten-3 |
+| Photos delivered | **276/276 and 539/539.** Nothing dropped (2026-07-10 lost 104 of 398) |
+| Gimbal pan (B) | median **6.5°**, 0 of 276 at the ±60° stop. The `2bf3308` fix is **verified in the air** |
+| Commanded vs actual | pitch median **0.1°**; yaw on C's panned shot median **0.1°** over 256 frames |
+| Coverage | fly-through 5 of 162 walls ≥2 m²; stop + 2 shots **71 of 162** |
+| GSD | 1.83–2.01 mm/px on the WIDE lens — in spec, standoff p90 8.6–11 m |
+| ICP | RMSE 0.138 m, drift 2–3 cm (Mijande was 0.468 m) |
+| Time | A 6.5 min · B 6.7 min · **C 21.2 min** (4.6 s/waypoint, of which ~2.3 s is the stop) |
+| Continue | ran for real: `…120925Z_003.resume104.lean.kmz`, WPs 104–416 |
+
+### THE fix made after the flight — deployed, NOT flown
+
+`6e980b7`: the primary photo was taken with the gimbal still holding the **previous**
+waypoint's pan (correlation **+0.985**; 36.6° off where the previous pan was large).
+Primary shots missed their wall by 13.6° median against 6.7° for the same mission
+without extra shots. Now an explicit `gimbalRotate` aims at the primary target before
+the first photo, clamped to `max_gimbal_pan_deg`. Gimbal only — the airframe does not
+turn. Deployed to the Manifold 2026-09-07 and its tests pass there (14 passed).
+
+**Next flight is the measurement flight for this.** Success = primary shots within
+~5° of their target instead of 13.6°. Same house, same settings as C.
+
+### Two claims we retracted (do not re-derive)
+
+- **"The M4E ignores absolute-north gimbal yaw"** (2026-07-10) — **wrong**. C commanded
+  it 256 times and the gimbal landed within 0.1°. July's saturation had another cause.
+  `schedule_headings()` is viable again.
+- **"C is twice as fast"** — wrong; that was commanded leg speed. C is **3.2× slower**.
+  Always time a flight from the photo timestamps.
+
+### Open, in priority order
+
+1. **Fly the aim fix** (above). One battery, ~20 min.
+2. **Telemetry CSV was never written** — `/open_app/dev/data/received/telemetry/` does
+   not exist after three flights. Manifold repo at `9d054ae`. Unresolved.
+3. **`journalctl` on the Manifold is volatile** — the power-cycle home wiped the whole
+   field session (log jumps 09-03 15:22 → 09-07 16:03). **Pull the journal before
+   powering down**, or make it persistent.
+4. **Coverage still under half** (71/162). The lever is the aim picker, not the detector.
+5. **Is the stop even needed?** The two shots cost 1.0 s; a 1.47 m leg at 1 m/s gives
+   1.47 s. `cli.py:557` force-clamps shots to 1 in fly-through on a 2026-09-03 guess
+   that the measurements contradict. Research: `docs/reports/2026-09-07-stop-at-waypoint-dwell-research.md`.
+   DJI's own mission shoots 635 frames in 6.5 min without ever stopping — but via
+   `startSmartOblique`, a closed actuator we cannot give our aims to.
+
+### Field notes worth keeping
+
+- `deliverables/` was missing from `deploy_to_manifold.sh`'s excludes and the deploy
+  started pushing ~19 GB of photos to the aircraft. Fixed; check excludes before
+  adding big directories to the repo root.
+- The **2026-07-10 photos were still on the SD card** and are now recovered to
+  `flight-archive/2026-07-10/photos/` (6.6 GB, 893 JPEGs). Earlier notes wrote them off.
+- Manifold was at **192.168.1.118** on the day (`.55` is also in the docs; it moves).
+
+---
 
 ## One-line status
 
