@@ -30,6 +30,40 @@ def _unit(v: np.ndarray) -> np.ndarray:
     return v / n if n > 1e-9 else v
 
 
+def aim_point(facade: Facade, pos: np.ndarray, inset_frac: float = 0.25) -> np.ndarray:
+    """Point on ``facade`` the camera at ``pos`` should look at.
+
+    The foot of the perpendicular from ``pos`` onto the facet, clamped to the
+    facet's extent in its own plane frame. Aiming at the centroid instead made a
+    waypoint that had flown past the middle of a long wall look back at the
+    middle, so the camera trailed behind the aircraft for half of every wall.
+
+    The clamp is inset from the edges by ``inset_frac`` of the half-extent, so a
+    waypoint beyond the end of a wall aims a little inside the corner and the
+    photo frames the wall rather than the edge.
+    """
+    V = np.asarray(facade.vertices, dtype=np.float64).reshape(-1, 3)
+    c = V.mean(axis=0)
+    if len(V) < 3:
+        return c
+    n = _unit(np.asarray(facade.normal, dtype=np.float64))
+    # Plane frame: u horizontal along the facet (or east for a flat roof), v = n × u.
+    u = np.cross(np.array([0.0, 0.0, 1.0]), n)
+    if np.linalg.norm(u) < 1e-6:
+        u = np.array([1.0, 0.0, 0.0])
+    u = _unit(u)
+    v = _unit(np.cross(n, u))
+    rel = V - c
+    pu, pv = rel @ u, rel @ v
+    k = 1.0 - inset_frac
+    lo_u, hi_u = pu.min() * k, pu.max() * k
+    lo_v, hi_v = pv.min() * k, pv.max() * k
+    d = np.asarray(pos, dtype=np.float64) - c
+    su = float(np.clip(d @ u, lo_u, hi_u))
+    sv = float(np.clip(d @ v, lo_v, hi_v))
+    return c + su * u + sv * v
+
+
 def _wrap180(a):
     return (np.asarray(a, dtype=np.float64) + 180.0) % 360.0 - 180.0
 
@@ -413,8 +447,10 @@ def assign_extra_shots(
                 continue
             if signed[i] <= 0 or pan[i] > pan_window_deg:
                 continue
-            p = float(min(pitch_max, max(pitch_min, pitch[i])))
-            y = float(_wrap180(bearing[i]))
+            # Aim at the nearest point of the facet, as the primary shot does.
+            a = aim_point(facades[i], pos) - pos
+            p = float(min(pitch_max, max(pitch_min, np.degrees(np.arctan2(a[2], np.hypot(a[0], a[1]))))))
+            y = float(_wrap180(np.degrees(np.arctan2(a[0], a[1]))))
             extras.append((i, p, y))
             taken.add(i)
         out.append(extras)
@@ -549,10 +585,10 @@ def rewrite_gimbals_perpendicular(
         idx, _ = pick
         previous_index = idx
         facade = facades[idx]
-        center = np.asarray(facade.center, dtype=np.float64)
-
-        # Camera look direction = WP → facade center.
-        look = center - pos
+        # Camera look direction = WP → nearest point on the facet (not its
+        # centroid, which made the camera look back along a wall once the
+        # aircraft had passed its middle).
+        look = aim_point(facade, pos) - pos
         norm = float(np.linalg.norm(look))
         if norm < 1e-6:
             out.append(replace(wp, facade_index=wp.facade_index))

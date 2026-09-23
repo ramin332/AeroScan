@@ -104,6 +104,51 @@ def _heading_to_djikmz(heading_deg: float) -> float:
     return h
 
 
+def _single_shot_can_pass(waypoints: list[Waypoint], config: MissionConfig) -> list[bool]:
+    """Which waypoints may fly through even though the mission is stop-and-shoot.
+
+    Houten 2026-09-07: stopping cost ~3.2 s per waypoint (4.6 s vs 1.4 s flying
+    through), and the same flight's fly-through run returned 276 of 276 photos.
+    The stop only earns its time where the gimbal pans for a second photo, so a
+    waypoint passes when it:
+
+    - takes one photo (no ``extra_facade_indices``), and
+    - has at least ``min_action_dwell_s`` on both its incoming and outgoing leg
+      (2026-07-10 lost 104 of 398 photos at 0.58 s legs), and
+    - needs no more heading change on either leg than the yaw rate covers in
+      that leg's time.
+
+    Anything that fails a test keeps the stop, so at a high speed or on a
+    tight sweep this degrades to the flown stop-everywhere behaviour.
+    """
+    n = len(waypoints)
+
+    def leg(a: Waypoint, b: Waypoint) -> tuple[float, float]:
+        d = math.sqrt((b.x - a.x) ** 2 + (b.y - a.y) ** 2 + (b.z - a.z) ** 2)
+        v = b.speed_ms if b.speed_ms and b.speed_ms > 0 else config.flight_speed_ms
+        t = d / v if v > 0 else 0.0
+        step = abs(b.heading_deg - a.heading_deg) % 360.0
+        return t, min(step, 360.0 - step)
+
+    out = [False] * n
+    for i, wp in enumerate(waypoints):
+        if wp.is_transition or wp.extra_facade_indices:
+            continue
+        legs = []
+        if i > 0:
+            legs.append(leg(waypoints[i - 1], wp))
+        if i + 1 < n:
+            legs.append(leg(wp, waypoints[i + 1]))
+        ok = bool(legs)
+        for t, step in legs:
+            if t < config.min_action_dwell_s:
+                ok = False
+            if config.yaw_rate_deg_per_s > 0 and step / config.yaw_rate_deg_per_s > t:
+                ok = False
+        out[i] = ok
+    return out
+
+
 def _build_mission(
     waypoints: list[Waypoint],
     config: MissionConfig,
@@ -143,7 +188,8 @@ def _build_mission(
     )
     mission._mission_config.take_off_height = config.takeoff_security_height_m
 
-    for wp in waypoints:
+    passable = _single_shot_can_pass(waypoints, config)
+    for wi, wp in enumerate(waypoints):
         height = max(wp.z, algo.min_waypoint_height_m)
         wb = mission.fly_to(wp.lat, wp.lon, height=height)
         wb.speed(wp.speed_ms)
@@ -176,7 +222,11 @@ def _build_mission(
 
         # Inspection: set gimbal, take photo
         # M4E mechanical shutter allows fly-through capture at slow speeds
-        wb.turn_mode("curve_and_stop" if config.stop_at_waypoint else "curve_and_pass")
+        # In stop mode, only waypoints that pan for an extra photo must stop;
+        # a single-shot waypoint flies through when its legs leave the camera
+        # and the nose enough time (see _single_shot_can_pass).
+        stop = config.stop_at_waypoint and not passable[wi]
+        wb.turn_mode("curve_and_stop" if stop else "curve_and_pass")
         # gimbal_yaw_deg=None means "follow aircraft heading" (don't command yaw).
         # When set, it's absolute degrees from geographic north (WPML headingBase=north).
         wb.gimbal_rotate(

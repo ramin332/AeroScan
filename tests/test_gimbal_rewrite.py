@@ -172,3 +172,21 @@ def test_a_single_shot_mission_still_commands_no_gimbal_yaw():
     assert all(wp.gimbal_yaw_deg is None for wp in out)
     assert all(a.action_type is not ActionType.GIMBAL_ROTATE
                for wp in out for a in wp.actions)
+
+
+def test_waypoint_past_middle_of_long_wall_looks_at_the_wall_not_back():
+    # 20 m east-facing wall centred at y=0. A waypoint 5 m out at y=+7 is past
+    # the middle; aiming at the centroid made it look back ~54° south of west.
+    wall = _make_facade(normal=(1.0, 0.0, 0.0), center=(0.0, 0.0, 2.0), size=20.0)
+    wp = Waypoint(x=5.0, y=7.0, z=2.0)
+    out = rewrite_gimbals_perpendicular([wp], [wall], command_gimbal_yaw=True)[0]
+    assert abs(out.gimbal_yaw_deg - (-90.0)) < 0.5
+
+
+def test_waypoint_beyond_end_of_wall_aims_just_inside_the_end():
+    wall = _make_facade(normal=(1.0, 0.0, 0.0), center=(0.0, 0.0, 2.0), size=20.0)
+    wp = Waypoint(x=5.0, y=15.0, z=2.0)
+    out = rewrite_gimbals_perpendicular([wp], [wall], command_gimbal_yaw=True)[0]
+    # Inset clamp: aim point at y = 10 * 0.75 = 7.5, so bearing atan2(-5, -7.5).
+    expected = math.degrees(math.atan2(-5.0, -7.5))
+    assert abs(out.gimbal_yaw_deg - expected) < 0.5

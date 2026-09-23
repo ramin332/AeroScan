@@ -577,9 +577,20 @@ class TestTurnMode:
     chain and the heading turn complete before the aircraft moves on."""
 
     def test_stop_at_waypoint_emits_stop_turn_mode(self):
-        xml = _extract_wpml_xml(MissionConfig(stop_at_waypoint=True))
+        # Two-shot waypoints must stop; single-shot ones may pass (see below).
+        wps = _make_test_waypoints()
+        for wp in wps:
+            wp.extra_facade_indices = [1]
+        data = build_kmz_bytes(wps, MissionConfig(stop_at_waypoint=True))
+        with zipfile.ZipFile(io.BytesIO(data)) as zf:
+            xml = zf.read("wpmz/waylines.wpml").decode("utf-8")
         assert "toPointAndStopWithContinuityCurvature" in xml
         assert "toPointAndPassWithContinuityCurvature" not in xml
+
+    def test_stop_mode_lets_roomy_single_shot_waypoints_pass(self):
+        # 3 m legs at 3 m/s = 1.0 s, meeting min_action_dwell_s: no stop needed.
+        xml = _extract_wpml_xml(MissionConfig(stop_at_waypoint=True))
+        assert "toPointAndStopWithContinuityCurvature" not in xml
 
     def test_fly_through_emits_pass_turn_mode(self):
         xml = _extract_wpml_xml(MissionConfig(stop_at_waypoint=False))
@@ -600,7 +611,10 @@ def test_turn_mode_follows_stop_at_waypoint_end_to_end():
     from flight_planner.models import MissionConfig
 
     def turn_modes(stop: bool) -> str:
-        raw = build_kmz_bytes(_make_test_waypoints(), MissionConfig(stop_at_waypoint=stop))
+        wps = _make_test_waypoints()
+        for wp in wps:
+            wp.extra_facade_indices = [1]   # two-shot: the stop is load-bearing
+        raw = build_kmz_bytes(wps, MissionConfig(stop_at_waypoint=stop))
         with zipfile.ZipFile(BytesIO(raw)) as zf:
             name = next(n for n in zf.namelist() if n.endswith("waylines.wpml"))
             return zf.read(name).decode("utf-8")
