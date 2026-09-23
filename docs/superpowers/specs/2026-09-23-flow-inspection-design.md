@@ -1,151 +1,129 @@
-# Flow inspection: two shots without stopping, calm nose, autofocus — design
+# Calm nose, autofocus, nearest-point picker — design
 
-Date: 2026-09-23 · Status: approved in conversation, awaiting spec review · Flown: no
+Date: 2026-09-23 · Status: approved in conversation · Flown: no
 
 ## Goal
 
-One test flight that is **faster** than Houten flight C and gives **sharper, better-aimed
-photos from different positions** (usable for photogrammetry), without losing coverage.
+One test flight that gives **sharper, better-aimed photos** with a **calm aircraft
+nose**, without losing coverage or photos.
 
 Baseline (Houten-3, 2026-09-07, flight C: 2 m/s, stop at every waypoint, 2 shots):
-4.6 s per waypoint, 21.2 min, 539/539 photos, 71 of 162 walls ≥ 2 m² covered, lens
-locked near infinity (`LensPosition` 29–30, infinity 27–28) at a median 7.3 m standoff.
+4.6 s per waypoint, 539/539 photos, 71 of 162 walls ≥ 2 m² covered, primary shots
+13.6° median off target, lens locked near infinity (`LensPosition` 29–30, infinity
+27–28) at a median 7.3 m standoff.
 
 The 2026-09-23 on-site fix (`570427b`) already aims at the nearest point of a facet and
-lets single-shot waypoints fly through. This design builds on it.
+lets single-shot waypoints fly through when their legs allow it. The pilot reported the
+aim better and the nose "a bit weird". This design builds on `570427b`.
 
-## What the user asked for
+## Scope
 
-- Autofocus — the client wants it. Default: before every photo. A setting selects
-  "only when the distance changes" instead.
-- Picker scores the nearest point of a facet, not its centroid (idea 3).
-- Two photos per waypoint without stopping, taken from different positions (idea 4).
-  Never two photos of the same place: the extra shot still only goes to a facet no other
-  waypoint photographs.
-- A calm aircraft nose, with the gimbal doing the fine aim (idea 5).
-- All flown together as one test.
+In:
+- **Autofocus** — the client wants it. Default: before every photo.
+- **Calm nose (idea 5)** — the nose turns at a bounded rate; the gimbal does the fine aim.
+- **Picker by nearest point (idea 3)** — the facet choice uses the same point the camera
+  aims at.
 
-Added during design, because idea 4 does not work without it: **per-leg speed** (idea 2).
+Out (decided 2026-09-23): splitting two-shot waypoints into two fly-through waypoints,
+and the per-leg speed that splitting needed. Two-shot waypoints keep stopping.
 
-## Pipeline (augment, after registration and facade detection)
+## Changes
 
-Order of steps in `rewrite_gimbals_perpendicular` / `augment_mission`:
+### 1. Picker by nearest point (`gimbal_rewrite.py`)
 
-1. **Pick (idea 3).** `assign_facades_viterbi` scores each facet by the distance from
-   the waypoint to `aim_point(facet, wp)` instead of to `facet.center`. The validity
-   test (waypoint on the outward side) and the pitch penalty use the same point. The
-   switch cost and the plane-group logic do not change. The greedy picker
-   (`_pick_facade_for_waypoint`) gets the same change, so both modes agree.
-2. **Assign extra shots.** `assign_extra_shots`, unchanged in rule: only facets no other
-   waypoint photographs, each given out once. Its distance and pan tests move to
-   `aim_point` too.
-3. **Split (idea 4).** For each waypoint that has an extra shot, insert a new waypoint
-   on the segment to the next waypoint, at the midpoint. The original waypoint keeps
-   the primary shot; the new one takes the extra shot. The new waypoint carries
-   `facade_index` = the extra facet and an `is_split` flag. With `shots_per_waypoint`
-   = 3 or 4, the extras are spread evenly along the segment (at 1/3 and 2/3, and so
-   on). The last waypoint of the mission has no next segment: it keeps its extras as a
-   stop-and-shoot chain, as today.
-   - Safety: the new waypoint lies on a segment the aircraft flies anyway. It adds no
-     new airspace, and the polygon clip and point-cloud obstacle filter still run on
-     the result.
-4. **Aim.** Every photo waypoint aims at `aim_point` of its facet: pitch and absolute
-   yaw from north, pitch clamped to the gimbal limits minus the margin.
-5. **Heading (idea 5).** `schedule_headings()` over all waypoints (originals and
-   splits) with each waypoint's aim bearing as the target: `rate_fraction` 0.5 of 60°/s,
-   gimbal pan capped at ±50°. The gimbal yaw is commanded (`command_gimbal_yaw=True`).
-   The 2026-09-07 XMP proved the M4E follows it: median 0.1° over 256 frames. The
-   primary-shot `gimbalRotate` added in `6e980b7` becomes the normal per-waypoint
-   gimbal command.
-6. **Autofocus.** A `focus` action (`isPointFocus=0`, centre area: `focusX=focusY=0.4`,
-   width and height 0.2, `isInfiniteFocus=0`) placed after `gimbalRotate` and before
-   `takePhoto`. Setting `autofocus`:
-   - `2` = before every photo (default for this test flight)
-   - `1` = only when the facet changes, or when the planned distance to the aim point
-     differs by more than 15% from the distance at the last focus
-   - `0` = off (today's behaviour: manual focus, never refocused)
+`assign_facades_viterbi` scores each facet by the distance from the waypoint to
+`aim_point(facet, wp)` instead of to `facet.center`. The outward-side test, the reach
+cap, the pitch penalty and the bearing used for the switch cost all use that point.
+`_pick_facade_for_waypoint` (greedy mode) and `assign_extra_shots` get the same change,
+so every mode agrees with the aim. The switch cost and plane-group logic are unchanged.
 
-   The `startActionGroup` keeps `setFocusType manual`. The `focus` action is a
-   one-shot autofocus in that mode, as in DJI's own start group.
-7. **Per-leg speed (idea 2).** For each leg into a photo waypoint:
-   `speed = clamp(leg_m / need_s, 0.3, inspection_speed_ms)` where
-   `need_s = min_action_dwell_s + (af_time_s if that waypoint focuses else 0)`.
-   The outgoing leg is checked the same way, so the slower of the two legs sets the
-   waypoint's `speed_ms`. Transit waypoints keep `inspection_speed_ms`.
-8. **Turn mode.** Every photo waypoint flies through (`toPointAndPassWithContinuityCurvature`).
-   A waypoint keeps `curve_and_stop` only if its time need cannot be met even at
-   0.3 m/s (leg shorter than `0.3 × need_s`), if the heading schedule had to yaw
-   faster than the rate budget on an adjoining leg (a counted violation in
-   `schedule_headings`), or if it still carries more than one photo (the last-waypoint
-   case in step 3). `_single_shot_can_pass` from `570427b` is
-   generalised to this rule.
+Why: a long wall's centroid is far from a waypoint at one end of it, so the wall lost
+to small facets nearby even though the camera would aim at the wall right in front.
+
+### 2. Calm nose (`gimbal_rewrite.py`, `cli.py`)
+
+`augment_mission` passes `command_gimbal_yaw=True`. That path already exists:
+`schedule_headings()` makes the heading a rate-limited pursuit of each waypoint's aim
+bearing (`rate_fraction` 0.5 of 60°/s) and caps the gimbal pan at ±50°, and every
+waypoint commands an absolute gimbal yaw. The 2026-09-07 XMP proved the M4E follows
+that yaw: median 0.1° over 256 frames. The July "gimbal ignores yaw" conclusion that
+disabled this path is retracted.
+
+The explicit `gimbalRotate` before the primary photo (`6e980b7`) stays.
+
+Side effect: a calmer nose means smaller heading steps, so more single-shot waypoints
+pass the `_single_shot_can_pass` heading test and fly through.
+
+### 3. Autofocus (`models.py`, `gimbal_rewrite.py`/`cli.py`, `kmz_builder.py`)
+
+New `ActionType.FOCUS`, emitted as a WPML `focus` action: area focus in the centre of
+the frame (`isPointFocus=0`, `focusX=focusY=0.4`, `focusRegionWidth=focusRegionHeight=0.2`,
+`isInfiniteFocus=0`). It goes after the gimbal command and before each `takePhoto` it
+serves. The `startActionGroup` keeps `setFocusType manual`; `focus` is a one-shot
+autofocus in that mode, as in DJI's own start group.
+
+Setting `autofocus`:
+- `2` = before every photo (default for this test flight)
+- `1` = only when the facet changes, or when the planned distance to the aim point
+  differs by more than 15% from the distance at the last focus
+- `0` = off (the behaviour flown so far: manual focus, never refocused)
+
+Time budget: a waypoint with a focus action needs `min_action_dwell_s + af_time_s` on
+its legs to fly through. `_single_shot_can_pass` uses that sum; waypoints that cannot
+meet it stop, as today. So autofocus can cost fly-throughs; it never costs photos.
 
 ## Settings (mission intent `settings`, `mission_intent.SETTING_KEYS`)
 
-New numeric keys, with engine-side defaults. No RC rebuild is needed for the test
-flight; panel toggles come later.
+Numeric keys with engine defaults. No RC rebuild is needed for the test flight.
 
 | key | type, range | default | meaning |
 |---|---|---|---|
 | `autofocus` | int 0–2 | 2 | 0 off, 1 on change, 2 every photo |
-| `af_time_s` | float 0–3 | 0.5 | time budget for one autofocus; measured on the test flight |
-| `split_extra_shots` | int 0–1 | 1 | 0 = the stop-for-extra-shots behaviour flown on 2026-09-23 |
-| `smooth_heading` | int 0–1 | 1 | 0 = nose points at the target at every waypoint (today) |
+| `af_time_s` | float 0–3 | 0.5 | time budget for one autofocus; the flight measures it |
+| `smooth_heading` | int 0–1 | 1 | 0 = nose points at the target at every waypoint (flown 2026-09-23) |
 
-`stop_at_waypoint` keeps its meaning of "stopping is allowed". With it off (fly-through),
-`shots_per_waypoint` is still forced to 1, as today.
+## Summary and validation
 
-## Validation
-
-- `extra_shots_need_stop` stays. After splitting, no pass-through waypoint carries two
-  photos, so the rule is satisfied by construction.
-- The fly-through gates (`action_dwell_too_short`, `heading_step_unreachable`) run on
-  the final waypoints whenever any waypoint passes, not only when
-  `stop_at_waypoint` is off. Per-leg speed means they should not fire. If they do, the
-  test fails.
-- New info line in the summary: counts of split waypoints, stops kept, focus actions,
-  and the estimated mission time.
+- Summary gains `focus_actions`, `stops`, `pass_throughs` counts, logged on one line.
+- No new validation rule. The existing fly-through gates stay as they are.
 
 ## Risks the flight has to answer
 
-- **How long one autofocus takes on the M4E.** Undocumented. 0.5 s is a guess.
-  Measure it from photo timestamps against planned leg times.
 - **Whether the FC accepts `focus` at an inspection waypoint.** DJI only uses it in
-  `startActionGroup`. If the mission-validity check rejects it, START fails. The
-  pilot sees that before takeoff, and we fall back to `autofocus=0`.
-- **Gimbal-motor overload.** There will be more gimbal commands than on 2026-09-07.
-  2026-06-12 tripped the HMS warning at ~3.9 commands/s. The 5° dedupe stays. Watch
-  HMS and the journal.
-- **Split leg speed.** At 0.3–0.75 m/s, split legs are slow. The per-waypoint
-  estimate is ~2 s against 4.6 s for a stop. If it comes out worse, the planned-time
-  estimate will say so before flight.
+  `startActionGroup`. If the mission-validity check rejects it, START fails before
+  takeoff; fall back to `autofocus=0` (needs a redeploy until the panel has a toggle).
+- **How long one autofocus takes on the M4E.** Undocumented; 0.5 s is a guess. Measure
+  from photo timestamps.
+- **Gimbal-motor overload.** Every waypoint now commands gimbal yaw. 2026-06-12
+  tripped HMS at ~3.9 commands/s; the 5° dedupe stays. Watch HMS and the journal.
+- **Autofocus hunting on a plain wall.** Area focus on a featureless surface can miss.
+  `LensPosition` against the laser distance will show it.
 
 ## Testing
 
-- Unit tests per step: nearest-point Viterbi prefers a long wall the waypoint faces
-  over a small off-axis facet; split waypoint on the segment, midpoint, carries the
-  extra facet; heading schedule keeps |pan| ≤ 50°; focus placement for modes 0/1/2;
-  per-leg speed respects `need_s` and the 0.3 m/s floor; turn mode falls back to stop
-  only in the three cases of step 8.
-- Bench run on the Houten-3 archive (`flight-archive/2026-09-07/`) against flight C:
-  waypoint count, split count, stops kept, focus count, estimated time, walls covered.
-  The spec is met on the bench if estimated time < C's and walls covered ≥ C's 71.
+- Unit: Viterbi picks a long wall the waypoint faces over a small facet whose centroid
+  is nearer; greedy and extra-shot assignment use the same point; `smooth_heading=1`
+  keeps |pan| ≤ 50° and commands gimbal yaw on every aimed waypoint; focus placement for
+  modes 0/1/2 (order gimbalRotate → focus → takePhoto, one focus per photo in mode 2,
+  refocus rules in mode 1); `focus` serialises to the WPML fields above; the pass test
+  adds `af_time_s` where a waypoint focuses.
+- Bench: augment the Houten-3 archive (`flight-archive/2026-09-07/`) and compare with
+  flight C: walls covered (≥ 71), heading step p90, focus count, stops vs pass-throughs.
 
 ## After the flight, from the photos (success criteria)
 
 | measure | target |
 |---|---|
-| photos delivered | all planned (as 276/276 and 539/539 at Houten) |
-| seconds per original waypoint | < 4.6 s (C) |
+| photos delivered | all planned |
 | aim error, primary and extra | ≤ ~5° median (C's primary: 13.6°) |
 | gimbal pan at the ±60° stop | 0 frames |
-| `LensPosition` | follows the laser distance (not stuck near infinity) |
+| heading change per waypoint | visibly calmer; p90 below C's |
+| `LensPosition` | follows the laser distance, not stuck near infinity |
 | walls ≥ 2 m² covered | ≥ 71 of 162 on the same house |
 
-Also pull the journal before power-down (it is volatile) and check the telemetry CSV.
+Pull the journal before power-down (it is volatile) and check the telemetry CSV.
 
 ## Rollback
 
-`split_extra_shots=0`, `smooth_heading=0`, `autofocus=0` give the behaviour flown on
-2026-09-23. The pilot cannot set these from the RC until the panel has the toggles.
-In the field, rollback is `git stash` or a checkout of `570427b` + `deploy_to_manifold.sh`.
+`smooth_heading=0`, `autofocus=0` give the behaviour flown on 2026-09-23. Until the
+panel has toggles, field rollback is a checkout of `570427b` + `deploy_to_manifold.sh`.
